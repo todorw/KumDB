@@ -192,12 +192,19 @@ KdbStatus kdb_result_append(KdbResult *res, const KdbRecord *r) {
 
     if (r->field_count > 0) {
         dst->fields = (KdbRecordField *)calloc(r->field_count, sizeof(KdbRecordField));
-        if (!dst->fields) { kdb_err_oom("result record fields"); return KDB_ERR_OOM; }
+        if (!dst->fields) { kdb_err_oom("result record fields"); dst->field_count = 0; return KDB_ERR_OOM; }
 
         for (uint32_t i = 0; i < r->field_count; i++) {
             KDB_STRLCPY(dst->fields[i].col_name, r->fields[i].col_name, KDB_MAX_NAME_LEN);
             KdbStatus st = kdb_value_copy(&r->fields[i].value, &dst->fields[i].value);
-            if (st != KDB_OK) return st;
+            if (st != KDB_OK) {
+                for (uint32_t j = 0; j < i; j++)
+                    kdb_value_free(&dst->fields[j].value);
+                free(dst->fields);
+                dst->fields      = NULL;
+                dst->field_count = 0;
+                return st;
+            }
         }
     }
 
