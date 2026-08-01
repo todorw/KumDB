@@ -320,6 +320,56 @@ static void test_alter_table(void) {
     teardown(db);
 }
 
+static void test_nested_values_through_sql(void) {
+    /* no SQL literal syntax for arrays/objects -- build via the C API,
+       then confirm SQL's SELECT/projection/GROUP BY-MIN paths carry them
+       through correctly instead of silently zeroing them out. */
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (name TEXT)"));
+
+    KdbField addr1[] = { kdb_field_string("city", "NYC"), kdb_field_end() };
+    KdbField f1[] = { kdb_field_string("name", "Alice"), kdb_field_object("address", addr1), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, "t", f1));
+
+    KdbField addr2[] = { kdb_field_string("city", "LA"), kdb_field_end() };
+    KdbField f2[] = { kdb_field_string("name", "Bob"), kdb_field_object("address", addr2), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, "t", f2));
+
+    KdbRows *rows = NULL;
+
+    /* SELECT * carries the object through untouched */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE name = 'Alice'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const KdbField *addr = kdb_row_get(&rows->rows[0], "address");
+        ASSERT(addr != NULL && addr->type == KDB_TYPE_OBJECT);
+        if (addr) {
+            ASSERT(addr->v.as_object != NULL);
+            ASSERT_STR(addr->v.as_object[0].name, "city");
+            ASSERT_STR(addr->v.as_object[0].v.as_string, "NYC");
+        }
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* explicit projection must also deep-copy the object, not zero it */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name, address FROM t WHERE name = 'Alice'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const KdbField *addr = kdb_row_get(&rows->rows[0], "address");
+        ASSERT(addr != NULL && addr->type == KDB_TYPE_OBJECT && addr->v.as_object != NULL);
+        if (addr && addr->v.as_object) ASSERT_STR(addr->v.as_object[0].v.as_string, "NYC");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* GROUP BY MIN() on the object column exercises the aggregate copy path */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name, MIN(address) FROM t GROUP BY name", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) kdb_rows_free(rows);
+
+    teardown(db);
+}
+
 static void test_reserved_columns_skipped(void) {
     KumDB *db;
     setup(&db);
@@ -380,6 +430,7 @@ int main(void) {
     test_or();
     test_group_by_and_aggregates();
     test_alter_table();
+    test_nested_values_through_sql();
     test_reserved_columns_skipped();
     test_drop_table();
     test_syntax_errors();

@@ -7,9 +7,9 @@
 #include <time.h>
 
 
-#define KDB_MAGIC              0x4B554D44  
+#define KDB_MAGIC              0x4B554D44
 #define KDB_VERSION_MAJOR      1
-#define KDB_VERSION_MINOR      0
+#define KDB_VERSION_MINOR      1
 #define KDB_VERSION_PATCH      0
 
 
@@ -17,26 +17,37 @@
 #define KDB_MAX_COLUMNS        64
 #define KDB_MAX_NAME_LEN       128
 #define KDB_MAX_STRING_LEN     4096
-#define KDB_MAX_RECORDS        (1 << 24)   
+#define KDB_MAX_RECORDS        (1 << 24)
 #define KDB_MAX_FILTER_KEYS    32
 #define KDB_MAX_FILTER_GROUPS  4
 #define KDB_MAX_BATCH_SIZE     65536
 #define KDB_PAGE_SIZE          4096
 #define KDB_INDEX_BUCKETS      1024
 
+/* ARRAY/OBJECT values: bounds so a corrupt/malicious file can't make
+ * deserialization recurse or allocate without limit. */
+#define KDB_MAX_NEST_DEPTH     16
+#define KDB_MAX_NEST_ELEMS     KDB_MAX_COLUMNS
+
 
 typedef enum {
     KDB_TYPE_NULL    = 0,
-    KDB_TYPE_INT     = 1,   
-    KDB_TYPE_FLOAT   = 2,   
-    KDB_TYPE_BOOL    = 3,   
-    KDB_TYPE_STRING  = 4,   
-    KDB_TYPE_BLOB    = 5,   
+    KDB_TYPE_INT     = 1,
+    KDB_TYPE_FLOAT   = 2,
+    KDB_TYPE_BOOL    = 3,
+    KDB_TYPE_STRING  = 4,
+    KDB_TYPE_BLOB    = 5,
+    KDB_TYPE_ARRAY   = 6,
+    KDB_TYPE_OBJECT  = 7,
     KDB_TYPE_UNKNOWN = 255
 } KdbType;
 
 
-typedef struct {
+/* Added in file format 1.1 (KDB_VERSION_MINOR). Files written by 1.0 never
+ * contain these type tags, so they're unaffected; a 1.0 engine opening a
+ * 1.1 file will choke the moment it hits an ARRAY/OBJECT field, same as
+ * any unknown-format-extension situation -- expected, not a corruption bug. */
+typedef struct KdbValue {
     KdbType type;
     union {
         int64_t  as_int;
@@ -50,6 +61,14 @@ typedef struct {
             uint8_t *data;
             size_t   len;
         } as_blob;
+        struct {
+            struct KdbValue *items;
+            size_t           count;
+        } as_array;
+        struct {
+            struct KdbRecordField *fields;
+            uint32_t                count;
+        } as_object;
     } v;
 } KdbValue;
 
@@ -57,8 +76,8 @@ typedef struct {
 typedef struct {
     char     name[KDB_MAX_NAME_LEN];
     KdbType  type;
-    uint8_t  nullable;       
-    uint8_t  indexed;        
+    uint8_t  nullable;
+    uint8_t  indexed;
     uint8_t  _pad[6];
 } KdbColumn;
 
@@ -82,7 +101,7 @@ typedef struct {
 } KdbTableHeader;
 
 
-typedef struct {
+typedef struct KdbRecordField {
     char     col_name[KDB_MAX_NAME_LEN];
     KdbValue value;
 } KdbRecordField;
@@ -199,8 +218,15 @@ typedef enum {
 } KdbStatus;
 
 
-#define KDB_RECORD_FIXED_SIZE  (8 + 8 + 8 + 4 + 1 + 3)   
-#define KDB_FIELD_HEADER_SIZE  (KDB_MAX_NAME_LEN + 1 + 7) 
+#define KDB_RECORD_FIXED_SIZE  (8 + 8 + 8 + 4 + 1 + 3)
+#define KDB_FIELD_HEADER_SIZE  (KDB_MAX_NAME_LEN + 1 + 7)
+#define KDB_VALUE_HEADER_SIZE  (1 + 7)  /* type tag + padding, no name -- unnamed array elements */
+
+/* Sanity ceiling on a single serialized record, checked before trusting a
+ * size prefix read from disk enough to malloc it. Generous enough for any
+ * realistic record (including nested ARRAY/OBJECT values) while still
+ * rejecting an obviously-corrupt size prefix without a huge allocation. */
+#define KDB_MAX_RECORD_SERIAL_SIZE (16u * 1024 * 1024)
 
 
 #define KDB_UNUSED(x)       ((void)(x))

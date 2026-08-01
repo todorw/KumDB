@@ -46,6 +46,17 @@ static void print_field_csv(const KdbField *f, FILE *fp) {
         case KDB_TYPE_BOOL:   fprintf(fp, "%s",    f->v.as_bool ? "true" : "false"); break;
         case KDB_TYPE_NULL:   break;
         case KDB_TYPE_STRING: escape_csv(f->v.as_string ? f->v.as_string : "", fp); break;
+        case KDB_TYPE_ARRAY:
+            snprintf(buf, sizeof(buf), "<array:%zu items>", f->v.as_array.count);
+            escape_csv(buf, fp);
+            break;
+        case KDB_TYPE_OBJECT: {
+            uint32_t n = 0;
+            if (f->v.as_object) while (f->v.as_object[n].name != NULL) n++;
+            snprintf(buf, sizeof(buf), "<object:%u fields>", n);
+            escape_csv(buf, fp);
+            break;
+        }
         default:
             snprintf(buf, sizeof(buf), "<blob>");
             escape_csv(buf, fp);
@@ -60,6 +71,28 @@ static void print_field_json(const KdbField *f, FILE *fp) {
         case KDB_TYPE_BOOL:   fprintf(fp, "%s",    f->v.as_bool ? "true" : "false"); break;
         case KDB_TYPE_NULL:   fprintf(fp, "null");                             break;
         case KDB_TYPE_STRING: escape_json_string(f->v.as_string ? f->v.as_string : "", fp); break;
+        case KDB_TYPE_ARRAY:
+            fprintf(fp, "[");
+            for (size_t i = 0; i < f->v.as_array.count; i++) {
+                if (i > 0) fprintf(fp, ",");
+                print_field_json(&f->v.as_array.items[i], fp);
+            }
+            fprintf(fp, "]");
+            break;
+        case KDB_TYPE_OBJECT:
+            fprintf(fp, "{");
+            if (f->v.as_object) {
+                int first = 1;
+                for (const KdbField *sub = f->v.as_object; sub->name != NULL; sub++) {
+                    if (!first) fprintf(fp, ",");
+                    escape_json_string(sub->name, fp);
+                    fprintf(fp, ":");
+                    print_field_json(sub, fp);
+                    first = 0;
+                }
+            }
+            fprintf(fp, "}");
+            break;
         default:              fprintf(fp, "\"<blob>\"");                       break;
     }
 }

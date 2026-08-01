@@ -13,7 +13,13 @@ extern "C" {
 
 typedef KdbType KdbFieldType;
 
-typedef struct {
+/* ARRAY elements have no name, so they're count-based on both the write
+ * side (kdb_field_array) and the read side (kdb_row_get_array) -- a
+ * NULL-terminator convention doesn't work when a real element can itself
+ * be an unnamed NULL-type value. OBJECT fields always have a real name
+ * (they're keys), so they stay NULL-name-terminated like every other
+ * field list in this API (kdb_field_end()). */
+typedef struct KdbField {
     const char  *name;
     KdbFieldType type;
     union {
@@ -22,6 +28,8 @@ typedef struct {
         int          as_bool;
         const char  *as_string;
         struct { const void *data; size_t len; } as_blob;
+        struct { const struct KdbField *items; size_t count; } as_array;
+        const struct KdbField *as_object;
     } v;
 } KdbField;
 
@@ -143,6 +151,10 @@ KdbStatus kdb_row_get_float (const KdbRow *row, const char *col, double     *out
 KdbStatus kdb_row_get_bool  (const KdbRow *row, const char *col, int        *out);
 KdbStatus kdb_row_get_string(const KdbRow *row, const char *col, const char **out);
 KdbStatus kdb_row_get_blob  (const KdbRow *row, const char *col, const void **data_out, size_t *len_out);
+/* *items_out points into row-owned memory, valid until kdb_row_free()/kdb_rows_free(). */
+KdbStatus kdb_row_get_array (const KdbRow *row, const char *col, const KdbField **items_out, size_t *count_out);
+/* *fields_out is NULL-name-terminated, same convention as everywhere else. */
+KdbStatus kdb_row_get_object(const KdbRow *row, const char *col, const KdbField **fields_out);
 
 const char *kdb_last_error (void);
 KdbStatus   kdb_last_status(void);
@@ -167,6 +179,29 @@ static inline KdbField kdb_field_blob  (const char *n, const void *data, size_t 
     KdbField f = {n, KDB_TYPE_BLOB, {0}};
     f.v.as_blob.data = data;
     f.v.as_blob.len  = len;
+    return f;
+}
+
+/* items is a plain array of KdbField (count-based, see the KdbField comment
+ * above) -- each element's own .name is ignored. Example:
+ *   KdbField tags[] = { kdb_field_string(NULL, "vip"), kdb_field_string(NULL, "new") };
+ *   kdb_field_array("tags", tags, 2)
+ */
+static inline KdbField kdb_field_array(const char *n, const KdbField *items, size_t count) {
+    KdbField f = {n, KDB_TYPE_ARRAY, {0}};
+    f.v.as_array.items = items;
+    f.v.as_array.count = count;
+    return f;
+}
+
+/* fields is a NULL-name-terminated list, same convention as kdb_add()'s
+ * top-level fields array. Example:
+ *   KdbField address[] = { kdb_field_string("city", "NYC"), kdb_field_end() };
+ *   kdb_field_object("address", address)
+ */
+static inline KdbField kdb_field_object(const char *n, const KdbField *fields) {
+    KdbField f = {n, KDB_TYPE_OBJECT, {0}};
+    f.v.as_object = fields;
     return f;
 }
 

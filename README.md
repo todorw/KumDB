@@ -114,6 +114,47 @@ kdb_drop_table(db, "users");
 
 ---
 
+## **🪆 Nested Values**
+
+Fields aren't limited to scalars -- a field can be an array or a nested object,
+like a JSON document:
+
+```c
+KdbField tags[]    = { kdb_field_string(NULL, "vip"), kdb_field_string(NULL, "new") };
+KdbField address[] = { kdb_field_string("city", "NYC"), kdb_field_int("zip", 10001), kdb_field_end() };
+
+KdbField fields[] = {
+    kdb_field_string("name",    "Alice"),
+    kdb_field_array ("tags",    tags, 2),      // array elements: no name, count-based
+    kdb_field_object("address", address),      // object fields: named, kdb_field_end()-terminated
+    kdb_field_end()
+};
+kdb_add(db, "users", fields);
+
+KdbRow *row = kdb_find_one(db, "users", (const char*[]){"name=Alice", NULL});
+const KdbField *items = NULL; size_t count = 0;
+kdb_row_get_array(row, "tags", &items, &count);
+
+const KdbField *obj = NULL;
+kdb_row_get_object(row, "address", &obj);   // NULL-name-terminated, walk it like any field list
+```
+
+Nesting can go as deep as you want (arrays of objects of arrays...), up to
+16 levels and 64 elements per level -- generous caps that exist purely to
+stop a corrupt file from making the engine allocate or recurse forever, not
+limits you'll hit in practice. `EQ`/`NEQ` compare arrays/objects by deep
+value; there's no dot-path querying (`WHERE address.city = 'NYC'`) --
+match/filter on the whole field or pull it out and inspect it yourself.
+No SQL literal syntax for arrays/objects either (there's no sane one-line
+syntax for it); build nested values through the C API, SQL can still
+`SELECT`/project/aggregate the resulting columns fine.
+
+Old data files written before this feature (format 1.0) open exactly as
+before -- nested values only showed up in format 1.1, and existing type
+tags never changed, so there's nothing to migrate.
+
+---
+
 ## **🔍 Filter Operators**
 
 | Operator | Example | Meaning |

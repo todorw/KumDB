@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
+#include <stdarg.h>
 
 #include "../include/types.h"
 #include "../include/error.h"
@@ -136,6 +137,57 @@ KdbStatus kdb_value_from_blob(const void *data, size_t len, KdbValue *out) {
     return KDB_OK;
 }
 
+KdbStatus kdb_value_from_array(const KdbValue *items, size_t count, KdbValue *out) {
+    if (!out) return KDB_ERR_BAD_ARG;
+    memset(out, 0, sizeof(*out));
+    out->type = KDB_TYPE_ARRAY;
+    if (count == 0) return KDB_OK;
+    if (!items) { kdb_err_null_arg("items", "kdb_value_from_array"); return KDB_ERR_BAD_ARG; }
+    if (count > KDB_MAX_NEST_ELEMS) {
+        kdb_err_bad_arg("count", "exceeds KDB_MAX_NEST_ELEMS");
+        return KDB_ERR_FULL;
+    }
+
+    KdbValue *copy = (KdbValue *)calloc(count, sizeof(KdbValue));
+    if (!copy) { kdb_err_oom("array value"); return KDB_ERR_OOM; }
+    for (size_t i = 0; i < count; i++) {
+        if (kdb_value_copy(&items[i], &copy[i]) != KDB_OK) {
+            for (size_t j = 0; j < i; j++) kdb_value_free(&copy[j]);
+            free(copy);
+            return KDB_ERR_OOM;
+        }
+    }
+    out->v.as_array.items = copy;
+    out->v.as_array.count = count;
+    return KDB_OK;
+}
+
+KdbStatus kdb_value_from_object(const KdbRecordField *fields, uint32_t count, KdbValue *out) {
+    if (!out) return KDB_ERR_BAD_ARG;
+    memset(out, 0, sizeof(*out));
+    out->type = KDB_TYPE_OBJECT;
+    if (count == 0) return KDB_OK;
+    if (!fields) { kdb_err_null_arg("fields", "kdb_value_from_object"); return KDB_ERR_BAD_ARG; }
+    if (count > KDB_MAX_NEST_ELEMS) {
+        kdb_err_bad_arg("count", "exceeds KDB_MAX_NEST_ELEMS");
+        return KDB_ERR_FULL;
+    }
+
+    KdbRecordField *copy = (KdbRecordField *)calloc(count, sizeof(KdbRecordField));
+    if (!copy) { kdb_err_oom("object value"); return KDB_ERR_OOM; }
+    for (uint32_t i = 0; i < count; i++) {
+        KDB_STRLCPY(copy[i].col_name, fields[i].col_name, KDB_MAX_NAME_LEN);
+        if (kdb_value_copy(&fields[i].value, &copy[i].value) != KDB_OK) {
+            for (uint32_t j = 0; j < i; j++) kdb_value_free(&copy[j].value);
+            free(copy);
+            return KDB_ERR_OOM;
+        }
+    }
+    out->v.as_object.fields = copy;
+    out->v.as_object.count  = count;
+    return KDB_OK;
+}
+
 KdbStatus kdb_value_from_string(const char *raw, KdbType hint, KdbValue *out) {
     if (!out) return KDB_ERR_BAD_ARG;
     memset(out, 0, sizeof(*out));
@@ -223,6 +275,41 @@ KdbStatus kdb_value_copy(const KdbValue *src, KdbValue *dst) {
             dst->v.as_blob.len  = src->v.as_blob.len;
             break;
         }
+        case KDB_TYPE_ARRAY: {
+            dst->v.as_array.items = NULL;
+            dst->v.as_array.count = 0;
+            if (src->v.as_array.count == 0) break;
+            KdbValue *copy = (KdbValue *)calloc(src->v.as_array.count, sizeof(KdbValue));
+            if (!copy) { kdb_err_oom("array copy"); return KDB_ERR_OOM; }
+            for (size_t i = 0; i < src->v.as_array.count; i++) {
+                if (kdb_value_copy(&src->v.as_array.items[i], &copy[i]) != KDB_OK) {
+                    for (size_t j = 0; j < i; j++) kdb_value_free(&copy[j]);
+                    free(copy);
+                    return KDB_ERR_OOM;
+                }
+            }
+            dst->v.as_array.items = copy;
+            dst->v.as_array.count = src->v.as_array.count;
+            break;
+        }
+        case KDB_TYPE_OBJECT: {
+            dst->v.as_object.fields = NULL;
+            dst->v.as_object.count  = 0;
+            if (src->v.as_object.count == 0) break;
+            KdbRecordField *copy = (KdbRecordField *)calloc(src->v.as_object.count, sizeof(KdbRecordField));
+            if (!copy) { kdb_err_oom("object copy"); return KDB_ERR_OOM; }
+            for (uint32_t i = 0; i < src->v.as_object.count; i++) {
+                KDB_STRLCPY(copy[i].col_name, src->v.as_object.fields[i].col_name, KDB_MAX_NAME_LEN);
+                if (kdb_value_copy(&src->v.as_object.fields[i].value, &copy[i].value) != KDB_OK) {
+                    for (uint32_t j = 0; j < i; j++) kdb_value_free(&copy[j].value);
+                    free(copy);
+                    return KDB_ERR_OOM;
+                }
+            }
+            dst->v.as_object.fields = copy;
+            dst->v.as_object.count  = src->v.as_object.count;
+            break;
+        }
         default:
             break;
     }
@@ -242,6 +329,18 @@ void kdb_value_free(KdbValue *v) {
             v->v.as_blob.data = NULL;
             v->v.as_blob.len  = 0;
             break;
+        case KDB_TYPE_ARRAY:
+            for (size_t i = 0; i < v->v.as_array.count; i++) kdb_value_free(&v->v.as_array.items[i]);
+            free(v->v.as_array.items);
+            v->v.as_array.items = NULL;
+            v->v.as_array.count = 0;
+            break;
+        case KDB_TYPE_OBJECT:
+            for (uint32_t i = 0; i < v->v.as_object.count; i++) kdb_value_free(&v->v.as_object.fields[i].value);
+            free(v->v.as_object.fields);
+            v->v.as_object.fields = NULL;
+            v->v.as_object.count  = 0;
+            break;
         default:
             break;
     }
@@ -254,6 +353,42 @@ static double kdb__to_double(const KdbValue *v) {
     if (v->type == KDB_TYPE_FLOAT) return v->v.as_float;
     if (v->type == KDB_TYPE_BOOL)  return (double)v->v.as_bool;
     return 0.0;
+}
+
+/* Arrays compare lexicographically by element (shorter-is-less on a common
+ * prefix), same idea as comparing tuples/lists in most languages -- this
+ * gives EQ/NEQ a real answer (not just "incomparable") and GT/LT/etc. a
+ * defined, if not hugely useful, ordering. An incomparable element pair
+ * deep inside (e.g. int vs string at the same position) makes the whole
+ * comparison INT32_MIN, same as any other genuinely incompatible pairing. */
+static int kdb__compare_array(const KdbValue *a, const KdbValue *b) {
+    size_t na = a->v.as_array.count, nb = b->v.as_array.count;
+    size_t n  = na < nb ? na : nb;
+    for (size_t i = 0; i < n; i++) {
+        int c = kdb_value_compare(&a->v.as_array.items[i], &b->v.as_array.items[i]);
+        if (c == INT32_MIN) return INT32_MIN;
+        if (c != 0) return c;
+    }
+    if (na < nb) return -1;
+    if (na > nb) return  1;
+    return 0;
+}
+
+/* Objects compare by (name, value) pairs in stored order -- order-sensitive
+ * on purpose, keeps this simple and gives EQ/NEQ a real answer. */
+static int kdb__compare_object(const KdbValue *a, const KdbValue *b) {
+    uint32_t na = a->v.as_object.count, nb = b->v.as_object.count;
+    uint32_t n  = na < nb ? na : nb;
+    for (uint32_t i = 0; i < n; i++) {
+        int nc = strcmp(a->v.as_object.fields[i].col_name, b->v.as_object.fields[i].col_name);
+        if (nc != 0) return nc < 0 ? -1 : 1;
+        int c = kdb_value_compare(&a->v.as_object.fields[i].value, &b->v.as_object.fields[i].value);
+        if (c == INT32_MIN) return INT32_MIN;
+        if (c != 0) return c;
+    }
+    if (na < nb) return -1;
+    if (na > nb) return  1;
+    return 0;
 }
 
 int kdb_value_compare(const KdbValue *a, const KdbValue *b) {
@@ -280,7 +415,13 @@ int kdb_value_compare(const KdbValue *a, const KdbValue *b) {
     if (a->type == KDB_TYPE_STRING && b->type == KDB_TYPE_STRING)
         return strcmp(a->v.as_string.data, b->v.as_string.data);
 
-    
+    if (a->type == KDB_TYPE_ARRAY && b->type == KDB_TYPE_ARRAY)
+        return kdb__compare_array(a, b);
+
+    if (a->type == KDB_TYPE_OBJECT && b->type == KDB_TYPE_OBJECT)
+        return kdb__compare_object(a, b);
+
+
     return INT32_MIN;
 }
 
@@ -396,6 +537,8 @@ const char *kdb_type_name(KdbType type) {
         case KDB_TYPE_BOOL:    return "bool";
         case KDB_TYPE_STRING:  return "string";
         case KDB_TYPE_BLOB:    return "blob";
+        case KDB_TYPE_ARRAY:   return "array";
+        case KDB_TYPE_OBJECT:  return "object";
         default:               return "unknown";
     }
 }
@@ -469,6 +612,21 @@ KdbStatus kdb_parse_filter_key(const char  *key,
 }
 
 
+/* Appends to buf at pos (bounded, always leaves buf nul-terminated within
+ * buf_size) and returns the new pos. Safe to keep calling even after the
+ * buffer fills up -- just stops writing, like snprintf itself. */
+static size_t kdb__append(char *buf, size_t buf_size, size_t pos, const char *fmt, ...) {
+    if (pos >= buf_size) return pos;
+    va_list args;
+    va_start(args, fmt);
+    int w = vsnprintf(buf + pos, buf_size - pos, fmt, args);
+    va_end(args);
+    if (w <= 0) return pos;
+    size_t avail   = buf_size - pos - 1; /* excluding the nul terminator slot */
+    size_t written = (size_t)w < avail ? (size_t)w : avail;
+    return pos + written;
+}
+
 int kdb_value_to_str(const KdbValue *v, char *buf, size_t buf_size) {
     if (!v || !buf || buf_size == 0) return 0;
 
@@ -485,6 +643,27 @@ int kdb_value_to_str(const KdbValue *v, char *buf, size_t buf_size) {
             return snprintf(buf, buf_size, "\"%s\"", v->v.as_string.data ? v->v.as_string.data : "");
         case KDB_TYPE_BLOB:
             return snprintf(buf, buf_size, "<blob:%zu bytes>", v->v.as_blob.len);
+        case KDB_TYPE_ARRAY: {
+            size_t pos = kdb__append(buf, buf_size, 0, "[");
+            for (size_t i = 0; i < v->v.as_array.count; i++) {
+                char elem[128];
+                kdb_value_to_str(&v->v.as_array.items[i], elem, sizeof(elem));
+                pos = kdb__append(buf, buf_size, pos, "%s%s", i > 0 ? ", " : "", elem);
+            }
+            pos = kdb__append(buf, buf_size, pos, "]");
+            return (int)pos;
+        }
+        case KDB_TYPE_OBJECT: {
+            size_t pos = kdb__append(buf, buf_size, 0, "{");
+            for (uint32_t i = 0; i < v->v.as_object.count; i++) {
+                char elem[128];
+                kdb_value_to_str(&v->v.as_object.fields[i].value, elem, sizeof(elem));
+                pos = kdb__append(buf, buf_size, pos, "%s%s: %s",
+                                  i > 0 ? ", " : "", v->v.as_object.fields[i].col_name, elem);
+            }
+            pos = kdb__append(buf, buf_size, pos, "}");
+            return (int)pos;
+        }
         default:
             return snprintf(buf, buf_size, "<unknown>");
     }

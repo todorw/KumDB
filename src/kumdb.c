@@ -77,10 +77,71 @@ static KdbTable *kdb__get_or_create_table(KumDB *db, const char *table_name) {
 }
 
 
+/* Recursive KdbField -> KdbValue conversion (the write side). Array
+ * elements/object members go through this same function, so nesting is
+ * unbounded here -- kdb_value_from_array()/kdb_value_from_object() enforce
+ * the real KDB_MAX_NEST_ELEMS cap per level when they deep-copy the result. */
+static KdbStatus kdb__field_to_value(const KdbField *f, KdbValue *out) {
+    switch (f->type) {
+        case KDB_TYPE_INT:
+            return kdb_value_from_int(f->v.as_int, out);
+        case KDB_TYPE_FLOAT:
+            return kdb_value_from_float(f->v.as_float, out);
+        case KDB_TYPE_BOOL:
+            return kdb_value_from_bool((uint8_t)f->v.as_bool, out);
+        case KDB_TYPE_STRING:
+            return kdb_value_from_string(f->v.as_string, KDB_TYPE_STRING, out);
+        case KDB_TYPE_NULL:
+            return kdb_value_from_null(out);
+        case KDB_TYPE_BLOB:
+            return kdb_value_from_blob(f->v.as_blob.data, f->v.as_blob.len, out);
+        case KDB_TYPE_ARRAY: {
+            size_t count = f->v.as_array.count;
+            if (count == 0) return kdb_value_from_array(NULL, 0, out);
+
+            KdbValue *elems = (KdbValue *)calloc(count, sizeof(KdbValue));
+            if (!elems) { kdb_err_oom("array field elements"); return KDB_ERR_OOM; }
+            for (size_t i = 0; i < count; i++) {
+                if (kdb__field_to_value(&f->v.as_array.items[i], &elems[i]) != KDB_OK) {
+                    for (size_t j = 0; j < i; j++) kdb_value_free(&elems[j]);
+                    free(elems);
+                    return kdb_last_status();
+                }
+            }
+            KdbStatus st = kdb_value_from_array(elems, count, out);
+            for (size_t i = 0; i < count; i++) kdb_value_free(&elems[i]);
+            free(elems);
+            return st;
+        }
+        case KDB_TYPE_OBJECT: {
+            uint32_t count = 0;
+            if (f->v.as_object) while (f->v.as_object[count].name != NULL) count++;
+            if (count == 0) return kdb_value_from_object(NULL, 0, out);
+
+            KdbRecordField *sub = (KdbRecordField *)calloc(count, sizeof(KdbRecordField));
+            if (!sub) { kdb_err_oom("object field members"); return KDB_ERR_OOM; }
+            for (uint32_t i = 0; i < count; i++) {
+                KDB_STRLCPY(sub[i].col_name, f->v.as_object[i].name, KDB_MAX_NAME_LEN);
+                if (kdb__field_to_value(&f->v.as_object[i], &sub[i].value) != KDB_OK) {
+                    for (uint32_t j = 0; j < i; j++) kdb_value_free(&sub[j].value);
+                    free(sub);
+                    return kdb_last_status();
+                }
+            }
+            KdbStatus st = kdb_value_from_object(sub, count, out);
+            for (uint32_t i = 0; i < count; i++) kdb_value_free(&sub[i].value);
+            free(sub);
+            return st;
+        }
+        default:
+            return kdb_value_from_null(out);
+    }
+}
+
 static KdbRecord *kdb__fields_to_record(const KdbField *fields) {
     if (!fields) { kdb_err_null_arg("fields", "kdb__fields_to_record"); return NULL; }
 
-    
+
     uint32_t count = 0;
     while (fields[count].name != NULL) count++;
 
@@ -92,34 +153,9 @@ static KdbRecord *kdb__fields_to_record(const KdbField *fields) {
         KdbValue val;
         memset(&val, 0, sizeof(val));
 
-        switch (f->type) {
-            case KDB_TYPE_INT:
-                kdb_value_from_int(f->v.as_int, &val);
-                break;
-            case KDB_TYPE_FLOAT:
-                kdb_value_from_float(f->v.as_float, &val);
-                break;
-            case KDB_TYPE_BOOL:
-                kdb_value_from_bool((uint8_t)f->v.as_bool, &val);
-                break;
-            case KDB_TYPE_STRING:
-                if (kdb_value_from_string(f->v.as_string, KDB_TYPE_STRING, &val) != KDB_OK) {
-                    kdb_record_free(r);
-                    return NULL;
-                }
-                break;
-            case KDB_TYPE_NULL:
-                kdb_value_from_null(&val);
-                break;
-            case KDB_TYPE_BLOB:
-                if (kdb_value_from_blob(f->v.as_blob.data, f->v.as_blob.len, &val) != KDB_OK) {
-                    kdb_record_free(r);
-                    return NULL;
-                }
-                break;
-            default:
-                kdb_value_from_null(&val);
-                break;
+        if (kdb__field_to_value(f, &val) != KDB_OK) {
+            kdb_record_free(r);
+            return NULL;
         }
 
         KdbStatus st = kdb_record_set_field(r, f->name, &val);
@@ -202,6 +238,101 @@ static KdbStatus kdb__build_query(const char **filters, KdbQuery *q) {
 }
 
 
+/* Recursively frees a single KdbField's owned memory: its name, and
+ * whatever its value owns (string/blob data, or array/object children).
+ * Safe on a partially-built field (calloc'd-but-not-yet-filled array/object
+ * slots are type NULL, which is a no-op to free) and safe to call on a
+ * field whose .name is NULL (array elements never have one). */
+static void kdb__free_field_value(KdbField *f) {
+    if (!f) return;
+    free((void *)f->name);
+    if (f->type == KDB_TYPE_STRING) {
+        free((void *)f->v.as_string);
+    } else if (f->type == KDB_TYPE_BLOB) {
+        free((void *)f->v.as_blob.data);
+    } else if (f->type == KDB_TYPE_ARRAY) {
+        for (size_t i = 0; i < f->v.as_array.count; i++)
+            kdb__free_field_value((KdbField *)&f->v.as_array.items[i]);
+        free((void *)f->v.as_array.items);
+    } else if (f->type == KDB_TYPE_OBJECT) {
+        if (f->v.as_object) {
+            for (const KdbField *sub = f->v.as_object; sub->name != NULL; sub++)
+                kdb__free_field_value((KdbField *)sub);
+            free((void *)f->v.as_object);
+        }
+    }
+}
+
+/* Recursive KdbValue -> KdbField conversion (the read side), the mirror of
+ * kdb__field_to_value(). dst->name is NOT set here -- callers own that
+ * (top-level row fields get a real name; array elements pass NULL). */
+static KdbStatus kdb__value_to_field(const KdbValue *src, KdbField *dst) {
+    dst->type = src->type;
+    switch (src->type) {
+        case KDB_TYPE_INT:    dst->v.as_int   = src->v.as_int;   return KDB_OK;
+        case KDB_TYPE_FLOAT:  dst->v.as_float = src->v.as_float; return KDB_OK;
+        case KDB_TYPE_BOOL:   dst->v.as_bool  = src->v.as_bool;  return KDB_OK;
+        case KDB_TYPE_STRING: {
+            char *copy = NULL;
+            if (src->v.as_string.data) {
+                copy = (char *)malloc(src->v.as_string.len + 1);
+                if (!copy) { kdb_err_oom("row field string"); return KDB_ERR_OOM; }
+                memcpy(copy, src->v.as_string.data, src->v.as_string.len + 1);
+            }
+            dst->v.as_string = copy;
+            return KDB_OK;
+        }
+        case KDB_TYPE_BLOB: {
+            void *copy = NULL;
+            if (src->v.as_blob.len > 0 && src->v.as_blob.data) {
+                copy = malloc(src->v.as_blob.len);
+                if (!copy) { kdb_err_oom("row field blob"); return KDB_ERR_OOM; }
+                memcpy(copy, src->v.as_blob.data, src->v.as_blob.len);
+            }
+            dst->v.as_blob.data = copy;
+            dst->v.as_blob.len  = src->v.as_blob.len;
+            return KDB_OK;
+        }
+        case KDB_TYPE_ARRAY: {
+            size_t count = src->v.as_array.count;
+            dst->v.as_array.items = NULL;
+            dst->v.as_array.count = 0;
+            if (count == 0) return KDB_OK;
+
+            KdbField *items = (KdbField *)calloc(count, sizeof(KdbField));
+            if (!items) { kdb_err_oom("row field array"); return KDB_ERR_OOM; }
+            dst->v.as_array.items = items;
+            dst->v.as_array.count = count;
+            for (size_t i = 0; i < count; i++) {
+                items[i].name = NULL;
+                if (kdb__value_to_field(&src->v.as_array.items[i], &items[i]) != KDB_OK)
+                    return KDB_ERR_OOM;
+            }
+            return KDB_OK;
+        }
+        case KDB_TYPE_OBJECT: {
+            uint32_t count = src->v.as_object.count;
+            /* always a valid NULL-terminated array, even when empty, so
+             * callers can iterate it unconditionally */
+            KdbField *fields = (KdbField *)calloc((size_t)count + 1, sizeof(KdbField));
+            if (!fields) { kdb_err_oom("row field object"); return KDB_ERR_OOM; }
+            dst->v.as_object = fields;
+            for (uint32_t i = 0; i < count; i++) {
+                char *name_copy = (char *)malloc(KDB_MAX_NAME_LEN);
+                if (!name_copy) { kdb_err_oom("row field object key"); return KDB_ERR_OOM; }
+                KDB_STRLCPY(name_copy, src->v.as_object.fields[i].col_name, KDB_MAX_NAME_LEN);
+                fields[i].name = name_copy;
+                if (kdb__value_to_field(&src->v.as_object.fields[i].value, &fields[i]) != KDB_OK)
+                    return KDB_ERR_OOM;
+            }
+            return KDB_OK;
+        }
+        case KDB_TYPE_NULL:
+        default:
+            return KDB_OK;
+    }
+}
+
 static KdbRow *kdb__record_to_row(const KdbRecord *r) {
     if (!r) return NULL;
 
@@ -220,11 +351,10 @@ static KdbRow *kdb__record_to_row(const KdbRecord *r) {
         for (uint32_t i = 0; i < r->field_count; i++) {
             const KdbRecordField *src = &r->fields[i];
             KdbField       *dst = &row->fields[i];
-            
+
             char *name_copy = (char *)malloc(KDB_MAX_NAME_LEN);
             if (!name_copy) {
-                
-                for (uint32_t j = 0; j < i; j++) free((void *)row->fields[j].name);
+                for (uint32_t j = 0; j < i; j++) kdb__free_field_value(&row->fields[j]);
                 free(row->fields);
                 free(row);
                 kdb_err_oom("KdbRow field name");
@@ -233,51 +363,11 @@ static KdbRow *kdb__record_to_row(const KdbRecord *r) {
             KDB_STRLCPY(name_copy, src->col_name, KDB_MAX_NAME_LEN);
             dst->name = name_copy;
 
-            
-            switch (src->value.type) {
-                case KDB_TYPE_INT:
-                    dst->type       = KDB_TYPE_INT;
-                    dst->v.as_int   = src->value.v.as_int;
-                    break;
-                case KDB_TYPE_FLOAT:
-                    dst->type       = KDB_TYPE_FLOAT;
-                    dst->v.as_float = src->value.v.as_float;
-                    break;
-                case KDB_TYPE_BOOL:
-                    dst->type      = KDB_TYPE_BOOL;
-                    dst->v.as_bool = src->value.v.as_bool;
-                    break;
-                case KDB_TYPE_STRING: {
-                    dst->type = KDB_TYPE_STRING;
-                    char *str_copy = NULL;
-                    if (src->value.v.as_string.data) {
-                        str_copy = (char *)malloc(src->value.v.as_string.len + 1);
-                        if (str_copy) {
-                            memcpy(str_copy, src->value.v.as_string.data,
-                                   src->value.v.as_string.len + 1);
-                        }
-                    }
-                    dst->v.as_string = str_copy;
-                    break;
-                }
-                case KDB_TYPE_BLOB: {
-                    dst->type = KDB_TYPE_BLOB;
-                    void *blob_copy = NULL;
-                    if (src->value.v.as_blob.len > 0 && src->value.v.as_blob.data) {
-                        blob_copy = malloc(src->value.v.as_blob.len);
-                        if (blob_copy) {
-                            memcpy(blob_copy, src->value.v.as_blob.data,
-                                   src->value.v.as_blob.len);
-                        }
-                    }
-                    dst->v.as_blob.data = blob_copy;
-                    dst->v.as_blob.len  = src->value.v.as_blob.len;
-                    break;
-                }
-                case KDB_TYPE_NULL:
-                default:
-                    dst->type = KDB_TYPE_NULL;
-                    break;
+            if (kdb__value_to_field(&src->value, dst) != KDB_OK) {
+                for (uint32_t j = 0; j <= i; j++) kdb__free_field_value(&row->fields[j]);
+                free(row->fields);
+                free(row);
+                return NULL;
             }
         }
     }
@@ -781,13 +871,8 @@ void kdb_row_free(KdbRow *row) {
 
 void kdb_row_free_internal(KdbRow *row) {
     if (!row || !row->fields) return;
-    for (uint32_t i = 0; i < row->field_count; i++) {
-        free((void *)row->fields[i].name);
-        if (row->fields[i].type == KDB_TYPE_STRING)
-            free((void *)row->fields[i].v.as_string);
-        else if (row->fields[i].type == KDB_TYPE_BLOB)
-            free((void *)row->fields[i].v.as_blob.data);
-    }
+    for (uint32_t i = 0; i < row->field_count; i++)
+        kdb__free_field_value(&row->fields[i]);
     free(row->fields);
     row->fields      = NULL;
     row->field_count = 0;
@@ -844,6 +929,58 @@ KdbStatus kdb_row_get_blob(const KdbRow *row, const char *col, const void **data
     return KDB_OK;
 }
 
+KdbStatus kdb_row_get_array(const KdbRow *row, const char *col, const KdbField **items_out, size_t *count_out) {
+    const KdbField *f = kdb_row_get(row, col);
+    if (!f)                          { kdb_err_field_not_found(col, "row"); return KDB_ERR_NOT_FOUND; }
+    if (f->type != KDB_TYPE_ARRAY)   { kdb_err_bad_type(col, KDB_TYPE_ARRAY, (KdbType)f->type); return KDB_ERR_BAD_TYPE; }
+    *items_out = f->v.as_array.items;
+    *count_out = f->v.as_array.count;
+    return KDB_OK;
+}
+
+KdbStatus kdb_row_get_object(const KdbRow *row, const char *col, const KdbField **fields_out) {
+    const KdbField *f = kdb_row_get(row, col);
+    if (!f)                          { kdb_err_field_not_found(col, "row"); return KDB_ERR_NOT_FOUND; }
+    if (f->type != KDB_TYPE_OBJECT)  { kdb_err_bad_type(col, KDB_TYPE_OBJECT, (KdbType)f->type); return KDB_ERR_BAD_TYPE; }
+    *fields_out = f->v.as_object;
+    return KDB_OK;
+}
+
+
+static void kdb__print_field_value(FILE *fp, const KdbField *f) {
+    switch (f->type) {
+        case KDB_TYPE_INT:    fprintf(fp, "%lld",   (long long)f->v.as_int);   break;
+        case KDB_TYPE_FLOAT:  fprintf(fp, "%g",     f->v.as_float);            break;
+        case KDB_TYPE_BOOL:   fprintf(fp, "%s",     f->v.as_bool ? "true" : "false"); break;
+        case KDB_TYPE_STRING: fprintf(fp, "\"%s\"", f->v.as_string ? f->v.as_string : ""); break;
+        case KDB_TYPE_NULL:   fprintf(fp, "null");                             break;
+        case KDB_TYPE_BLOB:   fprintf(fp, "<blob:%zu bytes>", f->v.as_blob.len); break;
+        case KDB_TYPE_ARRAY:
+            fprintf(fp, "[");
+            for (size_t i = 0; i < f->v.as_array.count; i++) {
+                if (i > 0) fprintf(fp, ", ");
+                kdb__print_field_value(fp, &f->v.as_array.items[i]);
+            }
+            fprintf(fp, "]");
+            break;
+        case KDB_TYPE_OBJECT:
+            fprintf(fp, "{");
+            if (f->v.as_object) {
+                int first = 1;
+                for (const KdbField *sub = f->v.as_object; sub->name != NULL; sub++) {
+                    if (!first) fprintf(fp, ", ");
+                    fprintf(fp, "%s: ", sub->name);
+                    kdb__print_field_value(fp, sub);
+                    first = 0;
+                }
+            }
+            fprintf(fp, "}");
+            break;
+        default:
+            fprintf(fp, "<unknown>");
+            break;
+    }
+}
 
 void kdb_row_print(const KdbRow *row, FILE *fp) {
     if (!row || !fp) return;
@@ -851,14 +988,7 @@ void kdb_row_print(const KdbRow *row, FILE *fp) {
     for (uint32_t i = 0; i < row->field_count; i++) {
         const KdbField *f = &row->fields[i];
         fprintf(fp, ", %s=", f->name ? f->name : "?");
-        switch (f->type) {
-            case KDB_TYPE_INT:    fprintf(fp, "%lld",    (long long)f->v.as_int);   break;
-            case KDB_TYPE_FLOAT:  fprintf(fp, "%g",      f->v.as_float);            break;
-            case KDB_TYPE_BOOL:   fprintf(fp, "%s",      f->v.as_bool ? "true" : "false"); break;
-            case KDB_TYPE_STRING: fprintf(fp, "\"%s\"",  f->v.as_string ? f->v.as_string : ""); break;
-            case KDB_TYPE_NULL:   fprintf(fp, "null");                               break;
-            default:              fprintf(fp, "<blob>");                             break;
-        }
+        kdb__print_field_value(fp, f);
     }
     fprintf(fp, " }\n");
 }

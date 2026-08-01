@@ -466,6 +466,94 @@ static void test_blob_field(void) {
     teardown(db);
 }
 
+static void test_nested_array_object(void) {
+    KumDB *db;
+    setup(&db);
+
+    KdbField tags[] = {
+        kdb_field_string(NULL, "vip"),
+        kdb_field_string(NULL, "premium"),
+    };
+    KdbField address[] = {
+        kdb_field_string("city", "NYC"),
+        kdb_field_int   ("zip",  10001),
+        kdb_field_end   ()
+    };
+    KdbField f[] = {
+        kdb_field_string("name", "Alice"),
+        kdb_field_array ("tags", tags, 2),
+        kdb_field_object("address", address),
+        kdb_field_end   ()
+    };
+    ASSERT_OK(kdb_add(db, TABLE, f));
+
+    const char *filters[] = { "name=Alice", NULL };
+    KdbRow *row = kdb_find_one(db, TABLE, filters);
+    ASSERT(row != NULL);
+    if (row) {
+        const KdbField *items = NULL;
+        size_t count = 0;
+        ASSERT_OK(kdb_row_get_array(row, "tags", &items, &count));
+        ASSERT_EQ(count, 2u);
+        if (count == 2) {
+            ASSERT_STR(items[0].v.as_string, "vip");
+            ASSERT_STR(items[1].v.as_string, "premium");
+        }
+
+        const KdbField *obj = NULL;
+        ASSERT_OK(kdb_row_get_object(row, "address", &obj));
+        ASSERT(obj != NULL);
+        if (obj) {
+            const KdbField *city = NULL;
+            for (const KdbField *sub = obj; sub->name != NULL; sub++)
+                if (strcmp(sub->name, "city") == 0) city = sub;
+            ASSERT(city != NULL);
+            if (city) ASSERT_STR(city->v.as_string, "NYC");
+        }
+
+        /* wrong-type getters fail cleanly instead of misreading memory */
+        ASSERT_ERR(kdb_row_get_array(row, "address", &items, &count));
+        ASSERT_ERR(kdb_row_get_object(row, "tags", &obj));
+
+        kdb_row_free(row);
+    }
+
+    teardown(db);
+}
+
+static void test_nested_survives_reopen(void) {
+    system("rm -rf " TEST_DIR);
+    mkdir(TEST_DIR, 0755);
+
+    KumDB *db = kdb_open(TEST_DIR);
+    ASSERT(db != NULL);
+
+    KdbField addr[] = { kdb_field_string("city", "Berlin"), kdb_field_end() };
+    KdbField f[] = {
+        kdb_field_string("name", "Bob"),
+        kdb_field_object("address", addr),
+        kdb_field_end()
+    };
+    ASSERT_OK(kdb_add(db, TABLE, f));
+    kdb_close(db);
+
+    db = kdb_open(TEST_DIR);
+    ASSERT(db != NULL);
+    const char *filters[] = { "name=Bob", NULL };
+    KdbRow *row = kdb_find_one(db, TABLE, filters);
+    ASSERT(row != NULL);
+    if (row) {
+        const KdbField *obj = NULL;
+        ASSERT_OK(kdb_row_get_object(row, "address", &obj));
+        ASSERT(obj != NULL && obj->name != NULL);
+        if (obj && obj->name) ASSERT_STR(obj->v.as_string, "Berlin");
+        kdb_row_free(row);
+    }
+
+    kdb_close(db);
+    system("rm -rf " TEST_DIR);
+}
+
 static void test_list_tables_repeated(void) {
     KumDB *db;
     setup(&db);
@@ -514,6 +602,8 @@ int main(void) {
     test_id_and_timestamp_filters();
     test_numeric_literal_edge_cases();
     test_blob_field();
+    test_nested_array_object();
+    test_nested_survives_reopen();
     test_list_tables_repeated();
 
     printf("passed=%d  failed=%d\n", passed, failed);

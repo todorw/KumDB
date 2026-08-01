@@ -195,6 +195,104 @@ static void test_value_cast(void) {
     ASSERT_EQ_INT(dst.v.as_bool, 0);
 }
 
+static void test_value_array(void) {
+    KdbValue elems[3];
+    kdb_value_from_int(1, &elems[0]);
+    kdb_value_from_string("two", KDB_TYPE_STRING, &elems[1]);
+    kdb_value_from_float(3.5, &elems[2]);
+
+    KdbValue arr;
+    ASSERT(kdb_value_from_array(elems, 3, &arr) == KDB_OK);
+    for (int i = 0; i < 3; i++) kdb_value_free(&elems[i]);
+
+    ASSERT_EQ_INT(arr.type, KDB_TYPE_ARRAY);
+    ASSERT_EQ_INT((int)arr.v.as_array.count, 3);
+    ASSERT_EQ_INT(arr.v.as_array.items[0].v.as_int, 1);
+    ASSERT_STR(arr.v.as_array.items[1].v.as_string.data, "two");
+
+    char buf[128];
+    kdb_value_to_str(&arr, buf, sizeof(buf));
+    ASSERT_STR(buf, "[1, \"two\", 3.5]");
+
+    /* deep copy is independent of the original */
+    KdbValue arr_copy;
+    ASSERT(kdb_value_copy(&arr, &arr_copy) == KDB_OK);
+    ASSERT_EQ_INT(kdb_value_compare(&arr, &arr_copy), 0);
+    kdb_value_free(&arr);
+    ASSERT_EQ_INT(arr_copy.v.as_array.count, 3u); /* survives freeing the source */
+    ASSERT_STR(arr_copy.v.as_array.items[1].v.as_string.data, "two");
+
+    /* different array: NEQ must actually detect the difference, not just
+       report "incomparable" (that was the trap here) */
+    KdbValue diff_elems[1];
+    kdb_value_from_int(99, &diff_elems[0]);
+    KdbValue arr_diff;
+    kdb_value_from_array(diff_elems, 1, &arr_diff);
+    kdb_value_free(&diff_elems[0]);
+    int cmp = kdb_value_compare(&arr_copy, &arr_diff);
+    ASSERT(cmp != 0 && cmp != INT32_MIN);
+
+    kdb_value_free(&arr_copy);
+    kdb_value_free(&arr_diff);
+}
+
+static void test_value_object(void) {
+    KdbRecordField fields[2];
+    snprintf(fields[0].col_name, sizeof(fields[0].col_name), "city");
+    kdb_value_from_string("NYC", KDB_TYPE_STRING, &fields[0].value);
+    snprintf(fields[1].col_name, sizeof(fields[1].col_name), "zip");
+    kdb_value_from_int(10001, &fields[1].value);
+
+    KdbValue obj;
+    ASSERT(kdb_value_from_object(fields, 2, &obj) == KDB_OK);
+    kdb_value_free(&fields[0].value);
+    kdb_value_free(&fields[1].value);
+
+    ASSERT_EQ_INT(obj.type, KDB_TYPE_OBJECT);
+    ASSERT_EQ_INT((int)obj.v.as_object.count, 2);
+    ASSERT_STR(obj.v.as_object.fields[0].col_name, "city");
+
+    char buf[128];
+    kdb_value_to_str(&obj, buf, sizeof(buf));
+    ASSERT_STR(buf, "{city: \"NYC\", zip: 10001}");
+
+    KdbValue obj_copy;
+    ASSERT(kdb_value_copy(&obj, &obj_copy) == KDB_OK);
+    ASSERT_EQ_INT(kdb_value_compare(&obj, &obj_copy), 0);
+
+    kdb_value_free(&obj);
+    kdb_value_free(&obj_copy);
+}
+
+static void test_value_nested_deep(void) {
+    /* array containing an object containing an array -- exercises real
+       recursion, not just one level */
+    KdbRecordField inner_fields[1];
+    snprintf(inner_fields[0].col_name, sizeof(inner_fields[0].col_name), "tags");
+    KdbValue inner_arr_elems[2];
+    kdb_value_from_string("a", KDB_TYPE_STRING, &inner_arr_elems[0]);
+    kdb_value_from_string("b", KDB_TYPE_STRING, &inner_arr_elems[1]);
+    kdb_value_from_array(inner_arr_elems, 2, &inner_fields[0].value);
+    kdb_value_free(&inner_arr_elems[0]);
+    kdb_value_free(&inner_arr_elems[1]);
+
+    KdbValue obj;
+    kdb_value_from_object(inner_fields, 1, &obj);
+    kdb_value_free(&inner_fields[0].value);
+
+    KdbValue outer_elems[1];
+    outer_elems[0] = obj; /* move semantics: obj's heap data now owned by outer_elems[0] */
+    KdbValue outer;
+    kdb_value_from_array(outer_elems, 1, &outer);
+    kdb_value_free(&outer_elems[0]);
+
+    char buf[256];
+    kdb_value_to_str(&outer, buf, sizeof(buf));
+    ASSERT_STR(buf, "[{tags: [\"a\", \"b\"]}]");
+
+    kdb_value_free(&outer);
+}
+
 int main(void) {
     printf("=== test_types ===\n");
 
@@ -209,6 +307,9 @@ int main(void) {
     test_value_matches();
     test_parse_filter_key();
     test_value_cast();
+    test_value_array();
+    test_value_object();
+    test_value_nested_deep();
 
     printf("passed=%d  failed=%d\n", passed, failed);
     return failed > 0 ? 1 : 0;

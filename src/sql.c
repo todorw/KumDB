@@ -627,40 +627,93 @@ static KdbStatus sql__exec_insert(SqlParser *p, KumDB *db, size_t *affected_out)
     return st;
 }
 
-/* Deep-copies a field's value (owned string/blob memory) into dst, which
- * must already have dst->type set to src->type. Used whenever a value from
- * an input row needs to outlive that row (projection, aggregation). */
-static void sql__copy_field_value(KdbField *dst, const KdbField *src) {
+/* Recursively frees a single field's owned memory (name, plus whatever the
+ * value owns: string/blob data, or array/object children). Safe on a
+ * partially-built field and safe when .name is NULL (array elements). */
+static void sql__free_field(KdbField *f) {
+    if (!f) return;
+    free((void *)f->name);
+    if (f->type == KDB_TYPE_STRING) {
+        free((void *)f->v.as_string);
+    } else if (f->type == KDB_TYPE_BLOB) {
+        free((void *)f->v.as_blob.data);
+    } else if (f->type == KDB_TYPE_ARRAY) {
+        for (size_t i = 0; i < f->v.as_array.count; i++)
+            sql__free_field((KdbField *)&f->v.as_array.items[i]);
+        free((void *)f->v.as_array.items);
+    } else if (f->type == KDB_TYPE_OBJECT) {
+        if (f->v.as_object) {
+            for (const KdbField *sub = f->v.as_object; sub->name != NULL; sub++)
+                sql__free_field((KdbField *)sub);
+            free((void *)f->v.as_object);
+        }
+    }
+}
+
+/* Deep-copies a field's value (owned string/blob/array/object memory) into
+ * dst, which must already have dst->type set to src->type. Used whenever a
+ * value from an input row needs to outlive that row (projection,
+ * aggregation). Returns 0 on OOM (dst is left in a state safe to pass to
+ * sql__free_field either way). */
+static int sql__copy_field_value(KdbField *dst, const KdbField *src) {
     switch (src->type) {
-        case KDB_TYPE_INT:    dst->v.as_int   = src->v.as_int;   break;
-        case KDB_TYPE_FLOAT:  dst->v.as_float = src->v.as_float; break;
-        case KDB_TYPE_BOOL:   dst->v.as_bool  = src->v.as_bool;  break;
+        case KDB_TYPE_INT:    dst->v.as_int   = src->v.as_int;   return 1;
+        case KDB_TYPE_FLOAT:  dst->v.as_float = src->v.as_float; return 1;
+        case KDB_TYPE_BOOL:   dst->v.as_bool  = src->v.as_bool;  return 1;
         case KDB_TYPE_STRING:
             dst->v.as_string = src->v.as_string ? strdup(src->v.as_string) : NULL;
-            break;
+            return 1;
         case KDB_TYPE_BLOB:
             if (src->v.as_blob.len > 0 && src->v.as_blob.data) {
                 void *copy = malloc(src->v.as_blob.len);
-                if (copy) memcpy(copy, src->v.as_blob.data, src->v.as_blob.len);
+                if (!copy) return 0;
+                memcpy(copy, src->v.as_blob.data, src->v.as_blob.len);
                 dst->v.as_blob.data = copy;
             } else {
                 dst->v.as_blob.data = NULL;
             }
             dst->v.as_blob.len = src->v.as_blob.len;
-            break;
+            return 1;
+        case KDB_TYPE_ARRAY: {
+            size_t count = src->v.as_array.count;
+            dst->v.as_array.items = NULL;
+            dst->v.as_array.count = 0;
+            if (count == 0) return 1;
+            KdbField *items = (KdbField *)calloc(count, sizeof(KdbField));
+            if (!items) return 0;
+            dst->v.as_array.items = items;
+            dst->v.as_array.count = count;
+            for (size_t i = 0; i < count; i++) {
+                items[i].name = NULL;
+                items[i].type = src->v.as_array.items[i].type;
+                if (!sql__copy_field_value(&items[i], &src->v.as_array.items[i])) return 0;
+            }
+            return 1;
+        }
+        case KDB_TYPE_OBJECT: {
+            uint32_t count = 0;
+            if (src->v.as_object) while (src->v.as_object[count].name != NULL) count++;
+            KdbField *fields = (KdbField *)calloc((size_t)count + 1, sizeof(KdbField));
+            if (!fields) return 0;
+            dst->v.as_object = fields;
+            for (uint32_t i = 0; i < count; i++) {
+                fields[i].name = strdup(src->v.as_object[i].name);
+                if (!fields[i].name) return 0;
+                fields[i].type = src->v.as_object[i].type;
+                if (!sql__copy_field_value(&fields[i], &src->v.as_object[i])) return 0;
+            }
+            return 1;
+        }
         default:
             memset(&dst->v, 0, sizeof(dst->v));
-            break;
+            return 1;
     }
 }
 
 static void sql__free_row_fields(KdbRow *row) {
     if (!row || !row->fields) return;
-    for (uint32_t i = 0; i < row->field_count; i++) {
-        free((void *)row->fields[i].name);
-        if (row->fields[i].type == KDB_TYPE_STRING) free((void *)row->fields[i].v.as_string);
-        else if (row->fields[i].type == KDB_TYPE_BLOB) free((void *)row->fields[i].v.as_blob.data);
-    }
+    for (uint32_t i = 0; i < row->field_count; i++)
+        sql__free_field(&row->fields[i]);
     free(row->fields);
     row->fields      = NULL;
     row->field_count = 0;
@@ -817,11 +870,7 @@ static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uin
             KdbField *of = &fields[it];
             of->name = strdup(items[it].alias);
             if (!of->name) {
-                for (uint32_t k = 0; k < it; k++) {
-                    free((void *)fields[k].name);
-                    if (fields[k].type == KDB_TYPE_STRING) free((void *)fields[k].v.as_string);
-                    else if (fields[k].type == KDB_TYPE_BLOB) free((void *)fields[k].v.as_blob.data);
-                }
+                for (uint32_t k = 0; k < it; k++) sql__free_field(&fields[k]);
                 free(fields);
                 kdb_rows_free(result);
                 free(groups);
@@ -829,9 +878,10 @@ static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uin
                 return KDB_ERR_OOM;
             }
 
+            int copy_ok = 1;
             switch (items[it].fn) {
                 case SQL_AGG_NONE:
-                    if (g->key_ref) { of->type = g->key_ref->type; sql__copy_field_value(of, g->key_ref); }
+                    if (g->key_ref) { of->type = g->key_ref->type; copy_ok = sql__copy_field_value(of, g->key_ref); }
                     else            { of->type = KDB_TYPE_NULL; }
                     break;
                 case SQL_AGG_COUNT:
@@ -847,13 +897,21 @@ static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uin
                     of->v.as_float = g->count_nonnull[it] > 0 ? g->sum[it] / (double)g->count_nonnull[it] : 0.0;
                     break;
                 case SQL_AGG_MIN:
-                    if (g->min_ref[it]) { of->type = g->min_ref[it]->type; sql__copy_field_value(of, g->min_ref[it]); }
+                    if (g->min_ref[it]) { of->type = g->min_ref[it]->type; copy_ok = sql__copy_field_value(of, g->min_ref[it]); }
                     else                { of->type = KDB_TYPE_NULL; }
                     break;
                 case SQL_AGG_MAX:
-                    if (g->max_ref[it]) { of->type = g->max_ref[it]->type; sql__copy_field_value(of, g->max_ref[it]); }
+                    if (g->max_ref[it]) { of->type = g->max_ref[it]->type; copy_ok = sql__copy_field_value(of, g->max_ref[it]); }
                     else                { of->type = KDB_TYPE_NULL; }
                     break;
+            }
+            if (!copy_ok) {
+                for (uint32_t k = 0; k <= it; k++) sql__free_field(&fields[k]);
+                free(fields);
+                kdb_rows_free(result);
+                free(groups);
+                kdb_err_oom("aggregate field value");
+                return KDB_ERR_OOM;
             }
         }
 
@@ -917,51 +975,18 @@ static KdbStatus sql__project_rows(KdbRows *rows, char proj_cols[][KDB_SQL_IDENT
             const KdbField *src = kdb_row_get(row, proj_cols[i]);
             if (!src) continue;
 
-            char *name_copy = strdup(proj_cols[i]);
-            if (!name_copy) {
-                for (uint32_t k = 0; k < kept; k++) {
-                    free((void *)new_fields[k].name);
-                    if (new_fields[k].type == KDB_TYPE_STRING) free((void *)new_fields[k].v.as_string);
-                    else if (new_fields[k].type == KDB_TYPE_BLOB) free((void *)new_fields[k].v.as_blob.data);
-                }
+            KdbField *dst = &new_fields[kept];
+            dst->name = strdup(proj_cols[i]);
+            dst->type = src->type;
+            if (!dst->name || !sql__copy_field_value(dst, src)) {
+                for (uint32_t k = 0; k <= kept; k++) sql__free_field(&new_fields[k]);
                 free(new_fields);
                 return KDB_ERR_OOM;
             }
-
-            KdbField dst;
-            dst.name = name_copy;
-            dst.type = src->type;
-            switch (src->type) {
-                case KDB_TYPE_INT:    dst.v.as_int   = src->v.as_int;   break;
-                case KDB_TYPE_FLOAT:  dst.v.as_float = src->v.as_float; break;
-                case KDB_TYPE_BOOL:   dst.v.as_bool  = src->v.as_bool;  break;
-                case KDB_TYPE_STRING:
-                    dst.v.as_string = src->v.as_string ? strdup(src->v.as_string) : NULL;
-                    break;
-                case KDB_TYPE_BLOB:
-                    if (src->v.as_blob.len > 0 && src->v.as_blob.data) {
-                        void *copy = malloc(src->v.as_blob.len);
-                        if (copy) memcpy(copy, src->v.as_blob.data, src->v.as_blob.len);
-                        dst.v.as_blob.data = copy;
-                    } else {
-                        dst.v.as_blob.data = NULL;
-                    }
-                    dst.v.as_blob.len = src->v.as_blob.len;
-                    break;
-                default:
-                    memset(&dst.v, 0, sizeof(dst.v));
-                    break;
-            }
-            new_fields[kept++] = dst;
+            kept++;
         }
 
-        for (uint32_t i = 0; i < row->field_count; i++) {
-            free((void *)row->fields[i].name);
-            if (row->fields[i].type == KDB_TYPE_STRING) free((void *)row->fields[i].v.as_string);
-            else if (row->fields[i].type == KDB_TYPE_BLOB) free((void *)row->fields[i].v.as_blob.data);
-        }
-        free(row->fields);
-
+        sql__free_row_fields(row);
         row->fields      = new_fields;
         row->field_count = kept;
     }

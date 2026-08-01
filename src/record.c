@@ -289,27 +289,104 @@ static uint64_t read_u64(const uint8_t **p) {
 }
 
 
+static size_t kdb__value_payload_size(const KdbValue *v) {
+    switch (v->type) {
+        case KDB_TYPE_INT:    return 8;
+        case KDB_TYPE_FLOAT:  return 8;
+        case KDB_TYPE_BOOL:   return 1;
+        case KDB_TYPE_STRING: return 4 + v->v.as_string.len + 1;
+        case KDB_TYPE_BLOB:   return 4 + v->v.as_blob.len;
+        case KDB_TYPE_ARRAY: {
+            size_t size = 4; /* element count */
+            for (size_t i = 0; i < v->v.as_array.count; i++)
+                size += KDB_VALUE_HEADER_SIZE + kdb__value_payload_size(&v->v.as_array.items[i]);
+            return size;
+        }
+        case KDB_TYPE_OBJECT: {
+            size_t size = 4; /* field count */
+            for (uint32_t i = 0; i < v->v.as_object.count; i++)
+                size += KDB_FIELD_HEADER_SIZE + kdb__value_payload_size(&v->v.as_object.fields[i].value);
+            return size;
+        }
+        case KDB_TYPE_NULL:
+        default:
+            return 0;
+    }
+}
+
 size_t kdb_record_serial_size(const KdbRecord *r) {
     if (!r) return 0;
-    
 
     size_t size = KDB_RECORD_FIXED_SIZE;
 
     for (uint32_t i = 0; i < r->field_count; i++) {
-        
         size += KDB_FIELD_HEADER_SIZE;
-        const KdbValue *v = &r->fields[i].value;
-        switch (v->type) {
-            case KDB_TYPE_INT:    size += 8; break;
-            case KDB_TYPE_FLOAT:  size += 8; break;
-            case KDB_TYPE_BOOL:   size += 1; break;
-            case KDB_TYPE_STRING: size += 4 + v->v.as_string.len + 1; break;
-            case KDB_TYPE_BLOB:   size += 4 + v->v.as_blob.len;       break;
-            case KDB_TYPE_NULL:   break;
-            default:              break;
-        }
+        size += kdb__value_payload_size(&r->fields[i].value);
     }
     return size;
+}
+
+static void kdb__write_value_header(uint8_t **p, KdbType type) {
+    write_u8(p, (uint8_t)type);
+    write_u8(p, 0); write_u8(p, 0); write_u8(p, 0);
+    write_u8(p, 0); write_u8(p, 0); write_u8(p, 0); write_u8(p, 0);
+}
+
+static void kdb__write_field_name(uint8_t **p, const char *col_name) {
+    uint8_t name_buf[KDB_MAX_NAME_LEN];
+    memset(name_buf, 0, KDB_MAX_NAME_LEN);
+    snprintf((char *)name_buf, KDB_MAX_NAME_LEN, "%s", col_name);
+    write_bytes(p, name_buf, KDB_MAX_NAME_LEN);
+}
+
+static void kdb__write_value_payload(uint8_t **p, const KdbValue *v) {
+    switch (v->type) {
+        case KDB_TYPE_INT:
+            write_u64(p, (uint64_t)v->v.as_int);
+            break;
+        case KDB_TYPE_FLOAT: {
+            uint64_t bits;
+            memcpy(&bits, &v->v.as_float, 8);
+            write_u64(p, bits);
+            break;
+        }
+        case KDB_TYPE_BOOL:
+            write_u8(p, v->v.as_bool);
+            break;
+        case KDB_TYPE_STRING: {
+            uint32_t slen = (uint32_t)v->v.as_string.len;
+            write_u32(p, slen);
+            if (slen > 0) write_bytes(p, v->v.as_string.data, slen);
+            write_u8(p, 0);
+            break;
+        }
+        case KDB_TYPE_BLOB: {
+            uint32_t blen = (uint32_t)v->v.as_blob.len;
+            write_u32(p, blen);
+            if (blen > 0) write_bytes(p, v->v.as_blob.data, blen);
+            break;
+        }
+        case KDB_TYPE_ARRAY:
+            write_u32(p, (uint32_t)v->v.as_array.count);
+            for (size_t i = 0; i < v->v.as_array.count; i++) {
+                const KdbValue *elem = &v->v.as_array.items[i];
+                kdb__write_value_header(p, elem->type);
+                kdb__write_value_payload(p, elem);
+            }
+            break;
+        case KDB_TYPE_OBJECT:
+            write_u32(p, (uint32_t)v->v.as_object.count);
+            for (uint32_t i = 0; i < v->v.as_object.count; i++) {
+                const KdbRecordField *f = &v->v.as_object.fields[i];
+                kdb__write_field_name(p, f->col_name);
+                kdb__write_value_header(p, f->value.type);
+                kdb__write_value_payload(p, &f->value);
+            }
+            break;
+        case KDB_TYPE_NULL:
+        default:
+            break;
+    }
 }
 
 size_t kdb_record_serialize(const KdbRecord *r, uint8_t *buf, size_t buf_size) {
@@ -323,58 +400,126 @@ size_t kdb_record_serialize(const KdbRecord *r, uint8_t *buf, size_t buf_size) {
     write_u64(&p, r->updated_at);
     write_u32(&p, r->field_count);
     write_u8 (&p, r->deleted);
-    write_u8 (&p, 0); write_u8(&p, 0); write_u8(&p, 0); 
+    write_u8 (&p, 0); write_u8(&p, 0); write_u8(&p, 0);
 
     for (uint32_t i = 0; i < r->field_count; i++) {
         const KdbRecordField *f = &r->fields[i];
-
-        
-        uint8_t name_buf[KDB_MAX_NAME_LEN];
-        memset(name_buf, 0, KDB_MAX_NAME_LEN);
-        snprintf((char *)name_buf, KDB_MAX_NAME_LEN, "%s", f->col_name);
-        write_bytes(&p, name_buf, KDB_MAX_NAME_LEN);
-
-        
-        write_u8(&p, (uint8_t)f->value.type);
-        write_u8(&p, 0); write_u8(&p, 0); write_u8(&p, 0);
-        write_u8(&p, 0); write_u8(&p, 0); write_u8(&p, 0); write_u8(&p, 0);
-
-        
-        switch (f->value.type) {
-            case KDB_TYPE_INT:
-                write_u64(&p, (uint64_t)f->value.v.as_int);
-                break;
-            case KDB_TYPE_FLOAT: {
-                uint64_t bits;
-                memcpy(&bits, &f->value.v.as_float, 8);
-                write_u64(&p, bits);
-                break;
-            }
-            case KDB_TYPE_BOOL:
-                write_u8(&p, f->value.v.as_bool);
-                break;
-            case KDB_TYPE_STRING: {
-                uint32_t slen = (uint32_t)f->value.v.as_string.len;
-                write_u32(&p, slen);
-                if (slen > 0)
-                    write_bytes(&p, f->value.v.as_string.data, slen);
-                write_u8(&p, 0); 
-                break;
-            }
-            case KDB_TYPE_BLOB: {
-                uint32_t blen = (uint32_t)f->value.v.as_blob.len;
-                write_u32(&p, blen);
-                if (blen > 0)
-                    write_bytes(&p, f->value.v.as_blob.data, blen);
-                break;
-            }
-            case KDB_TYPE_NULL:
-            default:
-                break;
-        }
+        kdb__write_field_name(&p, f->col_name);
+        kdb__write_value_header(&p, f->value.type);
+        kdb__write_value_payload(&p, &f->value);
     }
 
     return (size_t)(p - buf);
+}
+
+/* Reads one value (8-byte type+padding header, then type-specific payload)
+ * from *pp, advancing it. depth guards against runaway/malicious nesting;
+ * KDB_MAX_NEST_ELEMS bounds each array/object's element count. On error,
+ * whatever was already allocated into *v (e.g. a partially-filled nested
+ * array) stays correctly linked and zero-initialized past the failure
+ * point, so the caller's eventual kdb_value_free()/kdb_record_free() still
+ * cleans it up safely -- nothing here needs its own rollback. */
+static KdbStatus kdb__read_value(const uint8_t **pp, const uint8_t *p_end, KdbValue *v, int depth) {
+    const uint8_t *p = *pp;
+
+    if ((size_t)(p_end - p) < 8) return KDB_ERR_CORRUPT;
+    v->type = (KdbType)read_u8(&p);
+    p += 7;
+
+    switch (v->type) {
+        case KDB_TYPE_INT:
+            if ((size_t)(p_end - p) < 8) return KDB_ERR_CORRUPT;
+            v->v.as_int = (int64_t)read_u64(&p);
+            break;
+        case KDB_TYPE_FLOAT: {
+            if ((size_t)(p_end - p) < 8) return KDB_ERR_CORRUPT;
+            uint64_t bits = read_u64(&p);
+            memcpy(&v->v.as_float, &bits, 8);
+            break;
+        }
+        case KDB_TYPE_BOOL:
+            if ((size_t)(p_end - p) < 1) return KDB_ERR_CORRUPT;
+            v->v.as_bool = read_u8(&p);
+            break;
+        case KDB_TYPE_STRING: {
+            if ((size_t)(p_end - p) < 4) return KDB_ERR_CORRUPT;
+            uint32_t slen = read_u32(&p);
+            if (slen > KDB_MAX_STRING_LEN) return KDB_ERR_CORRUPT;
+            if ((size_t)(p_end - p) < (size_t)slen + 1) return KDB_ERR_CORRUPT;
+            char *str = malloc((size_t)slen + 1);
+            if (!str) return KDB_ERR_OOM;
+            memcpy(str, p, slen);
+            str[slen] = '\0';
+            p += (size_t)slen + 1;
+            v->v.as_string.data = str;
+            v->v.as_string.len  = slen;
+            break;
+        }
+        case KDB_TYPE_BLOB: {
+            if ((size_t)(p_end - p) < 4) return KDB_ERR_CORRUPT;
+            uint32_t blen = read_u32(&p);
+            if (blen > KDB_MAX_STRING_LEN) return KDB_ERR_CORRUPT;
+            if ((size_t)(p_end - p) < blen) return KDB_ERR_CORRUPT;
+            uint8_t *blob = NULL;
+            if (blen > 0) {
+                blob = malloc(blen);
+                if (!blob) return KDB_ERR_OOM;
+                memcpy(blob, p, blen);
+            }
+            p += blen;
+            v->v.as_blob.data = blob;
+            v->v.as_blob.len  = blen;
+            break;
+        }
+        case KDB_TYPE_ARRAY: {
+            if (depth >= KDB_MAX_NEST_DEPTH) return KDB_ERR_CORRUPT;
+            if ((size_t)(p_end - p) < 4) return KDB_ERR_CORRUPT;
+            uint32_t count = read_u32(&p);
+            if (count > KDB_MAX_NEST_ELEMS) return KDB_ERR_CORRUPT;
+            v->v.as_array.items = NULL;
+            v->v.as_array.count = 0;
+            if (count > 0) {
+                KdbValue *items = (KdbValue *)calloc(count, sizeof(KdbValue));
+                if (!items) return KDB_ERR_OOM;
+                v->v.as_array.items = items;
+                v->v.as_array.count = count;
+                for (uint32_t i = 0; i < count; i++) {
+                    KdbStatus st = kdb__read_value(&p, p_end, &items[i], depth + 1);
+                    if (st != KDB_OK) return st;
+                }
+            }
+            break;
+        }
+        case KDB_TYPE_OBJECT: {
+            if (depth >= KDB_MAX_NEST_DEPTH) return KDB_ERR_CORRUPT;
+            if ((size_t)(p_end - p) < 4) return KDB_ERR_CORRUPT;
+            uint32_t count = read_u32(&p);
+            if (count > KDB_MAX_NEST_ELEMS) return KDB_ERR_CORRUPT;
+            v->v.as_object.fields = NULL;
+            v->v.as_object.count  = 0;
+            if (count > 0) {
+                KdbRecordField *fields = (KdbRecordField *)calloc(count, sizeof(KdbRecordField));
+                if (!fields) return KDB_ERR_OOM;
+                v->v.as_object.fields = fields;
+                v->v.as_object.count  = count;
+                for (uint32_t i = 0; i < count; i++) {
+                    if ((size_t)(p_end - p) < KDB_MAX_NAME_LEN) return KDB_ERR_CORRUPT;
+                    memcpy(fields[i].col_name, p, KDB_MAX_NAME_LEN);
+                    fields[i].col_name[KDB_MAX_NAME_LEN - 1] = '\0';
+                    p += KDB_MAX_NAME_LEN;
+                    KdbStatus st = kdb__read_value(&p, p_end, &fields[i].value, depth + 1);
+                    if (st != KDB_OK) return st;
+                }
+            }
+            break;
+        }
+        case KDB_TYPE_NULL:
+        default:
+            break;
+    }
+
+    *pp = p;
+    return KDB_OK;
 }
 
 KdbRecord *kdb_record_deserialize(const uint8_t *buf,
@@ -424,58 +569,12 @@ KdbRecord *kdb_record_deserialize(const uint8_t *buf,
         f->col_name[KDB_MAX_NAME_LEN - 1] = '\0';
         p += KDB_MAX_NAME_LEN;
 
-        NEED(8);
-        f->value.type = (KdbType)read_u8(&p);
-        p += 7; 
-
-        switch (f->value.type) {
-            case KDB_TYPE_INT:
-                NEED(8);
-                f->value.v.as_int = (int64_t)read_u64(&p);
-                break;
-            case KDB_TYPE_FLOAT: {
-                NEED(8);
-                uint64_t bits = read_u64(&p);
-                memcpy(&f->value.v.as_float, &bits, 8);
-                break;
-            }
-            case KDB_TYPE_BOOL:
-                NEED(1);
-                f->value.v.as_bool = read_u8(&p);
-                break;
-            case KDB_TYPE_STRING: {
-                NEED(4);
-                uint32_t slen = read_u32(&p);
-                if (slen > KDB_MAX_STRING_LEN) {
-                    kdb_err_io_corrupt("record: string field too long");
-                    kdb_record_free(r);
-                    return NULL;
-                }
-                NEED(slen + 1);
-                char *str = malloc(slen + 1);
-                if (!str) { kdb_err_oom("string field"); kdb_record_free(r); return NULL; }
-                memcpy(str, p, slen);
-                str[slen] = '\0';
-                p += slen + 1; 
-                f->value.v.as_string.data = str;
-                f->value.v.as_string.len  = slen;
-                break;
-            }
-            case KDB_TYPE_BLOB: {
-                NEED(4);
-                uint32_t blen = read_u32(&p);
-                NEED(blen);
-                uint8_t *blob = malloc(blen);
-                if (!blob && blen > 0) { kdb_err_oom("blob field"); kdb_record_free(r); return NULL; }
-                if (blen > 0) memcpy(blob, p, blen);
-                p += blen;
-                f->value.v.as_blob.data = blob;
-                f->value.v.as_blob.len  = blen;
-                break;
-            }
-            case KDB_TYPE_NULL:
-            default:
-                break;
+        KdbStatus vst = kdb__read_value(&p, p_end, &f->value, 0);
+        if (vst != KDB_OK) {
+            if (vst == KDB_ERR_OOM) kdb_err_oom("record field value");
+            else                    kdb_err_io_corrupt("record: malformed field value");
+            kdb_record_free(r);
+            return NULL;
         }
     }
 
@@ -523,7 +622,7 @@ KdbRecord *kdb_record_read(FILE *fp) {
     uint32_t sz32 = 0;
     if (fread(&sz32, 4, 1, fp) != 1) return NULL; 
 
-    if (sz32 == 0 || sz32 > (KDB_MAX_COLUMNS * (KDB_FIELD_HEADER_SIZE + KDB_MAX_STRING_LEN) + KDB_RECORD_FIXED_SIZE)) {
+    if (sz32 == 0 || sz32 > KDB_MAX_RECORD_SERIAL_SIZE) {
         kdb_err_io_corrupt("record: implausible size prefix");
         return NULL;
     }
