@@ -111,23 +111,46 @@ int kdb_query_is_empty(const KdbQuery *q) {
 }
 
 
+static int kdb__pseudo_column_value(const KdbRecord *r, const char *col_name, KdbValue *out) {
+    if (strcmp(col_name, "id") == 0) {
+        kdb_value_from_int((int64_t)r->id, out);
+        return 1;
+    }
+    if (strcmp(col_name, "created_at") == 0) {
+        kdb_value_from_int((int64_t)r->created_at, out);
+        return 1;
+    }
+    if (strcmp(col_name, "updated_at") == 0) {
+        kdb_value_from_int((int64_t)r->updated_at, out);
+        return 1;
+    }
+    return 0;
+}
+
 int kdb_query_matches(const KdbQuery *q, const KdbRecord *r) {
     if (!q || !r) return 0;
     if (r->deleted) return 0;
-    if (q->count == 0) return 1; 
+    if (q->count == 0) return 1;
 
     for (uint32_t i = 0; i < q->count; i++) {
-        const KdbFilter *f     = &q->filters[i];
-        const KdbRecordField  *field = kdb_record_get_field(r, f->col_name);
+        const KdbFilter *f = &q->filters[i];
 
-        
-        if (!field) {
-            if (f->op == KDB_OP_IS_NULL)     { continue; }
-            if (f->op == KDB_OP_IS_NOT_NULL) { return 0; }
-            return 0; 
+
+        KdbValue pseudo_val;
+        const KdbValue *val;
+        if (kdb__pseudo_column_value(r, f->col_name, &pseudo_val)) {
+            val = &pseudo_val;
+        } else {
+            const KdbRecordField *field = kdb_record_get_field(r, f->col_name);
+            if (!field) {
+                if (f->op == KDB_OP_IS_NULL)     { continue; }
+                if (f->op == KDB_OP_IS_NOT_NULL) { return 0; }
+                return 0;
+            }
+            val = &field->value;
         }
 
-        if (!kdb_value_matches(&field->value, f->op, &f->value, &f->value2))
+        if (!kdb_value_matches(val, f->op, &f->value, &f->value2))
             return 0;
     }
     return 1;
@@ -206,6 +229,13 @@ static int         kdb__sort_asc    = 1;
 static int kdb__sort_cmp(const void *a, const void *b) {
     const KdbRecord *ra = (const KdbRecord *)a;
     const KdbRecord *rb = (const KdbRecord *)b;
+
+    KdbValue pa, pb;
+    if (kdb__pseudo_column_value(ra, kdb__sort_col, &pa) &&
+        kdb__pseudo_column_value(rb, kdb__sort_col, &pb)) {
+        int cmp = kdb_value_compare(&pa, &pb);
+        return kdb__sort_asc ? cmp : -cmp;
+    }
 
     const KdbRecordField *fa = kdb_record_get_field(ra, kdb__sort_col);
     const KdbRecordField *fb = kdb_record_get_field(rb, kdb__sort_col);

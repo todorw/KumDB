@@ -229,20 +229,22 @@ void kdb_value_free(KdbValue *v) {
 static double kdb__to_double(const KdbValue *v) {
     if (v->type == KDB_TYPE_INT)   return (double)v->v.as_int;
     if (v->type == KDB_TYPE_FLOAT) return v->v.as_float;
+    if (v->type == KDB_TYPE_BOOL)  return (double)v->v.as_bool;
     return 0.0;
 }
 
 int kdb_value_compare(const KdbValue *a, const KdbValue *b) {
     if (!a || !b) return INT32_MIN;
 
-    
+
     if (a->type == KDB_TYPE_NULL && b->type == KDB_TYPE_NULL) return 0;
     if (a->type == KDB_TYPE_NULL) return -1;
     if (b->type == KDB_TYPE_NULL) return  1;
 
-    
-    int a_num = (a->type == KDB_TYPE_INT || a->type == KDB_TYPE_FLOAT);
-    int b_num = (b->type == KDB_TYPE_INT || b->type == KDB_TYPE_FLOAT);
+
+
+    int a_num = (a->type == KDB_TYPE_INT || a->type == KDB_TYPE_FLOAT || a->type == KDB_TYPE_BOOL);
+    int b_num = (b->type == KDB_TYPE_INT || b->type == KDB_TYPE_FLOAT || b->type == KDB_TYPE_BOOL);
     if (a_num && b_num) {
         double da = kdb__to_double(a);
         double db = kdb__to_double(b);
@@ -251,11 +253,7 @@ int kdb_value_compare(const KdbValue *a, const KdbValue *b) {
         return 0;
     }
 
-    
-    if (a->type == KDB_TYPE_BOOL && b->type == KDB_TYPE_BOOL)
-        return (int)a->v.as_bool - (int)b->v.as_bool;
 
-    
     if (a->type == KDB_TYPE_STRING && b->type == KDB_TYPE_STRING)
         return strcmp(a->v.as_string.data, b->v.as_string.data);
 
