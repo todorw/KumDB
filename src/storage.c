@@ -11,6 +11,7 @@
 #include "../include/storage.h"
 #include "../include/error.h"
 #include "../include/lock.h"
+#include "../include/platform.h"
 
 
 void kdb_storage_path(const char *data_dir,
@@ -23,11 +24,19 @@ void kdb_storage_path(const char *data_dir,
 static void kdb__ensure_dir(const char *path) {
     struct stat st;
     if (stat(path, &st) != 0) {
-        mkdir(path, 0755);
+        kdb_mkdir(path);
     }
 }
 
+/* Explicit fsync of the parent directory entry is what makes a rename()
+ * durable against a crash on POSIX filesystems. Windows/NTFS doesn't have
+ * (or need) the same idiom -- there's no open()-a-directory-and-fsync-it
+ * primitive to reach for, NTFS's own journaling covers this instead -- so
+ * this is a deliberate no-op there rather than a gap. */
 static void kdb__fsync_parent_dir(const char *path) {
+#ifdef _WIN32
+    (void)path;
+#else
     char dir_path[4096];
     KDB_STRLCPY(dir_path, path, sizeof(dir_path));
 
@@ -43,6 +52,7 @@ static void kdb__fsync_parent_dir(const char *path) {
         fsync(dir_fd);
         close(dir_fd);
     }
+#endif
 }
 
 
@@ -50,7 +60,7 @@ static KdbStatus kdb__write_header(FILE *fp, const KdbTableHeader *hdr) {
     rewind(fp);
     if (fwrite(hdr, sizeof(*hdr), 1, fp) != 1) return KDB_ERR_IO;
     if (fflush(fp) != 0) return KDB_ERR_IO;
-    if (fsync(fileno(fp)) != 0) return KDB_ERR_IO;
+    if (kdb_fsync(fileno(fp)) != 0) return KDB_ERR_IO;
     return KDB_OK;
 }
 
@@ -377,7 +387,7 @@ KdbStatus kdb_storage_rewrite(KdbTable      *tbl,
     }
 
     
-    if (fflush(out_fp) != 0 || fsync(fileno(out_fp)) != 0) {
+    if (fflush(out_fp) != 0 || kdb_fsync(fileno(out_fp)) != 0) {
         fclose(out_fp); unlink(tmp_path);
         kdb_err_io(tmp_path, "fsync rewrite");
         return KDB_ERR_IO;

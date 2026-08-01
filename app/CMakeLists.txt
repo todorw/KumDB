@@ -33,7 +33,7 @@ if(UNIX)
     target_compile_definitions(kumdb PRIVATE _POSIX_C_SOURCE=200809L _GNU_SOURCE)
 endif()
 
-add_executable(kumdb_studio
+set(KUMDB_STUDIO_SOURCES
     src/main.cpp
     src/MainWindow.cpp
     src/MainWindow.h
@@ -45,14 +45,27 @@ add_executable(kumdb_studio
     src/QueryPanel.h
     src/KumDbHandle.cpp
     src/KumDbHandle.h
+    resources/icon.qrc
 )
+
+if(WIN32)
+    list(APPEND KUMDB_STUDIO_SOURCES resources/win_icon.rc)
+endif()
+
+add_executable(kumdb_studio ${KUMDB_STUDIO_SOURCES})
 
 target_link_libraries(kumdb_studio PRIVATE Qt${QT_VERSION_MAJOR}::Widgets kumdb)
 
 if(WIN32)
     set_target_properties(kumdb_studio PROPERTIES WIN32_EXECUTABLE TRUE)
 elseif(APPLE)
-    set_target_properties(kumdb_studio PROPERTIES MACOSX_BUNDLE TRUE)
+    set(KUMDB_ICNS ${KUMDB_ROOT}/assets/icon/icon.icns)
+    set_source_files_properties(${KUMDB_ICNS} PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+    target_sources(kumdb_studio PRIVATE ${KUMDB_ICNS})
+    set_target_properties(kumdb_studio PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_ICON_FILE icon.icns
+    )
 endif()
 
 # Functional check for KumDbHandle's C/C++ interop -- only needs QtCore, so

@@ -14,6 +14,7 @@
 #include "../include/table.h"
 #include "../include/query.h"
 #include "../include/storage.h"
+#include "../include/platform.h"
 
 static void kdb_row_free_internal(KdbRow *row);
 static void kdb__evict_table(KumDB *db, const char *table_name);
@@ -424,7 +425,7 @@ static KdbStatus kdb__tx_backup_table(KumDB *db, const char *table_name) {
     if (st == KDB_OK && ferror(src)) st = KDB_ERR_IO;
     fclose(src);
 
-    if (st == KDB_OK && (fflush(dst) != 0 || fsync(fileno(dst)) != 0)) st = KDB_ERR_IO;
+    if (st == KDB_OK && (fflush(dst) != 0 || kdb_fsync(fileno(dst)) != 0)) st = KDB_ERR_IO;
     fclose(dst);
 
     if (st != KDB_OK) {
@@ -664,7 +665,7 @@ static KumDB *kdb__open_internal(const char *data_dir, uint8_t read_only) {
     struct stat st;
     if (stat(data_dir, &st) != 0) {
         if (!read_only) {
-            mkdir(data_dir, 0755);
+            kdb_mkdir(data_dir);
         } else {
             kdb_set_error(KDB_ERR_NOT_FOUND,
                 "Data directory '%s' doesn't exist and can't be created in read-only mode.",
