@@ -183,8 +183,9 @@ typedef enum {
     KDB_ERR_LOCKED       = -8,   
     KDB_ERR_CORRUPT      = -9,   
     KDB_ERR_FULL         = -10,  
-    KDB_ERR_VALIDATION   = -11,  
-    KDB_ERR_READ_ONLY    = -12,  
+    KDB_ERR_VALIDATION   = -11,
+    KDB_ERR_READ_ONLY    = -12,
+    KDB_ERR_SQL_SYNTAX   = -13,
     KDB_ERR_UNKNOWN      = -99
 } KdbStatus;
 

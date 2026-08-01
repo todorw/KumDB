@@ -62,6 +62,7 @@ const char *kdb_status_name(KdbStatus status) {
         case KDB_ERR_FULL:       return "KDB_ERR_FULL";
         case KDB_ERR_VALIDATION: return "KDB_ERR_VALIDATION";
         case KDB_ERR_READ_ONLY:  return "KDB_ERR_READ_ONLY";
+        case KDB_ERR_SQL_SYNTAX: return "KDB_ERR_SQL_SYNTAX";
         default:                 return "KDB_ERR_UNKNOWN";
     }
 }

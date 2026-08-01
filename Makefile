@@ -29,7 +29,8 @@ LIB_SRCS = \
 	$(SRC_DIR)/index.c    \
 	$(SRC_DIR)/query.c    \
 	$(SRC_DIR)/table.c    \
-	$(SRC_DIR)/kumdb.c
+	$(SRC_DIR)/kumdb.c    \
+	$(SRC_DIR)/sql.c
 
 LIB_OBJS = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(LIB_SRCS))
 
