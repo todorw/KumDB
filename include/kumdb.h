@@ -92,6 +92,60 @@ KdbStatus kdb_delete(KumDB      *db,
                      const char **filters,
                      size_t     *deleted_out);
 
+#define KDB_TX_MAX_TABLES 32
+
+/* Groups kdb_tx_add/update/delete calls into one all-or-nothing unit,
+ * scoped to a single writer -- this is NOT a multi-writer isolation
+ * mechanism, KumDB's concurrency model is still "one writer at a time"
+ * same as everywhere else in this API. What it gives you:
+ *
+ *   - Rollback: kdb_tx_rollback() undoes every change the transaction
+ *     made, across however many tables it touched.
+ *   - Crash safety: if the process dies anywhere between kdb_tx_begin()
+ *     and a completed kdb_tx_commit(), the next kdb_open() (read-write)
+ *     automatically finishes the job -- either rolling back an
+ *     interrupted transaction, or finishing cleanup of one that had
+ *     already committed. A table is never left half-migrated.
+ *
+ * How: the first time a transaction touches a table, it backs up that
+ * table's file (or, if the table didn't exist yet, remembers to drop it
+ * on rollback instead). Operations apply immediately through the normal
+ * kdb_add/kdb_update/kdb_delete underneath -- each already has its own
+ * durability guarantees. Commit writes a small marker recording which
+ * backups are now safe to discard, deletes them, then deletes the
+ * marker; that marker is what recovery uses to tell "committed, just
+ * finish cleanup" apart from "never committed, roll back".
+ *
+ * Costs a full copy of each touched table's file on first touch, so
+ * this is meant for coordinating a handful of tables, not wrapping
+ * bulk operations on huge ones.
+ *
+ * kdb_tx_commit()/kdb_tx_rollback() end the transaction and free tx --
+ * don't reuse it afterward. If any kdb_tx_* call fails, the transaction
+ * is marked failed; kdb_tx_commit() will then refuse (call
+ * kdb_tx_rollback() instead). If kdb_tx_commit() itself fails (e.g. disk
+ * full while writing the marker), tx is NOT freed -- nothing was lost,
+ * retry the commit or roll back.
+ */
+typedef struct {
+    KumDB   *db;
+    char     tables[KDB_TX_MAX_TABLES][128];
+    uint8_t  is_new_table[KDB_TX_MAX_TABLES];
+    uint32_t table_count;
+    int      failed;
+    int      active;
+} KdbTx;
+
+KdbTx *kdb_tx_begin(KumDB *db);
+
+KdbStatus kdb_tx_add   (KdbTx *tx, const char *table_name, const KdbField *fields);
+KdbStatus kdb_tx_update(KdbTx *tx, const char *table_name, const char **where_filters,
+                        const KdbField *set_fields, size_t *updated_out);
+KdbStatus kdb_tx_delete(KdbTx *tx, const char *table_name, const char **filters, size_t *deleted_out);
+
+KdbStatus kdb_tx_commit  (KdbTx *tx);
+KdbStatus kdb_tx_rollback(KdbTx *tx);
+
 KdbStatus kdb_drop_table  (KumDB *db, const char *table_name);
 KdbStatus kdb_compact     (KumDB *db, const char *table_name);
 int       kdb_table_exists(KumDB *db, const char *table_name);

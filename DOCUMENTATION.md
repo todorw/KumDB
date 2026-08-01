@@ -10,6 +10,7 @@ the CLI. For a quick pitch and build instructions, see
 - [C API](#c-api)
 - [NoSQL filter syntax](#nosql-filter-syntax)
 - [Nested values](#nested-values)
+- [Transactions](#transactions)
 - [SQL](#sql)
 - [CLI](#cli)
 - [Tools](#tools)
@@ -247,6 +248,53 @@ new ones from a literal.
 Old data files (format 1.0, written before nested values existed) open
 exactly as before — nested values only appear starting at format 1.1, and
 none of the existing type encodings changed, so there's nothing to migrate.
+
+## Transactions
+
+`kdb_tx_*` groups `kdb_add`/`kdb_update`/`kdb_delete` calls across one or
+more tables into a single all-or-nothing unit:
+
+```c
+KdbTx *tx = kdb_tx_begin(db);
+
+KdbField f1[] = { kdb_field_string("from", "alice"), kdb_field_int("amount", 50), kdb_field_end() };
+kdb_tx_add(tx, "transfers", f1);
+
+const char *where[] = { "name=alice", NULL };
+KdbField patch[] = { kdb_field_int("balance", 50), kdb_field_end() };
+size_t updated = 0;
+kdb_tx_update(tx, "accounts", where, patch, &updated);
+
+if (kdb_last_status() == KDB_OK)
+    kdb_tx_commit(tx);
+else
+    kdb_tx_rollback(tx);
+```
+
+`kdb_tx_add`/`kdb_tx_update`/`kdb_tx_delete` are the same operations as
+their non-tx counterparts, just tracked by `tx`. If any of them fails, the
+transaction is marked failed and `kdb_tx_commit()` will refuse — call
+`kdb_tx_rollback()` instead. Either call ends the transaction and frees
+`tx`; don't reuse it afterward.
+
+This is scoped to a single writer, same as the rest of KumDB — it's not a
+multi-writer isolation mechanism. What it does give you:
+
+- **Rollback**: `kdb_tx_rollback()` undoes every change made across
+  however many tables the transaction touched (including dropping a table
+  that the transaction itself created).
+- **Crash safety**: if the process dies anywhere between `kdb_tx_begin()`
+  and a completed `kdb_tx_commit()`, the next `kdb_open()` automatically
+  finishes the job on its own — rolling back an interrupted transaction, or
+  finishing cleanup of one that had already committed. A table is never
+  left half-migrated. This has been verified with real crash simulations
+  (killing a process mid-transaction and mid-commit), not just unit tests.
+
+Mechanically: the first time a transaction touches a table, it backs up
+that table's file (or, if the table is new, just remembers to drop it on
+rollback). This means a transaction costs a full copy of each table it
+touches on first touch — fine for coordinating a handful of tables, not
+meant for wrapping bulk operations on a huge one.
 
 ## SQL
 

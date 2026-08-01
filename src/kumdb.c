@@ -3,6 +3,8 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <dirent.h>
 
 #include "../include/kumdb.h"
 #include "../include/internal.h"
@@ -14,6 +16,7 @@
 #include "../include/storage.h"
 
 static void kdb_row_free_internal(KdbRow *row);
+static void kdb__evict_table(KumDB *db, const char *table_name);
 
 
 const char *kdb_version(void) {
@@ -375,6 +378,282 @@ static KdbRow *kdb__record_to_row(const KdbRecord *r) {
 }
 
 
+#define KDB_TX_MARKER_NAME ".kdb_tx_commit"
+
+/* GCC's -Wformat-truncation can't prove these are safe: out_size is a
+ * runtime parameter, not a sizeof() visible at the snprintf call site, so
+ * it conservatively assumes out_size could be too small. Every call site
+ * in this file passes a 4104-byte buffer, comfortably enough -- this is
+ * the well-known false-positive case for that warning on generic
+ * bounded-buffer helper functions. */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
+
+static void kdb__tx_backup_path(KumDB *db, const char *table_name, char *out, size_t out_size) {
+    char kdb_path[4104];
+    kdb_storage_path(db->data_dir, table_name, kdb_path, sizeof(kdb_path));
+    snprintf(out, out_size, "%s.txbak", kdb_path);
+}
+
+static void kdb__tx_marker_path(KumDB *db, char *out, size_t out_size) {
+    snprintf(out, out_size, "%s/%s", db->data_dir, KDB_TX_MARKER_NAME);
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
+static KdbStatus kdb__tx_backup_table(KumDB *db, const char *table_name) {
+    char src_path[4104], dst_path[4104];
+    kdb_storage_path(db->data_dir, table_name, src_path, sizeof(src_path));
+    kdb__tx_backup_path(db, table_name, dst_path, sizeof(dst_path));
+
+    FILE *src = fopen(src_path, "rb");
+    if (!src) { kdb_err_io(src_path, "open for tx backup"); return KDB_ERR_IO; }
+    FILE *dst = fopen(dst_path, "wb");
+    if (!dst) { fclose(src); kdb_err_io(dst_path, "create tx backup"); return KDB_ERR_IO; }
+
+    char buf[65536];
+    size_t n;
+    KdbStatus st = KDB_OK;
+    while ((n = fread(buf, 1, sizeof(buf), src)) > 0) {
+        if (fwrite(buf, 1, n, dst) != n) { st = KDB_ERR_IO; break; }
+    }
+    if (st == KDB_OK && ferror(src)) st = KDB_ERR_IO;
+    fclose(src);
+
+    if (st == KDB_OK && (fflush(dst) != 0 || fsync(fileno(dst)) != 0)) st = KDB_ERR_IO;
+    fclose(dst);
+
+    if (st != KDB_OK) {
+        unlink(dst_path);
+        kdb_err_io(dst_path, "write tx backup");
+        return st;
+    }
+    return KDB_OK;
+}
+
+/* Rolls back one table by putting its backup back in place. Evicts any
+ * cached handle first -- an already-open fd keeps referencing the old
+ * inode through a rename, so without this the cache would silently keep
+ * pointing at the pre-rollback (or pre-commit-cleanup) file. */
+static KdbStatus kdb__tx_restore_table(KumDB *db, const char *table_name) {
+    char real_path[4104], bak_path[4104];
+    kdb_storage_path(db->data_dir, table_name, real_path, sizeof(real_path));
+    kdb__tx_backup_path(db, table_name, bak_path, sizeof(bak_path));
+
+    kdb__evict_table(db, table_name);
+
+    if (rename(bak_path, real_path) != 0) {
+        kdb_err_io(real_path, "restore tx backup");
+        return KDB_ERR_IO;
+    }
+    return KDB_OK;
+}
+
+static void kdb__tx_delete_backup(KumDB *db, const char *table_name) {
+    char bak_path[4104];
+    kdb__tx_backup_path(db, table_name, bak_path, sizeof(bak_path));
+    unlink(bak_path);
+}
+
+static KdbStatus kdb__tx_write_marker(KumDB *db, char tables[][KDB_MAX_NAME_LEN], uint32_t count) {
+    char marker_path[4104];
+    kdb__tx_marker_path(db, marker_path, sizeof(marker_path));
+
+    char buf[KDB_TX_MAX_TABLES * KDB_MAX_NAME_LEN];
+    size_t pos = 0;
+    for (uint32_t i = 0; i < count && pos < sizeof(buf); i++) {
+        int n = snprintf(buf + pos, sizeof(buf) - pos, "%s\n", tables[i]);
+        if (n > 0) {
+            size_t avail = sizeof(buf) - pos;
+            pos += (size_t)n < avail ? (size_t)n : avail;
+        }
+    }
+
+    return kdb_atomic_write(marker_path, (const uint8_t *)buf, pos);
+}
+
+static void kdb__tx_delete_marker(KumDB *db) {
+    char marker_path[4104];
+    kdb__tx_marker_path(db, marker_path, sizeof(marker_path));
+    unlink(marker_path);
+}
+
+/* Called on every read-write kdb_open(). Cheap no-op in the common case
+ * (no marker, no leftover .txbak files). Two cases to resolve:
+ *
+ *   1. Marker present -> a transaction had already reached the "safe to
+ *      discard backups" point before the process died. Finish that
+ *      cleanup; do NOT roll back, the data is correctly committed.
+ *   2. No marker, but some table has a leftover .txbak -> a transaction
+ *      was interrupted before it ever got that far. Roll it back.
+ */
+static void kdb__tx_recover(KumDB *db) {
+    char marker_path[4104];
+    kdb__tx_marker_path(db, marker_path, sizeof(marker_path));
+
+    FILE *mf = fopen(marker_path, "rb");
+    if (mf) {
+        char line[KDB_MAX_NAME_LEN];
+        while (fgets(line, sizeof(line), mf)) {
+            size_t len = strlen(line);
+            while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+            if (len > 0) kdb__tx_delete_backup(db, line);
+        }
+        fclose(mf);
+        unlink(marker_path);
+    }
+
+    DIR *dir = opendir(db->data_dir);
+    if (!dir) return;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        const char *name = entry->d_name;
+        size_t nlen = strlen(name);
+        static const char suffix[] = ".kdb.txbak";
+        size_t slen = sizeof(suffix) - 1;
+        if (nlen <= slen || strcmp(name + nlen - slen, suffix) != 0) continue;
+
+        char table_name[KDB_MAX_NAME_LEN];
+        size_t base_len = nlen - slen;
+        if (base_len >= sizeof(table_name)) continue;
+        memcpy(table_name, name, base_len);
+        table_name[base_len] = '\0';
+
+        kdb__tx_restore_table(db, table_name);
+    }
+    closedir(dir);
+}
+
+/* Tracks 'table_name' in the transaction exactly once: backs it up (or,
+ * if it doesn't exist yet, remembers to drop it on rollback instead). */
+static KdbStatus kdb__tx_touch(KdbTx *tx, const char *table_name) {
+    for (uint32_t i = 0; i < tx->table_count; i++) {
+        if (strcmp(tx->tables[i], table_name) == 0) return KDB_OK;
+    }
+    if (tx->table_count >= KDB_TX_MAX_TABLES) {
+        kdb_set_error(KDB_ERR_FULL, "Transaction already touches %d tables, that's the limit.", KDB_TX_MAX_TABLES);
+        return KDB_ERR_FULL;
+    }
+
+    uint32_t idx = tx->table_count;
+    KDB_STRLCPY(tx->tables[idx], table_name, sizeof(tx->tables[idx]));
+
+    if (!kdb_table_exists(tx->db, table_name)) {
+        tx->is_new_table[idx] = 1;
+    } else {
+        tx->is_new_table[idx] = 0;
+        KdbStatus st = kdb__tx_backup_table(tx->db, table_name);
+        if (st != KDB_OK) return st;
+    }
+
+    tx->table_count++;
+    return KDB_OK;
+}
+
+KdbTx *kdb_tx_begin(KumDB *db) {
+    if (!db) { kdb_err_null_arg("db", "kdb_tx_begin"); return NULL; }
+    if (db->read_only) { kdb_err_table_read_only("(transaction)"); return NULL; }
+
+    KdbTx *tx = KDB_ALLOC(KdbTx);
+    if (!tx) { kdb_err_oom("KdbTx"); return NULL; }
+    tx->db     = db;
+    tx->active = 1;
+    return tx;
+}
+
+KdbStatus kdb_tx_add(KdbTx *tx, const char *table_name, const KdbField *fields) {
+    if (!tx || !tx->active) { kdb_err_bad_arg("tx", "not an active transaction"); return KDB_ERR_BAD_ARG; }
+    if (tx->failed) {
+        kdb_set_error(KDB_ERR_VALIDATION, "Transaction already has a failed operation -- roll it back.");
+        return KDB_ERR_VALIDATION;
+    }
+
+    KdbStatus st = kdb__tx_touch(tx, table_name);
+    if (st != KDB_OK) { tx->failed = 1; return st; }
+
+    st = kdb_add(tx->db, table_name, fields);
+    if (st != KDB_OK) tx->failed = 1;
+    return st;
+}
+
+KdbStatus kdb_tx_update(KdbTx *tx, const char *table_name, const char **where_filters,
+                        const KdbField *set_fields, size_t *updated_out) {
+    if (!tx || !tx->active) { kdb_err_bad_arg("tx", "not an active transaction"); return KDB_ERR_BAD_ARG; }
+    if (tx->failed) {
+        kdb_set_error(KDB_ERR_VALIDATION, "Transaction already has a failed operation -- roll it back.");
+        return KDB_ERR_VALIDATION;
+    }
+
+    KdbStatus st = kdb__tx_touch(tx, table_name);
+    if (st != KDB_OK) { tx->failed = 1; return st; }
+
+    st = kdb_update(tx->db, table_name, where_filters, set_fields, updated_out);
+    if (st != KDB_OK) tx->failed = 1;
+    return st;
+}
+
+KdbStatus kdb_tx_delete(KdbTx *tx, const char *table_name, const char **filters, size_t *deleted_out) {
+    if (!tx || !tx->active) { kdb_err_bad_arg("tx", "not an active transaction"); return KDB_ERR_BAD_ARG; }
+    if (tx->failed) {
+        kdb_set_error(KDB_ERR_VALIDATION, "Transaction already has a failed operation -- roll it back.");
+        return KDB_ERR_VALIDATION;
+    }
+
+    KdbStatus st = kdb__tx_touch(tx, table_name);
+    if (st != KDB_OK) { tx->failed = 1; return st; }
+
+    st = kdb_delete(tx->db, table_name, filters, deleted_out);
+    if (st != KDB_OK) tx->failed = 1;
+    return st;
+}
+
+KdbStatus kdb_tx_commit(KdbTx *tx) {
+    if (!tx || !tx->active) { kdb_err_bad_arg("tx", "not an active transaction"); return KDB_ERR_BAD_ARG; }
+    if (tx->failed) {
+        kdb_set_error(KDB_ERR_VALIDATION, "Transaction had a failed operation -- can't commit, roll it back instead.");
+        return KDB_ERR_VALIDATION;
+    }
+
+    char backed_up[KDB_TX_MAX_TABLES][KDB_MAX_NAME_LEN];
+    uint32_t nbacked = 0;
+    for (uint32_t i = 0; i < tx->table_count; i++) {
+        if (!tx->is_new_table[i]) {
+            KDB_STRLCPY(backed_up[nbacked], tx->tables[i], sizeof(backed_up[nbacked]));
+            nbacked++;
+        }
+    }
+
+    if (nbacked > 0) {
+        KdbStatus st = kdb__tx_write_marker(tx->db, backed_up, nbacked);
+        if (st != KDB_OK) return st; /* not committed yet -- tx is still valid, retry or roll back */
+
+        for (uint32_t i = 0; i < nbacked; i++) kdb__tx_delete_backup(tx->db, backed_up[i]);
+        kdb__tx_delete_marker(tx->db);
+    }
+
+    free(tx);
+    return KDB_OK;
+}
+
+KdbStatus kdb_tx_rollback(KdbTx *tx) {
+    if (!tx || !tx->active) { kdb_err_bad_arg("tx", "not an active transaction"); return KDB_ERR_BAD_ARG; }
+
+    KdbStatus first_err = KDB_OK;
+    for (uint32_t i = 0; i < tx->table_count; i++) {
+        KdbStatus st = tx->is_new_table[i]
+            ? kdb_drop_table(tx->db, tx->tables[i])
+            : kdb__tx_restore_table(tx->db, tx->tables[i]);
+        if (st != KDB_OK && first_err == KDB_OK) first_err = st;
+    }
+
+    free(tx);
+    return first_err;
+}
+
 static KumDB *kdb__open_internal(const char *data_dir, uint8_t read_only) {
     if (!data_dir) {
         kdb_err_null_arg("data_dir", "kdb_open");
@@ -400,6 +679,9 @@ static KumDB *kdb__open_internal(const char *data_dir, uint8_t read_only) {
     KDB_STRLCPY(db->data_dir, data_dir, sizeof(db->data_dir));
     db->read_only   = read_only;
     db->table_count = 0;
+
+    if (!read_only) kdb__tx_recover(db);
+
     return db;
 }
 
@@ -795,22 +1077,29 @@ KdbStatus kdb_drop_column(KumDB *db, const char *table_name, const char *col_nam
     return kdb_table_drop_column(tbl, col_name);
 }
 
-KdbStatus kdb_drop_table(KumDB *db, const char *table_name) {
-    if (!db || !table_name) {
-        kdb_err_null_arg("db/table_name", "kdb_drop_table");
-        return KDB_ERR_BAD_ARG;
-    }
-
-
+/* Closes and evicts a table's cached handle, if open. Needed anywhere a
+ * table's file gets replaced/renamed out from under a live process --
+ * without this, an already-open fd keeps referencing the old inode and the
+ * cached handle silently goes stale relative to what's actually on disk. */
+static void kdb__evict_table(KumDB *db, const char *table_name) {
     for (uint32_t i = 0; i < db->table_count; i++) {
         if (db->tables[i] && strcmp(db->tables[i]->name, table_name) == 0) {
             kdb_table_close(db->tables[i]);
             free(db->tables[i]);
             db->tables[i] = db->tables[--db->table_count];
             db->tables[db->table_count] = NULL;
-            break;
+            return;
         }
     }
+}
+
+KdbStatus kdb_drop_table(KumDB *db, const char *table_name) {
+    if (!db || !table_name) {
+        kdb_err_null_arg("db/table_name", "kdb_drop_table");
+        return KDB_ERR_BAD_ARG;
+    }
+
+    kdb__evict_table(db, table_name);
     return kdb_storage_drop(db->data_dir, table_name);
 }
 

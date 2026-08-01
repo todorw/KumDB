@@ -294,6 +294,163 @@ static void test_alter_table_api(void) {
     teardown(db);
 }
 
+static void test_tx_commit(void) {
+    KumDB *db;
+    setup(&db);
+
+    KdbField seed[] = { kdb_field_string("name", "seed"), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, TABLE, seed));
+
+    KdbTx *tx = kdb_tx_begin(db);
+    ASSERT(tx != NULL);
+
+    KdbField u[] = { kdb_field_string("name", "Alice"), kdb_field_end() };
+    KdbField o[] = { kdb_field_string("item", "widget"), kdb_field_end() };
+    ASSERT_OK(kdb_tx_add(tx, TABLE, u));
+    ASSERT_OK(kdb_tx_add(tx, "orders", o)); /* table doesn't exist yet */
+
+    ASSERT_OK(kdb_tx_commit(tx));
+
+    ASSERT_EQ(kdb_count(db, TABLE, NULL), 2);
+    ASSERT_EQ(kdb_count(db, "orders", NULL), 1);
+    ASSERT(kdb_table_exists(db, "orders"));
+
+    teardown(db);
+}
+
+static void test_tx_rollback(void) {
+    KumDB *db;
+    setup(&db);
+
+    KdbField seed[] = { kdb_field_string("name", "seed"), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, TABLE, seed));
+
+    KdbTx *tx = kdb_tx_begin(db);
+    KdbField u[] = { kdb_field_string("name", "Bob"), kdb_field_end() };
+    KdbField p[] = { kdb_field_string("name", "gadget"), kdb_field_end() };
+    ASSERT_OK(kdb_tx_add(tx, TABLE, u));
+    ASSERT_OK(kdb_tx_add(tx, "products", p)); /* new table, should vanish */
+
+    ASSERT(kdb_table_exists(db, "products"));
+    ASSERT_OK(kdb_tx_rollback(tx));
+
+    /* everything back to exactly the pre-transaction state */
+    ASSERT_EQ(kdb_count(db, TABLE, NULL), 1);
+    ASSERT(!kdb_table_exists(db, "products"));
+
+    KdbRow *row = kdb_find_by_id(db, TABLE, 1);
+    ASSERT(row != NULL);
+    if (row) {
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_string(row, "name", &name));
+        ASSERT_STR(name, "seed");
+        kdb_row_free(row);
+    }
+
+    teardown(db);
+}
+
+static void test_tx_failed_op_forces_rollback(void) {
+    KumDB *db;
+    setup(&db);
+
+    KdbField seed[] = { kdb_field_string("name", "seed"), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, TABLE, seed));
+
+    KdbTx *tx = kdb_tx_begin(db);
+    KdbField u[] = { kdb_field_string("name", "Carol"), kdb_field_end() };
+    ASSERT_OK(kdb_tx_add(tx, TABLE, u));
+
+    /* updating a table that doesn't exist is a real failure, not just 0 rows matched */
+    ASSERT_ERR(kdb_tx_update(tx, "nonexistent_table", NULL, u, NULL));
+
+    /* commit must refuse once the tx has a failed operation */
+    ASSERT_ERR(kdb_tx_commit(tx));
+    ASSERT_OK(kdb_tx_rollback(tx));
+
+    /* Carol's insert must not have survived */
+    ASSERT_EQ(kdb_count(db, TABLE, NULL), 1);
+
+    teardown(db);
+}
+
+static void test_tx_crash_recovery_uncommitted(void) {
+    /* simulates a crash mid-transaction: operations applied to disk, but
+       neither commit nor rollback ever ran. the next kdb_open() must undo it. */
+    system("rm -rf " TEST_DIR);
+    mkdir(TEST_DIR, 0755);
+
+    KumDB *db = kdb_open(TEST_DIR);
+    KdbField seed[] = { kdb_field_string("name", "seed"), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, TABLE, seed));
+
+    KdbTx *tx = kdb_tx_begin(db);
+    KdbField ghost[] = { kdb_field_string("name", "ghost"), kdb_field_end() };
+    ASSERT_OK(kdb_tx_add(tx, TABLE, ghost));
+    ASSERT_EQ(kdb_count(db, TABLE, NULL), 2); /* visible mid-transaction */
+
+    /* "crash": abandon the tx (never commit/rollback) right here -- the
+       on-disk state (real file already has 2 rows, .txbak has the pre-tx
+       snapshot) is exactly what a real crash at this point would leave.
+       kdb_close() here only releases this process's in-memory/fd
+       resources so the test binary doesn't leak across many tests --
+       it doesn't touch the .txbak/marker files that matter for recovery. */
+    free(tx);
+    kdb_close(db);
+
+    KumDB *db2 = kdb_open(TEST_DIR);
+    ASSERT(db2 != NULL);
+    ASSERT_EQ(kdb_count(db2, TABLE, NULL), 1); /* ghost insert rolled back automatically */
+
+    KdbRow *row = kdb_find_by_id(db2, TABLE, 1);
+    ASSERT(row != NULL);
+    if (row) {
+        const char *name = NULL;
+        kdb_row_get_string(row, "name", &name);
+        ASSERT_STR(name, "seed");
+        kdb_row_free(row);
+    }
+
+    kdb_close(db2);
+    system("rm -rf " TEST_DIR);
+}
+
+static void test_tx_crash_recovery_committed(void) {
+    /* simulates a crash *after* the commit marker was written but *before*
+       cleanup finished -- recovery must NOT roll back in this case, the
+       marker means the transaction already committed. */
+    system("rm -rf " TEST_DIR);
+    mkdir(TEST_DIR, 0755);
+
+    KumDB *db = kdb_open(TEST_DIR);
+    KdbField seed[] = { kdb_field_string("name", "seed"), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, TABLE, seed));
+
+    KdbTx *tx = kdb_tx_begin(db);
+    KdbField committed_row[] = { kdb_field_string("name", "committed_row"), kdb_field_end() };
+    ASSERT_OK(kdb_tx_add(tx, TABLE, committed_row));
+    /* users.kdb now has 2 rows; users.kdb.txbak has 1 (the pre-tx snapshot) --
+       normal mid-transaction state, exactly what kdb_tx_commit() would see
+       right before it writes the marker */
+
+    char marker_path[512];
+    snprintf(marker_path, sizeof(marker_path), "%s/.kdb_tx_commit", TEST_DIR);
+    FILE *mf = fopen(marker_path, "wb");
+    ASSERT(mf != NULL);
+    fputs(TABLE "\n", mf);
+    fclose(mf);
+    /* "crash" right here: marker written, backup not yet deleted */
+    free(tx);
+    kdb_close(db); /* just releases this process's handles, see comment above */
+
+    KumDB *db2 = kdb_open(TEST_DIR);
+    ASSERT(db2 != NULL);
+    ASSERT_EQ(kdb_count(db2, TABLE, NULL), 2); /* committed_row must survive */
+
+    kdb_close(db2);
+    system("rm -rf " TEST_DIR);
+}
+
 static void test_reopen(void) {
     system("rm -rf " TEST_DIR);
     mkdir(TEST_DIR, 0755);
@@ -596,6 +753,11 @@ int main(void) {
     test_compact();
     test_table_exists_and_drop();
     test_alter_table_api();
+    test_tx_commit();
+    test_tx_rollback();
+    test_tx_failed_op_forces_rollback();
+    test_tx_crash_recovery_uncommitted();
+    test_tx_crash_recovery_committed();
     test_reopen();
     test_row_accessors();
     test_find_by_id();
