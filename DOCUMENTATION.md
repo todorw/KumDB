@@ -1,0 +1,380 @@
+# KumDB Documentation
+
+Full reference for the C API, the NoSQL filter syntax, the SQL dialect, and
+the CLI. For a quick pitch and build instructions, see
+[`README.md`](README.md).
+
+## Contents
+
+- [Core concepts](#core-concepts)
+- [C API](#c-api)
+- [NoSQL filter syntax](#nosql-filter-syntax)
+- [Nested values](#nested-values)
+- [SQL](#sql)
+- [CLI](#cli)
+- [Tools](#tools)
+- [KumDB Studio](#kumdb-studio)
+
+## Core concepts
+
+A KumDB database is a directory (`data_dir`). Each table is one file in
+that directory (`<table>.kdb`), append-only on disk, with deleted rows
+marked rather than removed until you `compact`. Tables don't need a schema
+up front — the first `kdb_add()` into a new table infers one from whatever
+fields you pass — but you can also declare one explicitly with
+`kdb_create_table()`, including which columns are indexed.
+
+Every row has three fields the engine manages for you and that you never
+set directly: `id` (auto-incrementing, unique per table), `created_at`, and
+`updated_at` (both Unix timestamps). All three are filterable like any
+other column (see below) — `id=5`, `created_at__gt=...`, etc.
+
+Field values are typed: `INT` (int64), `FLOAT` (double), `BOOL`, `STRING`,
+`BLOB` (raw bytes), or a nested `ARRAY`/`OBJECT` (see
+[Nested values](#nested-values)). Passing a string through the NoSQL
+filter API or the CLI infers its type automatically (`"30"` → int, `"true"`
+→ bool, `"1"`/`"0"` → also treated numerically wherever it matters, so
+`age=1` matches an int column with value `1`, not just a bool).
+
+## C API
+
+Include `kumdb.h`, link `libkumdb.a`. Every function that can fail sets a
+thread-local error you can read with `kdb_last_error()` / `kdb_last_status()`.
+
+### Opening and closing
+
+```c
+KumDB *db = kdb_open("./mydata");           // creates the directory if needed
+KumDB *db = kdb_open_readonly("./mydata");  // fails if it doesn't exist
+kdb_close(db);
+```
+
+### Inserting
+
+```c
+KdbField fields[] = {
+    kdb_field_string("name",  "Alice"),
+    kdb_field_int   ("age",   25),
+    kdb_field_float ("score", 9.5),
+    kdb_field_bool  ("vip",   1),
+    kdb_field_null  ("notes"),
+    kdb_field_end   ()
+};
+kdb_add(db, "users", fields);
+```
+
+- `kdb_add_validated(db, table, fields, validator_fn, user_data)` — same as
+  `kdb_add`, but runs `validator_fn(row, user_data)` first and rejects the
+  insert if it returns non-`KDB_OK`.
+- `kdb_batch_import(db, table, rows, count, &inserted_out)` — inserts many
+  rows (each a `const KdbField *`) under a single lock acquisition.
+
+Blob values: `kdb_field_blob(name, data, len)`. Nested values:
+`kdb_field_array(name, items, count)` / `kdb_field_object(name, fields)` —
+see [Nested values](#nested-values).
+
+### Querying
+
+```c
+const char *filters[] = { "age__gt=21", "name__contains=Ali", NULL };
+KdbRows *rows = kdb_find(db, "users", filters);   // NULL filters = all rows
+kdb_rows_free(rows);
+
+KdbRow *row = kdb_find_one(db, "users", filters);
+kdb_row_free(row);
+
+KdbRow *row = kdb_find_by_id(db, "users", 5);
+
+int64_t n = kdb_count(db, "users", filters);
+```
+
+`kdb_find_ex()` adds sorting and pagination on top of `kdb_find()`:
+
+```c
+KdbFindOpts opts = { .order_by = "age", .ascending = 0, .limit = 10, .offset = 0 };
+KdbRows *rows = kdb_find_ex(db, "users", filters, &opts);
+```
+
+### Reading a row's fields
+
+```c
+const KdbField *f = kdb_row_get(row, "age");   // generic, check f->type yourself
+
+int64_t     age;    kdb_row_get_int   (row, "age",   &age);
+double      score;  kdb_row_get_float (row, "score", &score);
+int         vip;    kdb_row_get_bool  (row, "vip",   &vip);
+const char *name;   kdb_row_get_string(row, "name",  &name);
+const void *data; size_t len;
+                     kdb_row_get_blob  (row, "avatar", &data, &len);
+```
+
+All the typed getters return `KDB_ERR_NOT_FOUND` if the column doesn't
+exist on that row and `KDB_ERR_BAD_TYPE` if it exists but isn't that type.
+
+### Updating and deleting
+
+```c
+const char *where[] = { "name=Alice", NULL };
+KdbField patch[] = { kdb_field_int("age", 26), kdb_field_end() };
+size_t updated = 0;
+kdb_update(db, "users", where, patch, &updated);
+
+size_t deleted = 0;
+kdb_delete(db, "users", where, &deleted);
+```
+
+### Schema management
+
+```c
+KdbColumnDef cols[] = {
+    { "name", KDB_TYPE_STRING, /*nullable*/ 0, /*indexed*/ 0 },
+    { "age",  KDB_TYPE_INT,    1,              1 },
+};
+kdb_create_table(db, "users", cols, 2);
+
+kdb_add_column (db, "users", "vip", KDB_TYPE_BOOL, /*nullable*/ 1, /*indexed*/ 0);
+kdb_drop_column(db, "users", "vip");   // rewrites the whole table file
+
+KdbColumnInfo schema[16]; uint32_t n = 0;
+kdb_get_schema(db, "users", schema, 16, &n);
+
+kdb_compact(db, "users");             // strip soft-deleted rows from disk
+kdb_drop_table(db, "users");
+int exists = kdb_table_exists(db, "users");
+
+const char *names[64]; size_t count = 0;
+kdb_list_tables(db, names, 64, &count);   // names point into TLS, valid until the next call
+```
+
+`kdb_add_column`/`kdb_add()` on a table with no explicit schema yet both
+work — an explicit schema is for when you want to nail down types and
+indexes up front, not a requirement.
+
+### Errors, printing, misc
+
+```c
+kdb_last_error();    // human-readable string
+kdb_last_status();    // KdbStatus enum
+kdb_clear_error();
+
+kdb_row_print (row,  stdout);
+kdb_rows_print(rows, stdout);
+kdb_print_schema(db, "users", stdout);
+kdb_version();
+```
+
+## NoSQL filter syntax
+
+Filters are plain strings: `"<column>__<operator>=<value>"`. No operator
+suffix means equals.
+
+| Operator | Example | Meaning |
+|---|---|---|
+| *(none)* | `age=30` | equals |
+| `__eq` | `age__eq=30` | equals |
+| `__neq` | `age__neq=30` | not equals |
+| `__gt` | `age__gt=21` | greater than |
+| `__gte` | `age__gte=21` | greater than or equal |
+| `__lt` | `age__lt=65` | less than |
+| `__lte` | `age__lte=65` | less than or equal |
+| `__between` | `age__between=18,30` | inclusive range |
+| `__in` | `age__in=18,21,30` | matches any value in the list |
+| `__contains` | `name__contains=ali` | substring match |
+| `__startswith` | `name__startswith=al` | prefix match |
+| `__endswith` | `name__endswith=ice` | suffix match |
+| `__isnull` | `notes__isnull` | field is null (or missing) |
+| `__isnotnull` | `notes__isnotnull` | field is present and not null |
+
+Multiple filters in one call = AND logic. For OR, prefix a filter with
+`"OR:"` to start a new AND-group that gets OR'd against everything before
+it — same precedence as SQL (AND binds tighter than OR, no parens/nesting):
+
+```c
+// age < 18 OR age > 65
+const char *filters[] = { "age__lt=18", "OR:age__gt=65", NULL };
+
+// (active=true AND score__gt=90) OR (vip=true)
+const char *filters2[] = { "active=true", "score__gt=90", "OR:vip=true", NULL };
+```
+
+`id`, `created_at`, and `updated_at` work as filter columns even though
+they're not stored as regular fields.
+
+## Nested values
+
+A field can be an array or a nested object instead of a scalar:
+
+```c
+KdbField tags[]    = { kdb_field_string(NULL, "vip"), kdb_field_string(NULL, "new") };
+KdbField address[] = { kdb_field_string("city", "NYC"), kdb_field_int("zip", 10001), kdb_field_end() };
+
+KdbField fields[] = {
+    kdb_field_string("name",    "Alice"),
+    kdb_field_array ("tags",    tags, 2),      // array elements: unnamed, count-based
+    kdb_field_object("address", address),      // object fields: named, kdb_field_end()-terminated
+    kdb_field_end()
+};
+kdb_add(db, "users", fields);
+
+const char *filters[] = { "name=Alice", NULL };
+KdbRow *row = kdb_find_one(db, "users", filters);
+
+const KdbField *items = NULL; size_t count = 0;
+kdb_row_get_array(row, "tags", &items, &count);
+
+const KdbField *obj = NULL;
+kdb_row_get_object(row, "address", &obj);   // NULL-name-terminated, walk it like any field list
+```
+
+Arrays are count-based (no NULL-terminator convention, since a real element
+can itself be an unnamed `NULL`-type value and that would collide with a
+sentinel). Objects are NULL-name-terminated, same convention as every other
+field list in this API, since object keys are never legitimately `NULL`.
+
+Nesting can go arbitrarily deep in principle (arrays of objects of
+arrays...), capped at 16 levels and 64 elements per level — generous limits
+that exist to stop a corrupt file from making the engine allocate or
+recurse without bound, not limits you'll hit in normal use.
+
+`EQ`/`NEQ` compare arrays/objects by deep value equality. There's no
+dot-path querying (`WHERE address.city = 'NYC'`) — match/filter on the
+whole field, or pull it out and inspect it yourself. There's no SQL literal
+syntax for constructing arrays/objects either (no sane one-line syntax for
+it); build nested values through the C API. SQL can still `SELECT`,
+project, and aggregate the resulting columns fine, it just can't construct
+new ones from a literal.
+
+Old data files (format 1.0, written before nested values existed) open
+exactly as before — nested values only appear starting at format 1.1, and
+none of the existing type encodings changed, so there's nothing to migrate.
+
+## SQL
+
+`kdb_exec_sql(db, sql, &rows_out, &affected_out)` runs one statement and
+hits the exact same storage/query engine the NoSQL API uses. Single table
+only: no `JOIN`, no subqueries.
+
+```sql
+CREATE TABLE t (col TYPE [NOT NULL] [INDEX], ...)
+ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [INDEX]
+ALTER TABLE t DROP [COLUMN] col
+DROP TABLE t
+
+INSERT INTO t (col, ...) VALUES (val, ...)
+
+SELECT * | item, ... FROM t
+    [WHERE cond [AND|OR cond ...]]
+    [GROUP BY col]
+    [ORDER BY col [ASC|DESC]]
+    [LIMIT n [OFFSET m]]
+
+UPDATE t SET col = val, ... [WHERE cond [AND|OR cond ...]]
+DELETE FROM t [WHERE cond [AND|OR cond ...]]
+```
+
+**Types:** `INT`/`INTEGER`, `FLOAT`/`REAL`/`DOUBLE`, `BOOL`/`BOOLEAN`,
+`TEXT`/`STRING`/`VARCHAR`/`CHAR` (length specs like `VARCHAR(50)` are
+accepted and ignored — KumDB strings aren't fixed-width), `BLOB`.
+
+**Reserved names:** `id`, `created_at`, `updated_at` are managed by the
+engine. Declaring them in `CREATE TABLE`/`ALTER TABLE ADD` is silently
+skipped (or rejected for `ADD`) rather than erroring, so a copy-pasted
+`id INTEGER PRIMARY KEY` doesn't blow up on you.
+
+**`WHERE`** supports `=`, `!=`/`<>`, `>`, `>=`, `<`, `<=`,
+`BETWEEN a AND b`, `IN (a, b, c)`, `IS [NOT] NULL`, `LIKE 'pat'`
+(leading/trailing `%` only — no `_` wildcard, no mid-pattern `%`), and
+`AND`/`OR` at standard SQL precedence (`AND` binds tighter than `OR`, no
+parens/nesting: `a=1 AND b=2 OR c=3` means `(a=1 AND b=2) OR (c=3)`).
+
+**`SELECT` items** can be a plain column, `*`, or an aggregate call —
+`COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` —
+optionally renamed with `AS alias` (default alias is e.g. `SUM(amount)`).
+Without `GROUP BY`, one or more aggregate items collapse the result into a
+single summary row. With `GROUP BY col`, you get one row per distinct value
+of `col`; every other selected item must be an aggregate call — same rule
+real SQL uses. `SELECT col FROM t GROUP BY col` with no aggregate at all is
+a valid way to get distinct values. `SUM`/`AVG` always come back as `FLOAT`
+regardless of the source column's type. No `HAVING`, no grouping by more
+than one column, no window functions.
+
+```sql
+CREATE TABLE sales (region TEXT, amount FLOAT)
+INSERT INTO sales (region, amount) VALUES ('east', 100.0)
+SELECT region, COUNT(*), SUM(amount) AS total
+    FROM sales
+    GROUP BY region
+    ORDER BY total DESC
+```
+
+Also callable from C directly via `kdb_exec_sql()` (`sql.h`).
+
+## CLI
+
+```bash
+./build/bin/kumdb_cli ./mydata
+```
+
+### NoSQL commands
+
+```
+open <dir>                          open a database
+close                               close the current database
+tables                              list tables
+schema <table>                      show schema
+add <table> <k=v> [k=v ...]         insert a record (value can be @path for a blob)
+find <table> [filter ...] [order_by=col] [order=asc|desc] [limit=N] [offset=N]
+findbyid <table> <id>               find a single record by id
+count <table> [filter ...]          count records
+update <table> where <k=v> set <k=v>  update records
+import <table> <file>               bulk-insert k=v lines from a file
+delete <table> <filter> [...]       delete records
+compact <table>                     compact table file
+drop <table>                        drop table
+version                             show CLI/engine version
+help                                show command help
+quit / exit                         exit
+```
+
+Filters/`where` clauses are AND by default; prefix a filter with `OR:` to
+start a new OR'd group (same convention as the C API).
+
+### SQL commands
+
+Prefix any line with `sql` to run it as one SQL statement:
+
+```
+kumdb> sql CREATE TABLE users (name TEXT NOT NULL, age INT INDEX)
+kumdb> sql INSERT INTO users (name, age) VALUES ('Alice', 30)
+kumdb> sql SELECT * FROM users WHERE age > 21 ORDER BY age DESC LIMIT 10
+kumdb> sql SELECT region, COUNT(*), SUM(amount) AS total FROM sales GROUP BY region ORDER BY total DESC
+kumdb> sql ALTER TABLE users ADD COLUMN vip BOOL
+kumdb> sql UPDATE users SET age = 31 WHERE name = 'Alice'
+kumdb> sql DELETE FROM users WHERE age < 18
+kumdb> sql ALTER TABLE users DROP COLUMN vip
+kumdb> sql DROP TABLE users
+```
+
+## Tools
+
+```bash
+# Benchmark (default 10k rows)
+./build/bin/bench 50000 ./mydata
+
+# Dump table contents
+./build/bin/dump ./mydata users
+./build/bin/dump ./mydata users --csv
+./build/bin/dump ./mydata users --json --limit 50
+```
+
+`dump --json` serializes nested array/object fields as real JSON, not a
+placeholder.
+
+## KumDB Studio
+
+A Qt desktop app (Windows/Mac/Linux): table browser, editable datasheet
+grid, and a query console that toggles between NoSQL filters and SQL.
+Array/object columns show as read-only text in the grid (editing a
+nested-value cell in place isn't supported — it would just overwrite the
+structured value with plain text). See [`app/README.md`](app/README.md)
+for build instructions.

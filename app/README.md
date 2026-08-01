@@ -18,7 +18,8 @@ cover custom forms or printed reports.
   — there's no separate save step). Add/delete rows from the toolbar.
 - **Query console**: toggle between NoSQL (pick a table, type filter lines
   like `age__gt=21`) and SQL (type a whole statement). Same engine either
-  way — see the main [README](../README.md) for what each syntax supports.
+  way — see [DOCUMENTATION.md](../DOCUMENTATION.md) for what each syntax
+  supports.
 - **New Table dialog**: define a table's columns (name, type, NOT NULL,
   indexed) before inserting anything, same as `CREATE TABLE` in SQL.
 
