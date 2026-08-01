@@ -6,6 +6,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <fcntl.h>
 
 #include "../include/storage.h"
 #include "../include/error.h"
@@ -26,11 +27,30 @@ static void kdb__ensure_dir(const char *path) {
     }
 }
 
+static void kdb__fsync_parent_dir(const char *path) {
+    char dir_path[4096];
+    KDB_STRLCPY(dir_path, path, sizeof(dir_path));
+
+    char *last_slash = strrchr(dir_path, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+    } else {
+        dir_path[0] = '.'; dir_path[1] = '\0';
+    }
+
+    int dir_fd = open(dir_path, O_RDONLY);
+    if (dir_fd >= 0) {
+        fsync(dir_fd);
+        close(dir_fd);
+    }
+}
+
 
 static KdbStatus kdb__write_header(FILE *fp, const KdbTableHeader *hdr) {
     rewind(fp);
     if (fwrite(hdr, sizeof(*hdr), 1, fp) != 1) return KDB_ERR_IO;
     if (fflush(fp) != 0) return KDB_ERR_IO;
+    if (fsync(fileno(fp)) != 0) return KDB_ERR_IO;
     return KDB_OK;
 }
 
@@ -267,23 +287,28 @@ typedef struct {
     void          *user_data;
     uint64_t       record_count;
     uint64_t       next_id;
+    int            aborted;
 } KdbRewriteCtx;
 
 static int kdb__rewrite_scan_cb(const KdbRecord *r_const, void *ud) {
     KdbRewriteCtx *ctx = (KdbRewriteCtx *)ud;
 
-    
+
     KdbRecord *r = kdb_record_copy(r_const);
-    if (!r) return 0; 
+    if (!r) { ctx->aborted = 1; return 0; }
 
     int keep = ctx->transform_fn(r, ctx->user_data);
     if (keep && !r->deleted) {
-        kdb_record_write(r, ctx->out_fp);
+        if (kdb_record_write(r, ctx->out_fp) != KDB_OK) {
+            ctx->aborted = 1;
+            kdb_record_free(r);
+            return 0;
+        }
         ctx->record_count++;
         if (r->id >= ctx->next_id) ctx->next_id = r->id + 1;
     }
     kdb_record_free(r);
-    return 1; 
+    return 1;
 }
 
 KdbStatus kdb_storage_rewrite(KdbTable      *tbl,
@@ -319,19 +344,26 @@ KdbStatus kdb_storage_rewrite(KdbTable      *tbl,
         return KDB_ERR_IO;
     }
 
-    
+
     KdbRewriteCtx ctx = {
         .out_fp       = out_fp,
         .transform_fn = transform_fn,
         .user_data    = user_data,
         .record_count = 0,
-        .next_id      = tbl->header.next_id
+        .next_id      = tbl->header.next_id,
+        .aborted      = 0
     };
 
     KdbStatus scan_st = kdb_storage_scan(tbl, kdb__rewrite_scan_cb, &ctx);
     if (scan_st != KDB_OK) {
         fclose(out_fp); unlink(tmp_path);
         return scan_st;
+    }
+    if (ctx.aborted) {
+
+        fclose(out_fp); unlink(tmp_path);
+        kdb_err_oom("rewrite: failed to copy/write a record mid-compaction, original table left untouched");
+        return KDB_ERR_OOM;
     }
 
     
@@ -362,8 +394,9 @@ KdbStatus kdb_storage_rewrite(KdbTable      *tbl,
         kdb_err_io(tbl->path, "rename rewrite");
         return KDB_ERR_IO;
     }
+    kdb__fsync_parent_dir(tbl->path);
 
-    
+
     tbl->fp = fopen(tbl->path, "r+b");
     if (!tbl->fp) {
         kdb_err_io(tbl->path, "reopen after rewrite");
