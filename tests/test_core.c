@@ -298,6 +298,145 @@ static void test_row_accessors(void) {
     teardown(db);
 }
 
+static void test_find_by_id(void) {
+    KumDB *db;
+    setup(&db);
+
+    KdbField f1[] = { kdb_field_string("name", "First"),  kdb_field_end() };
+    KdbField f2[] = { kdb_field_string("name", "Second"), kdb_field_end() };
+    KdbField f3[] = { kdb_field_string("name", "Third"),  kdb_field_end() };
+    ASSERT_OK(kdb_add(db, TABLE, f1));
+    ASSERT_OK(kdb_add(db, TABLE, f2));
+    ASSERT_OK(kdb_add(db, TABLE, f3));
+
+    /* id=1 is the case that used to break: "1" got type-inferred as bool */
+    KdbRow *row = kdb_find_by_id(db, TABLE, 1);
+    ASSERT(row != NULL);
+    if (row) {
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_string(row, "name", &name));
+        ASSERT_STR(name, "First");
+        ASSERT_EQ(row->id, 1u);
+        kdb_row_free(row);
+    }
+
+    row = kdb_find_by_id(db, TABLE, 3);
+    ASSERT(row != NULL);
+    if (row) {
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_string(row, "name", &name));
+        ASSERT_STR(name, "Third");
+        kdb_row_free(row);
+    }
+
+    row = kdb_find_by_id(db, TABLE, 999);
+    ASSERT(row == NULL);
+
+    teardown(db);
+}
+
+static void test_id_and_timestamp_filters(void) {
+    KumDB *db;
+    setup(&db);
+
+    for (int i = 0; i < 5; i++) {
+        KdbField f[] = { kdb_field_int("n", i), kdb_field_end() };
+        ASSERT_OK(kdb_add(db, TABLE, f));
+    }
+
+    const char *gte3[] = { "id__gte=3", NULL };
+    ASSERT_EQ(kdb_count(db, TABLE, gte3), 3);
+
+    const char *between[] = { "id__between=2,4", NULL };
+    ASSERT_EQ(kdb_count(db, TABLE, between), 3);
+
+    const char *notnull[] = { "created_at__isnotnull", NULL };
+    ASSERT_EQ(kdb_count(db, TABLE, notnull), 5);
+
+    teardown(db);
+}
+
+static void test_numeric_literal_edge_cases(void) {
+    KumDB *db;
+    setup(&db);
+
+    /* "0"/"1" used to type-infer as bool, breaking equality against int columns */
+    KdbField f0[] = { kdb_field_int("count", 0), kdb_field_end() };
+    KdbField f1[] = { kdb_field_int("count", 1), kdb_field_end() };
+    KdbField f2[] = { kdb_field_int("count", 2), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, TABLE, f0));
+    ASSERT_OK(kdb_add(db, TABLE, f1));
+    ASSERT_OK(kdb_add(db, TABLE, f2));
+
+    const char *eq0[] = { "count=0", NULL };
+    ASSERT_EQ(kdb_count(db, TABLE, eq0), 1);
+
+    const char *eq1[] = { "count=1", NULL };
+    ASSERT_EQ(kdb_count(db, TABLE, eq1), 1);
+
+    const char *gt0[] = { "count__gt=0", NULL };
+    ASSERT_EQ(kdb_count(db, TABLE, gt0), 2);
+
+    teardown(db);
+}
+
+static void test_blob_field(void) {
+    KumDB *db;
+    setup(&db);
+
+    unsigned char payload[] = { 0x00, 0x01, 0xFF, 0x42, 0x00, 0x99 };
+    KdbField f[] = {
+        kdb_field_string("name", "thumb"),
+        kdb_field_blob  ("data", payload, sizeof(payload)),
+        kdb_field_end   ()
+    };
+    ASSERT_OK(kdb_add(db, TABLE, f));
+
+    const char *filters[] = { "name=thumb", NULL };
+    KdbRow *row = kdb_find_one(db, TABLE, filters);
+    ASSERT(row != NULL);
+    if (row) {
+        const void *data = NULL;
+        size_t      len  = 0;
+        ASSERT_OK(kdb_row_get_blob(row, "data", &data, &len));
+        ASSERT_EQ(len, sizeof(payload));
+        ASSERT(data != NULL && memcmp(data, payload, len) == 0);
+        kdb_row_free(row);
+    }
+
+    teardown(db);
+}
+
+static void test_list_tables_repeated(void) {
+    KumDB *db;
+    setup(&db);
+
+    KdbField f[] = { kdb_field_int("x", 1), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, "alpha", f));
+    ASSERT_OK(kdb_add(db, "beta",  f));
+
+    /* used to return dangling pointers into a freed stack frame */
+    const char *names[16];
+    size_t      count = 0;
+    ASSERT_OK(kdb_list_tables(db, names, 16, &count));
+    ASSERT_EQ(count, 2u);
+
+    int saw_alpha = 0, saw_beta = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(names[i], "alpha") == 0) saw_alpha = 1;
+        if (strcmp(names[i], "beta")  == 0) saw_beta  = 1;
+    }
+    ASSERT(saw_alpha && saw_beta);
+
+    /* calling again shouldn't corrupt the first snapshot's semantics either */
+    const char *names2[16];
+    size_t      count2 = 0;
+    ASSERT_OK(kdb_list_tables(db, names2, 16, &count2));
+    ASSERT_EQ(count2, 2u);
+
+    teardown(db);
+}
+
 int main(void) {
     printf("=== test_core ===\n");
 
@@ -311,6 +450,11 @@ int main(void) {
     test_table_exists_and_drop();
     test_reopen();
     test_row_accessors();
+    test_find_by_id();
+    test_id_and_timestamp_filters();
+    test_numeric_literal_edge_cases();
+    test_blob_field();
+    test_list_tables_repeated();
 
     printf("passed=%d  failed=%d\n", passed, failed);
     return failed > 0 ? 1 : 0;
