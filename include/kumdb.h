@@ -144,10 +144,14 @@ void        kdb_rows_print (const KdbRows *rows, FILE *fp);
 KdbStatus   kdb_print_schema(KumDB *db, const char *table_name, FILE *fp);
 const char *kdb_version    (void);
 
-static inline KdbField kdb_field_int   (const char *n, int64_t     v) { KdbField f = {n, KDB_TYPE_INT,    .v.as_int    = v}; return f; }
-static inline KdbField kdb_field_float (const char *n, double      v) { KdbField f = {n, KDB_TYPE_FLOAT,  .v.as_float  = v}; return f; }
-static inline KdbField kdb_field_bool  (const char *n, int         v) { KdbField f = {n, KDB_TYPE_BOOL,   .v.as_bool   = v}; return f; }
-static inline KdbField kdb_field_string(const char *n, const char *v) { KdbField f = {n, KDB_TYPE_STRING, .v.as_string = v}; return f; }
+/* Plain member assignment on purpose, not designated initializers: nested
+ * designators like ".v.as_int = v" are a GNU C extension, not valid in any
+ * C++ standard -- and this header is explicitly meant to work from C++
+ * (see the extern "C" guard above). */
+static inline KdbField kdb_field_int   (const char *n, int64_t     v) { KdbField f = {n, KDB_TYPE_INT,    {0}}; f.v.as_int    = v; return f; }
+static inline KdbField kdb_field_float (const char *n, double      v) { KdbField f = {n, KDB_TYPE_FLOAT,  {0}}; f.v.as_float  = v; return f; }
+static inline KdbField kdb_field_bool  (const char *n, int         v) { KdbField f = {n, KDB_TYPE_BOOL,   {0}}; f.v.as_bool   = v; return f; }
+static inline KdbField kdb_field_string(const char *n, const char *v) { KdbField f = {n, KDB_TYPE_STRING, {0}}; f.v.as_string = v; return f; }
 static inline KdbField kdb_field_null  (const char *n)                { KdbField f = {n, KDB_TYPE_NULL,   {0}           }; return f; }
 static inline KdbField kdb_field_end   (void)                         { KdbField f = {NULL, KDB_TYPE_NULL, {0}           }; return f; }
 static inline KdbField kdb_field_blob  (const char *n, const void *data, size_t len) {
