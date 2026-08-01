@@ -394,6 +394,38 @@ static KdbStatus sql__type_from_ident(const char *s, KdbFieldType *out) {
     return KDB_ERR_SQL_SYNTAX;
 }
 
+/* NOT NULL / INDEX(ED) / UNIQUE / KEY / PRIMARY KEY / DEFAULT val -- shared
+ * between CREATE TABLE's column defs and ALTER TABLE ADD COLUMN. Only
+ * NOT NULL and INDEX(ED)/UNIQUE/PRIMARY KEY actually change the schema;
+ * the rest are accepted and ignored, best-effort SQL DDL compatibility. */
+static KdbStatus sql__parse_column_modifiers(SqlParser *p, const char *col_name, int *nullable, int *indexed) {
+    for (;;) {
+        if (sql__kw_is(&p->cur, "NOT")) {
+            sql__advance(p);
+            if (!sql__kw_is(&p->cur, "NULL")) return sql__err("expected NULL after NOT for column '%s'", col_name);
+            sql__advance(p);
+            *nullable = 0;
+            continue;
+        }
+        if (sql__kw_is(&p->cur, "INDEX") || sql__kw_is(&p->cur, "INDEXED")) { sql__advance(p); *indexed = 1; continue; }
+        if (sql__kw_is(&p->cur, "UNIQUE")) { sql__advance(p); *indexed = 1; continue; }
+        if (sql__kw_is(&p->cur, "KEY"))    { sql__advance(p); *indexed = 1; continue; }
+        if (sql__kw_is(&p->cur, "PRIMARY")) {
+            sql__advance(p);
+            if (sql__kw_is(&p->cur, "KEY")) sql__advance(p);
+            *indexed = 1; *nullable = 0;
+            continue;
+        }
+        if (sql__kw_is(&p->cur, "DEFAULT")) {
+            sql__advance(p);
+            sql__advance(p);
+            continue;
+        }
+        break;
+    }
+    return KDB_OK;
+}
+
 static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
     sql__advance(p); /* CREATE */
     if (!sql__kw_is(&p->cur, "TABLE")) return sql__err("expected TABLE after CREATE");
@@ -436,31 +468,8 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
         }
 
         int nullable = 1, indexed = 0;
-        for (;;) {
-            if (sql__kw_is(&p->cur, "NOT")) {
-                sql__advance(p);
-                if (!sql__kw_is(&p->cur, "NULL")) return sql__err("expected NULL after NOT for column '%s'", this_name);
-                sql__advance(p);
-                nullable = 0;
-                continue;
-            }
-            if (sql__kw_is(&p->cur, "INDEX") || sql__kw_is(&p->cur, "INDEXED")) { sql__advance(p); indexed = 1; continue; }
-            if (sql__kw_is(&p->cur, "UNIQUE")) { sql__advance(p); indexed = 1; continue; }
-            if (sql__kw_is(&p->cur, "KEY"))    { sql__advance(p); indexed = 1; continue; }
-            if (sql__kw_is(&p->cur, "PRIMARY")) {
-                sql__advance(p);
-                if (sql__kw_is(&p->cur, "KEY")) sql__advance(p);
-                indexed = 1; nullable = 0;
-                continue;
-            }
-            if (sql__kw_is(&p->cur, "DEFAULT")) {
-                /* best-effort: accept and ignore a default value, don't enforce it */
-                sql__advance(p);
-                sql__advance(p);
-                continue;
-            }
-            break;
-        }
+        KdbStatus mst = sql__parse_column_modifiers(p, this_name, &nullable, &indexed);
+        if (mst != KDB_OK) return mst;
 
         if (!sql__is_reserved_column(this_name)) {
             if (n >= KDB_SQL_MAX_COLUMNS) return sql__err("too many columns (max %d)", KDB_SQL_MAX_COLUMNS);
@@ -492,6 +501,68 @@ static KdbStatus sql__exec_drop_table(SqlParser *p, KumDB *db) {
     snprintf(table_name, sizeof(table_name), "%.255s", tname);
     sql__advance(p);
     return kdb_drop_table(db, table_name);
+}
+
+static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
+    sql__advance(p); /* ALTER */
+    if (!sql__kw_is(&p->cur, "TABLE")) return sql__err("expected TABLE after ALTER");
+    sql__advance(p);
+
+    const char *tname;
+    if (!sql__ident_text(&p->cur, &tname)) return sql__err("expected a table name after ALTER TABLE");
+    char table_name[KDB_SQL_IDENT_BUF];
+    snprintf(table_name, sizeof(table_name), "%.255s", tname);
+    sql__advance(p);
+
+    if (sql__kw_is(&p->cur, "ADD")) {
+        sql__advance(p);
+        if (sql__kw_is(&p->cur, "COLUMN")) sql__advance(p); /* optional, both spellings accepted */
+
+        const char *cname;
+        if (!sql__ident_text(&p->cur, &cname)) return sql__err("expected a column name after ALTER TABLE %s ADD", table_name);
+        char col_name[KDB_SQL_IDENT_BUF];
+        snprintf(col_name, sizeof(col_name), "%.255s", cname);
+        sql__advance(p);
+
+        const char *type_ident;
+        if (!sql__ident_text(&p->cur, &type_ident)) return sql__err("expected a type for column '%s'", col_name);
+        KdbFieldType ftype;
+        if (sql__type_from_ident(type_ident, &ftype) != KDB_OK)
+            return sql__err("unknown type '%s' for column '%s' -- use INT, FLOAT, BOOL, TEXT, or BLOB", type_ident, col_name);
+        sql__advance(p);
+
+        if (p->cur.type == SQLTOK_LPAREN) {
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_NUMBER) return sql__err("expected a number in the length spec for '%s'", col_name);
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing the length spec for '%s'", col_name);
+            sql__advance(p);
+        }
+
+        int nullable = 1, indexed = 0;
+        KdbStatus mst = sql__parse_column_modifiers(p, col_name, &nullable, &indexed);
+        if (mst != KDB_OK) return mst;
+
+        if (sql__is_reserved_column(col_name))
+            return sql__err("'%s' is reserved -- KumDB already manages id/created_at/updated_at", col_name);
+
+        return kdb_add_column(db, table_name, col_name, ftype, nullable, indexed);
+    }
+
+    if (sql__kw_is(&p->cur, "DROP")) {
+        sql__advance(p);
+        if (sql__kw_is(&p->cur, "COLUMN")) sql__advance(p);
+
+        const char *cname;
+        if (!sql__ident_text(&p->cur, &cname)) return sql__err("expected a column name after ALTER TABLE %s DROP", table_name);
+        char col_name[KDB_SQL_IDENT_BUF];
+        snprintf(col_name, sizeof(col_name), "%.255s", cname);
+        sql__advance(p);
+
+        return kdb_drop_column(db, table_name, col_name);
+    }
+
+    return sql__err("expected ADD [COLUMN] or DROP [COLUMN] after ALTER TABLE %s", table_name);
 }
 
 static KdbStatus sql__exec_insert(SqlParser *p, KumDB *db, size_t *affected_out) {
@@ -1169,12 +1240,13 @@ KdbStatus kdb_exec_sql(KumDB *db, const char *sql, KdbRows **rows_out, size_t *a
 
     KdbStatus st;
     if      (sql__kw_is(&p.cur, "CREATE")) st = sql__exec_create_table(&p, db);
+    else if (sql__kw_is(&p.cur, "ALTER"))  st = sql__exec_alter_table(&p, db);
     else if (sql__kw_is(&p.cur, "DROP"))   st = sql__exec_drop_table(&p, db);
     else if (sql__kw_is(&p.cur, "INSERT")) st = sql__exec_insert(&p, db, affected_out);
     else if (sql__kw_is(&p.cur, "SELECT")) st = sql__exec_select(&p, db, rows_out);
     else if (sql__kw_is(&p.cur, "UPDATE")) st = sql__exec_update(&p, db, affected_out);
     else if (sql__kw_is(&p.cur, "DELETE")) st = sql__exec_delete(&p, db, affected_out);
-    else return sql__err("unrecognized statement -- expected CREATE, DROP, INSERT, SELECT, UPDATE, or DELETE");
+    else return sql__err("unrecognized statement -- expected CREATE, ALTER, DROP, INSERT, SELECT, UPDATE, or DELETE");
 
     if (st != KDB_OK) return st;
 

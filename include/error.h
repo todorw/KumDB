@@ -30,6 +30,7 @@ void kdb_err_table_read_only (const char *table_name);
 
 void kdb_err_record_not_found(uint64_t id, const char *table_name);
 void kdb_err_field_not_found (const char *col_name, const char *table_name);
+void kdb_err_column_exists   (const char *col_name, const char *table_name);
 void kdb_err_bad_type        (const char *col_name, KdbType expected, KdbType got);
 void kdb_err_bad_filter      (const char *filter_key, const char *reason);
 

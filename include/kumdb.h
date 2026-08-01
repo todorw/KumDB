@@ -116,6 +116,15 @@ KdbStatus kdb_get_schema(KumDB *db, const char *table_name,
                          KdbColumnInfo *columns_out, uint32_t max_columns,
                          uint32_t *count_out);
 
+/* Add a column to an existing table's schema. Existing rows just don't have
+ * a value for it until you set one -- same as any other missing field. */
+KdbStatus kdb_add_column(KumDB *db, const char *table_name, const char *col_name,
+                         KdbFieldType type, int nullable, int indexed);
+
+/* Drop a column: removes it from the schema and rewrites every row to
+ * strip that field. Like kdb_compact(), this touches the whole table file. */
+KdbStatus kdb_drop_column(KumDB *db, const char *table_name, const char *col_name);
+
 /* names_out entries point into thread-local storage owned by KumDB and are
  * valid until the next call to kdb_list_tables() on this thread. Copy them
  * if you need to keep them around longer. */

@@ -197,8 +197,10 @@ kumdb> sql CREATE TABLE users (name TEXT NOT NULL, age INT INDEX)
 kumdb> sql INSERT INTO users (name, age) VALUES ('Alice', 30)
 kumdb> sql SELECT * FROM users WHERE age > 21 ORDER BY age DESC LIMIT 10
 kumdb> sql SELECT region, COUNT(*), SUM(amount) AS total FROM sales GROUP BY region ORDER BY total DESC
+kumdb> sql ALTER TABLE users ADD COLUMN vip BOOL
 kumdb> sql UPDATE users SET age = 31 WHERE name = 'Alice'
 kumdb> sql DELETE FROM users WHERE age < 18
+kumdb> sql ALTER TABLE users DROP COLUMN vip
 kumdb> sql DROP TABLE users
 ```
 No `JOIN`, no subqueries. `WHERE` supports `=`, `!=`/`<>`, `>`, `>=`, `<`, `<=`,

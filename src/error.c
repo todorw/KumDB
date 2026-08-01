@@ -157,6 +157,14 @@ void kdb_err_field_not_found(const char *col_name, const char *table_name) {
         table_name ? table_name : "unknown");
 }
 
+void kdb_err_column_exists(const char *col_name, const char *table_name) {
+    kdb_set_error(KDB_ERR_EXISTS,
+        "Column '%s' already exists in table '%s'. "
+        "Pick a different name or drop the existing one first.",
+        col_name   ? col_name   : "unknown",
+        table_name ? table_name : "unknown");
+}
+
 void kdb_err_bad_type(const char *col_name, KdbType expected, KdbType got) {
     kdb_set_error(KDB_ERR_BAD_TYPE,
         "Type mismatch on column '%s': expected %s, got %s. "

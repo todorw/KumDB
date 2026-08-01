@@ -676,6 +676,35 @@ KdbStatus kdb_get_schema(KumDB *db, const char *table_name,
     return KDB_OK;
 }
 
+KdbStatus kdb_add_column(KumDB *db, const char *table_name, const char *col_name,
+                         KdbFieldType type, int nullable, int indexed) {
+    if (!db || !table_name || !col_name) {
+        kdb_err_null_arg("db/table_name/col_name", "kdb_add_column");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+    return kdb_table_add_column(tbl, col_name, (KdbType)type, nullable ? 1 : 0, indexed ? 1 : 0);
+}
+
+KdbStatus kdb_drop_column(KumDB *db, const char *table_name, const char *col_name) {
+    if (!db || !table_name || !col_name) {
+        kdb_err_null_arg("db/table_name/col_name", "kdb_drop_column");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+    return kdb_table_drop_column(tbl, col_name);
+}
+
 KdbStatus kdb_drop_table(KumDB *db, const char *table_name) {
     if (!db || !table_name) {
         kdb_err_null_arg("db/table_name", "kdb_drop_table");

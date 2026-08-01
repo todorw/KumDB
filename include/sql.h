@@ -15,6 +15,8 @@ extern "C" {
  *
  * Supported:
  *   CREATE TABLE t (col TYPE [NOT NULL] [INDEX], ...)
+ *   ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [INDEX]
+ *   ALTER TABLE t DROP [COLUMN] col
  *   DROP TABLE t
  *   INSERT INTO t (col, ...) VALUES (val, ...)
  *   SELECT * | item, ... FROM t [WHERE cond [AND|OR cond ...]]
@@ -43,8 +45,13 @@ extern "C" {
  * BLOB. VARCHAR(n)/CHAR(n) length specs are accepted and ignored (KumDB
  * strings aren't fixed-width). "id", "created_at", "updated_at" are
  * reserved -- KumDB already manages them; declaring them in CREATE TABLE
- * is silently ignored rather than an error, so a copy-pasted
- * "id INTEGER PRIMARY KEY" doesn't blow up on you.
+ * or ALTER TABLE ADD is silently ignored / rejected rather than corrupting
+ * anything, so a copy-pasted "id INTEGER PRIMARY KEY" doesn't blow up on you.
+ *
+ * ALTER TABLE ADD only changes the schema -- existing rows don't get the
+ * new column's value until you UPDATE them, same as any other missing
+ * field. ALTER TABLE DROP rewrites the whole table file to strip that
+ * field from every row, same cost as kdb_compact().
  *
  * WHERE conditions: col = val, != / <>, >, >=, <, <=, BETWEEN a AND b,
  * IN (a, b, c), IS NULL, IS NOT NULL, LIKE 'pat' (pat may have a leading and/or

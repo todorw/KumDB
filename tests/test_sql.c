@@ -280,6 +280,46 @@ static void test_group_by_and_aggregates(void) {
     teardown(db);
 }
 
+static void test_alter_table(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (name TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('Alice')"));
+
+    ASSERT_OK(sql(db, "ALTER TABLE t ADD COLUMN age INT INDEX"));
+    ASSERT_OK(sql(db, "UPDATE t SET age = 30 WHERE name = 'Alice'"));
+
+    KdbRows *rows = NULL;
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE age > 20", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* both "ADD COLUMN x" and "ADD x" spellings accepted */
+    ASSERT_OK(sql(db, "ALTER TABLE t ADD score FLOAT"));
+    ASSERT_OK(sql(db, "UPDATE t SET score = 9.5 WHERE name = 'Alice'"));
+
+    /* duplicate column: real error, not "Table already exists" */
+    ASSERT_ERR(sql(db, "ALTER TABLE t ADD age INT"));
+
+    /* reserved names rejected */
+    ASSERT_ERR(sql(db, "ALTER TABLE t ADD id INT"));
+    ASSERT_ERR(sql(db, "ALTER TABLE t ADD created_at INT"));
+
+    /* nonexistent table */
+    ASSERT_ERR(sql(db, "ALTER TABLE nope ADD x INT"));
+
+    ASSERT_OK(sql(db, "ALTER TABLE t DROP COLUMN age"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        ASSERT(kdb_row_get(&rows->rows[0], "age") == NULL);
+        ASSERT(kdb_row_get(&rows->rows[0], "score") != NULL);
+    }
+    if (rows) kdb_rows_free(rows);
+
+    teardown(db);
+}
+
 static void test_reserved_columns_skipped(void) {
     KumDB *db;
     setup(&db);
@@ -339,6 +379,7 @@ int main(void) {
     test_where_operators();
     test_or();
     test_group_by_and_aggregates();
+    test_alter_table();
     test_reserved_columns_skipped();
     test_drop_table();
     test_syntax_errors();

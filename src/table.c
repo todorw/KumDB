@@ -113,7 +113,7 @@ KdbStatus kdb_table_add_column(KdbTable   *tbl,
         return KDB_ERR_BAD_ARG;
     }
     if (kdb_table_has_column(tbl, col_name)) {
-        kdb_err_table_exists(col_name);
+        kdb_err_column_exists(col_name, tbl->name);
         return KDB_ERR_EXISTS;
     }
     if (tbl->header.column_count >= KDB_MAX_COLUMNS) {

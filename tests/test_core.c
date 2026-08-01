@@ -20,6 +20,7 @@ static int failed = 0;
 #define ASSERT_EQ(a, b)  ASSERT((a) == (b))
 #define ASSERT_STR(a, b) ASSERT(strcmp((a), (b)) == 0)
 #define ASSERT_OK(st)    ASSERT((st) == KDB_OK)
+#define ASSERT_ERR(st)   ASSERT((st) != KDB_OK)
 
 #define TEST_DIR   "/tmp/kumdb_test_core"
 #define TABLE      "users"
@@ -248,6 +249,51 @@ static void test_table_exists_and_drop(void) {
     teardown(db);
 }
 
+static void test_alter_table_api(void) {
+    KumDB *db;
+    setup(&db);
+
+    KdbColumnDef cols[] = { { "name", KDB_TYPE_STRING, 0, 0 } };
+    ASSERT_OK(kdb_create_table(db, TABLE, cols, 1));
+
+    KdbField f[] = { kdb_field_string("name", "Alice"), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, TABLE, f));
+
+    ASSERT_OK(kdb_add_column(db, TABLE, "age", KDB_TYPE_INT, 1, 1));
+
+    KdbColumnInfo schema[16];
+    uint32_t n = 0;
+    ASSERT_OK(kdb_get_schema(db, TABLE, schema, 16, &n));
+    ASSERT_EQ(n, 2u);
+    if (n == 2) {
+        ASSERT_STR(schema[1].name, "age");
+        ASSERT(schema[1].indexed);
+    }
+
+    /* duplicate column: real column-specific error, not a table-exists one */
+    ASSERT_ERR(kdb_add_column(db, TABLE, "age", KDB_TYPE_INT, 1, 0));
+    ASSERT_EQ(kdb_last_status(), KDB_ERR_EXISTS);
+
+    KdbField patch[] = { kdb_field_int("age", 30), kdb_field_end() };
+    const char *where[] = { "name=Alice", NULL };
+    size_t updated = 0;
+    ASSERT_OK(kdb_update(db, TABLE, where, patch, &updated));
+    ASSERT_EQ(updated, 1u);
+
+    ASSERT_OK(kdb_drop_column(db, TABLE, "age"));
+    ASSERT_OK(kdb_get_schema(db, TABLE, schema, 16, &n));
+    ASSERT_EQ(n, 1u);
+
+    KdbRow *row = kdb_find_one(db, TABLE, where);
+    ASSERT(row != NULL);
+    if (row) {
+        ASSERT(kdb_row_get(row, "age") == NULL);
+        kdb_row_free(row);
+    }
+
+    teardown(db);
+}
+
 static void test_reopen(void) {
     system("rm -rf " TEST_DIR);
     mkdir(TEST_DIR, 0755);
@@ -461,6 +507,7 @@ int main(void) {
     test_delete();
     test_compact();
     test_table_exists_and_drop();
+    test_alter_table_api();
     test_reopen();
     test_row_accessors();
     test_find_by_id();
