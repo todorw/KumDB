@@ -331,7 +331,7 @@ size_t kdb_record_serialize(const KdbRecord *r, uint8_t *buf, size_t buf_size) {
         
         uint8_t name_buf[KDB_MAX_NAME_LEN];
         memset(name_buf, 0, KDB_MAX_NAME_LEN);
-        strncpy((char *)name_buf, f->col_name, KDB_MAX_NAME_LEN - 1);
+        snprintf((char *)name_buf, KDB_MAX_NAME_LEN, "%s", f->col_name);
         write_bytes(&p, name_buf, KDB_MAX_NAME_LEN);
 
         

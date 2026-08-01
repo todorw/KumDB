@@ -202,8 +202,7 @@ typedef enum {
 
 #define KDB_STRLCPY(dst, src, size) \
     do { \
-        strncpy((dst), (src), (size) - 1); \
-        (dst)[(size) - 1] = '\0'; \
+        snprintf((dst), (size), "%s", (src)); \
     } while (0)
 
 

@@ -200,7 +200,7 @@ void kdb_storage_close(KdbTable *tbl) {
 }
 
 KdbStatus kdb_storage_drop(const char *data_dir, const char *table_name) {
-    char path[4096], lock_path[4096];
+    char path[4096], lock_path[4096 + 8];
     kdb_storage_path(data_dir, table_name, path, sizeof(path));
     snprintf(lock_path, sizeof(lock_path), "%s.lock", path);
 
@@ -323,8 +323,8 @@ KdbStatus kdb_storage_rewrite(KdbTable      *tbl,
         return KDB_ERR_READ_ONLY;
     }
 
-    
-    char tmp_path[4096];
+
+    char tmp_path[4096 + 8];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", tbl->path);
 
     FILE *out_fp = fopen(tmp_path, "wb");

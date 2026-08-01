@@ -170,7 +170,7 @@ int main(int argc, char **argv) {
     bench_delete     (db, n);
     bench_compact    (db);
 
-    printf("\nFinal row count: %lld\n", kdb_count(db, TABLE_NAME, NULL));
+    printf("\nFinal row count: %lld\n", (long long)kdb_count(db, TABLE_NAME, NULL));
 
     kdb_close(db);
     return 0;

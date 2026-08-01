@@ -612,6 +612,8 @@ int kdb_table_exists(KumDB *db, const char *table_name) {
     return kdb_storage_exists(db->data_dir, table_name);
 }
 
+static _Thread_local char kdb__list_tables_buf[KDB_MAX_TABLES][KDB_MAX_NAME_LEN];
+
 KdbStatus kdb_list_tables(KumDB       *db,
                           const char **names_out,
                           size_t       max_tables,
@@ -621,14 +623,13 @@ KdbStatus kdb_list_tables(KumDB       *db,
         return KDB_ERR_BAD_ARG;
     }
 
-    char names[KDB_MAX_TABLES][KDB_MAX_NAME_LEN];
     uint32_t found = 0;
-    KdbStatus st = kdb_storage_list_tables(db->data_dir, names, &found);
+    KdbStatus st = kdb_storage_list_tables(db->data_dir, kdb__list_tables_buf, &found);
     if (st != KDB_OK) return st;
 
     *count_out = 0;
     for (uint32_t i = 0; i < found && *count_out < max_tables; i++) {
-        names_out[(*count_out)++] = names[i]; 
+        names_out[(*count_out)++] = kdb__list_tables_buf[i];
     }
     return KDB_OK;
 }

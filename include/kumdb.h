@@ -78,6 +78,9 @@ KdbStatus kdb_drop_table  (KumDB *db, const char *table_name);
 KdbStatus kdb_compact     (KumDB *db, const char *table_name);
 int       kdb_table_exists(KumDB *db, const char *table_name);
 
+/* names_out entries point into thread-local storage owned by KumDB and are
+ * valid until the next call to kdb_list_tables() on this thread. Copy them
+ * if you need to keep them around longer. */
 KdbStatus kdb_list_tables(KumDB      *db,
                           const char **names_out,
                           size_t      max_tables,

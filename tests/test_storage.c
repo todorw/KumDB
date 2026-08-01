@@ -251,6 +251,7 @@ int main(void) {
 
     test_record_serialize_roundtrip();
     test_storage_create_open_close();
+    test_storage_append_and_scan();
     test_storage_scan_c();
     test_compact_removes_deleted();
     test_durability_across_reopen();
