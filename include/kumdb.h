@@ -103,6 +103,19 @@ typedef struct {
 KdbStatus kdb_create_table(KumDB *db, const char *table_name,
                            const KdbColumnDef *columns, uint32_t column_count);
 
+typedef struct {
+    char         name[128];  /* matches the engine's internal column-name limit */
+    KdbFieldType type;
+    int          nullable;
+    int          indexed;
+} KdbColumnInfo;
+
+/* Structured schema introspection (kdb_print_schema() only gives you text).
+ * columns_out is caller-owned; copies at most max_columns entries in. */
+KdbStatus kdb_get_schema(KumDB *db, const char *table_name,
+                         KdbColumnInfo *columns_out, uint32_t max_columns,
+                         uint32_t *count_out);
+
 /* names_out entries point into thread-local storage owned by KumDB and are
  * valid until the next call to kdb_list_tables() on this thread. Copy them
  * if you need to keep them around longer. */

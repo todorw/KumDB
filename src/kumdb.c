@@ -643,6 +643,30 @@ KdbStatus kdb_create_table(KumDB *db, const char *table_name,
     return kdb_table_create(db->data_dir, table_name, cols, column_count);
 }
 
+KdbStatus kdb_get_schema(KumDB *db, const char *table_name,
+                         KdbColumnInfo *columns_out, uint32_t max_columns,
+                         uint32_t *count_out) {
+    if (!db || !table_name || !columns_out || !count_out) {
+        kdb_err_null_arg("db/table_name/columns_out/count_out", "kdb_get_schema");
+        return KDB_ERR_BAD_ARG;
+    }
+
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+
+    *count_out = 0;
+    for (uint32_t i = 0; i < tbl->header.column_count && *count_out < max_columns; i++) {
+        const KdbColumn *c = &tbl->header.columns[i];
+        KdbColumnInfo   *out = &columns_out[*count_out];
+        KDB_STRLCPY(out->name, c->name, sizeof(out->name));
+        out->type     = (KdbFieldType)c->type;
+        out->nullable = c->nullable ? 1 : 0;
+        out->indexed  = c->indexed  ? 1 : 0;
+        (*count_out)++;
+    }
+    return KDB_OK;
+}
+
 KdbStatus kdb_drop_table(KumDB *db, const char *table_name) {
     if (!db || !table_name) {
         kdb_err_null_arg("db/table_name", "kdb_drop_table");
