@@ -313,6 +313,7 @@ INSERT INTO t (col, ...) VALUES (val, ...)
 SELECT [DISTINCT] * | item, ... FROM t
     [WHERE cond [AND|OR cond ...]]
     [GROUP BY col]
+    [HAVING cond [AND|OR cond ...]]
     [ORDER BY col [ASC|DESC]]
     [LIMIT n [OFFSET m]]
 
@@ -343,8 +344,16 @@ single summary row. With `GROUP BY col`, you get one row per distinct value
 of `col`; every other selected item must be an aggregate call — same rule
 real SQL uses. `SELECT col FROM t GROUP BY col` with no aggregate at all is
 a valid way to get distinct values. `SUM`/`AVG` always come back as `FLOAT`
-regardless of the source column's type. No `HAVING`, no grouping by more
-than one column, no window functions.
+regardless of the source column's type. No grouping by more than one
+column, no window functions.
+
+**`HAVING`** filters the aggregated/grouped output (same condition syntax
+as `WHERE`, evaluated against the SELECT list's aliases -- `HAVING total >
+90` refers to `SUM(amount) AS total`, not the raw `amount` column). Only
+valid with `GROUP BY` or an aggregate function; requiring it without either
+is a syntax error, same as real SQL. Runs after grouping and before
+`ORDER BY`/`LIMIT`, so `HAVING ... ORDER BY ... LIMIT ...` limits the
+already-`HAVING`-filtered set.
 
 **`SELECT DISTINCT`** dedupes the result by the exact set of selected
 columns (after projection, so `SELECT DISTINCT col` dedupes on `col`

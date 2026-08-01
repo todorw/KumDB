@@ -280,6 +280,46 @@ static void test_group_by_and_aggregates(void) {
     teardown(db);
 }
 
+static void test_having(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE sales (region TEXT, amount FLOAT)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount) VALUES ('east', 100.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount) VALUES ('east', 200.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount) VALUES ('west', 50.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount) VALUES ('north', 500.0)"));
+
+    KdbRows *rows = NULL;
+
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT region, SUM(amount) AS total FROM sales GROUP BY region HAVING total > 90 ORDER BY total DESC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const char *r0 = NULL, *r1 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "region", &r0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "region", &r1));
+        ASSERT_STR(r0, "north");
+        ASSERT_STR(r1, "east");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* HAVING with COUNT(*) */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT region, COUNT(*) AS n FROM sales GROUP BY region HAVING n >= 2", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *r0 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "region", &r0));
+        ASSERT_STR(r0, "east");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* HAVING without GROUP BY/aggregate is rejected */
+    ASSERT_ERR(sql(db, "SELECT region FROM sales HAVING region = 'east'"));
+
+    teardown(db);
+}
+
 static void test_distinct(void) {
     KumDB *db;
     setup(&db);
@@ -480,6 +520,7 @@ int main(void) {
     test_where_operators();
     test_or();
     test_group_by_and_aggregates();
+    test_having();
     test_distinct();
     test_alter_table();
     test_nested_values_through_sql();

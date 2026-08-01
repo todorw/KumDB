@@ -329,21 +329,19 @@ static char *sql__parse_condition(SqlParser *p) {
     return buf;
 }
 
-/* returns 0 on error (error already set), 1 on success */
-static int sql__parse_where(SqlParser *p, char *filters_buf[KDB_SQL_MAX_COND], int *count_out) {
+/* AND binds tighter than OR, same as standard SQL -- no parens/nesting.
+ * "a=1 AND b=2 OR c=3" means (a=1 AND b=2) OR (c=3). Groups get built by
+ * prefixing the first condition of each OR'd group with "OR:", the same
+ * convention kdb_find()/kdb_update()/kdb_delete() understand. Shared by
+ * WHERE and HAVING -- the keyword itself is consumed by the caller.
+ * returns 0 on error (error already set), 1 on success */
+static int sql__parse_cond_list(SqlParser *p, char *filters_buf[KDB_SQL_MAX_COND], int *count_out) {
     int n = 0;
     *count_out = 0;
-    if (!sql__kw_is(&p->cur, "WHERE")) return 1;
-    sql__advance(p);
-
-    /* AND binds tighter than OR, same as standard SQL -- no parens/nesting.
-     * "a=1 AND b=2 OR c=3" means (a=1 AND b=2) OR (c=3). Groups get built
-     * by prefixing the first condition of each OR'd group with "OR:",
-     * the same convention kdb_find()/kdb_update()/kdb_delete() understand. */
     int start_new_group = 0;
     for (;;) {
         if (n >= KDB_SQL_MAX_COND) {
-            sql__err("too many WHERE conditions (max %d)", KDB_SQL_MAX_COND);
+            sql__err("too many conditions (max %d)", KDB_SQL_MAX_COND);
             sql__free_filters(filters_buf, n);
             return 0;
         }
@@ -376,6 +374,22 @@ static int sql__parse_where(SqlParser *p, char *filters_buf[KDB_SQL_MAX_COND], i
     }
     *count_out = n;
     return 1;
+}
+
+/* returns 0 on error (error already set), 1 on success */
+static int sql__parse_where(SqlParser *p, char *filters_buf[KDB_SQL_MAX_COND], int *count_out) {
+    *count_out = 0;
+    if (!sql__kw_is(&p->cur, "WHERE")) return 1;
+    sql__advance(p);
+    return sql__parse_cond_list(p, filters_buf, count_out);
+}
+
+/* returns 0 on error (error already set), 1 on success */
+static int sql__parse_having(SqlParser *p, char *filters_buf[KDB_SQL_MAX_COND], int *count_out) {
+    *count_out = 0;
+    if (!sql__kw_is(&p->cur, "HAVING")) return 1;
+    sql__advance(p);
+    return sql__parse_cond_list(p, filters_buf, count_out);
 }
 
 static int sql__is_reserved_column(const char *name) {
@@ -771,6 +785,192 @@ static int sql__field_cmp(const KdbField *a, const KdbField *b) {
     return 0;
 }
 
+#define SQL_CMP_INCOMPARABLE (-2)
+
+/* Same idea as sql__field_cmp, but against a raw filter-value string
+ * instead of another field -- and distinguishes "genuinely incomparable"
+ * (SQL_CMP_INCOMPARABLE) from "compares equal", since a filter like
+ * age__gt=abc on an int column must not match. */
+static int sql__field_cmp_text(const KdbField *f, const char *text) {
+    if (!f) return SQL_CMP_INCOMPARABLE;
+    double fd;
+    if (sql__field_to_double(f, &fd)) {
+        char *end = NULL;
+        double td = strtod(text, &end);
+        if (end == text) return SQL_CMP_INCOMPARABLE;
+        if (fd < td) return -1;
+        if (fd > td) return 1;
+        return 0;
+    }
+    if (f->type == KDB_TYPE_STRING)
+        return strcmp(f->v.as_string ? f->v.as_string : "", text);
+    return SQL_CMP_INCOMPARABLE;
+}
+
+typedef enum {
+    SQL_ROP_EQ, SQL_ROP_NEQ, SQL_ROP_GT, SQL_ROP_GTE, SQL_ROP_LT, SQL_ROP_LTE,
+    SQL_ROP_BETWEEN, SQL_ROP_IN, SQL_ROP_CONTAINS, SQL_ROP_STARTSWITH,
+    SQL_ROP_ENDSWITH, SQL_ROP_ISNULL, SQL_ROP_ISNOTNULL
+} SqlRowOp;
+
+typedef struct {
+    char     col[KDB_SQL_IDENT_BUF];
+    SqlRowOp op;
+    char     value[KDB_SQL_TOK_MAX];  /* raw text; comma-separated for IN/BETWEEN */
+    int      is_or_start;             /* filter string was "OR:"-prefixed */
+} SqlRowCond;
+
+/* Parses one filter string in the exact shape sql__parse_condition() emits
+ * ("col__op=value", "col=value", "col__isnull", optionally "OR:"-prefixed)
+ * back into a structured condition -- so HAVING and post-JOIN WHERE can
+ * evaluate the same filter strings sql__parse_where() already builds
+ * directly against an in-memory KdbRow, instead of a stored table. Returns
+ * 0 on a malformed string (shouldn't happen, these are always our own
+ * output, but fail closed rather than assert). */
+static int sql__parse_row_cond(const char *filter, SqlRowCond *out) {
+    memset(out, 0, sizeof(*out));
+    if (strncmp(filter, "OR:", 3) == 0) { out->is_or_start = 1; filter += 3; }
+
+    const char *eq = strchr(filter, '=');
+    const char *dunder = strstr(filter, "__");
+    if (dunder && dunder != filter && (!eq || dunder < eq)) {
+        size_t col_len = (size_t)(dunder - filter);
+        if (col_len >= sizeof(out->col)) col_len = sizeof(out->col) - 1;
+        memcpy(out->col, filter, col_len);
+        out->col[col_len] = '\0';
+
+        const char *op_start = dunder + 2;
+        const char *op_end   = eq ? eq : (filter + strlen(filter));
+        char op_buf[32];
+        size_t op_len = (size_t)(op_end - op_start);
+        if (op_len >= sizeof(op_buf)) op_len = sizeof(op_buf) - 1;
+        memcpy(op_buf, op_start, op_len);
+        op_buf[op_len] = '\0';
+
+        if      (strcmp(op_buf, "eq")         == 0) out->op = SQL_ROP_EQ;
+        else if (strcmp(op_buf, "neq")        == 0) out->op = SQL_ROP_NEQ;
+        else if (strcmp(op_buf, "gt")         == 0) out->op = SQL_ROP_GT;
+        else if (strcmp(op_buf, "gte")        == 0) out->op = SQL_ROP_GTE;
+        else if (strcmp(op_buf, "lt")         == 0) out->op = SQL_ROP_LT;
+        else if (strcmp(op_buf, "lte")        == 0) out->op = SQL_ROP_LTE;
+        else if (strcmp(op_buf, "between")    == 0) out->op = SQL_ROP_BETWEEN;
+        else if (strcmp(op_buf, "in")         == 0) out->op = SQL_ROP_IN;
+        else if (strcmp(op_buf, "contains")   == 0) out->op = SQL_ROP_CONTAINS;
+        else if (strcmp(op_buf, "startswith") == 0) out->op = SQL_ROP_STARTSWITH;
+        else if (strcmp(op_buf, "endswith")   == 0) out->op = SQL_ROP_ENDSWITH;
+        else if (strcmp(op_buf, "isnull")     == 0) out->op = SQL_ROP_ISNULL;
+        else if (strcmp(op_buf, "isnotnull")  == 0) out->op = SQL_ROP_ISNOTNULL;
+        else return 0;
+
+        if (eq) snprintf(out->value, sizeof(out->value), "%s", eq + 1);
+        return 1;
+    }
+
+    if (!eq) return 0;
+    size_t col_len = (size_t)(eq - filter);
+    if (col_len >= sizeof(out->col)) col_len = sizeof(out->col) - 1;
+    memcpy(out->col, filter, col_len);
+    out->col[col_len] = '\0';
+    out->op = SQL_ROP_EQ;
+    snprintf(out->value, sizeof(out->value), "%s", eq + 1);
+    return 1;
+}
+
+static int sql__row_cond_matches(const KdbRow *row, const SqlRowCond *c) {
+    const KdbField *f = kdb_row_get(row, c->col);
+
+    if (c->op == SQL_ROP_ISNULL)    return !f || f->type == KDB_TYPE_NULL;
+    if (c->op == SQL_ROP_ISNOTNULL) return f && f->type != KDB_TYPE_NULL;
+    if (!f) return 0;
+
+    switch (c->op) {
+        case SQL_ROP_EQ:  { int r = sql__field_cmp_text(f, c->value); return r != SQL_CMP_INCOMPARABLE && r == 0; }
+        case SQL_ROP_NEQ: { int r = sql__field_cmp_text(f, c->value); return r != SQL_CMP_INCOMPARABLE && r != 0; }
+        case SQL_ROP_GT:  { int r = sql__field_cmp_text(f, c->value); return r != SQL_CMP_INCOMPARABLE && r > 0; }
+        case SQL_ROP_GTE: { int r = sql__field_cmp_text(f, c->value); return r != SQL_CMP_INCOMPARABLE && r >= 0; }
+        case SQL_ROP_LT:  { int r = sql__field_cmp_text(f, c->value); return r != SQL_CMP_INCOMPARABLE && r < 0; }
+        case SQL_ROP_LTE: { int r = sql__field_cmp_text(f, c->value); return r != SQL_CMP_INCOMPARABLE && r <= 0; }
+        case SQL_ROP_CONTAINS:
+            return f->type == KDB_TYPE_STRING && f->v.as_string && strstr(f->v.as_string, c->value) != NULL;
+        case SQL_ROP_STARTSWITH:
+            return f->type == KDB_TYPE_STRING && f->v.as_string &&
+                   strncmp(f->v.as_string, c->value, strlen(c->value)) == 0;
+        case SQL_ROP_ENDSWITH: {
+            if (f->type != KDB_TYPE_STRING || !f->v.as_string) return 0;
+            size_t flen = strlen(f->v.as_string), slen = strlen(c->value);
+            if (slen > flen) return 0;
+            return strcmp(f->v.as_string + (flen - slen), c->value) == 0;
+        }
+        case SQL_ROP_BETWEEN: {
+            const char *comma = strchr(c->value, ',');
+            if (!comma) return 0;
+            char lo[KDB_SQL_IDENT_BUF];
+            size_t lo_len = (size_t)(comma - c->value);
+            if (lo_len >= sizeof(lo)) lo_len = sizeof(lo) - 1;
+            memcpy(lo, c->value, lo_len);
+            lo[lo_len] = '\0';
+            int cl = sql__field_cmp_text(f, lo);
+            int ch = sql__field_cmp_text(f, comma + 1);
+            return cl != SQL_CMP_INCOMPARABLE && ch != SQL_CMP_INCOMPARABLE && cl >= 0 && ch <= 0;
+        }
+        case SQL_ROP_IN: {
+            const char *p = c->value;
+            while (*p) {
+                const char *comma = strchr(p, ',');
+                size_t tok_len = comma ? (size_t)(comma - p) : strlen(p);
+                char tok[KDB_SQL_IDENT_BUF];
+                if (tok_len >= sizeof(tok)) tok_len = sizeof(tok) - 1;
+                memcpy(tok, p, tok_len);
+                tok[tok_len] = '\0';
+                int r = sql__field_cmp_text(f, tok);
+                if (r != SQL_CMP_INCOMPARABLE && r == 0) return 1;
+                if (!comma) break;
+                p = comma + 1;
+            }
+            return 0;
+        }
+        default: return 0;
+    }
+}
+
+/* Same AND-within-group / OR-across-groups semantics sql__parse_where()'s
+ * "OR:" convention encodes (and that the storage-layer query engine also
+ * implements): a row matches if ANY group's conditions are ALL true. */
+static int sql__row_matches_filters(const KdbRow *row, char *const *filters, int nfilt) {
+    if (nfilt == 0) return 1;
+    int group_ok = 1;
+    int result = 0;
+    for (int i = 0; i < nfilt; i++) {
+        SqlRowCond c;
+        if (!sql__parse_row_cond(filters[i], &c)) return 0;
+        if (c.is_or_start && i > 0) {
+            if (group_ok) result = 1;
+            group_ok = 1;
+        }
+        if (!sql__row_cond_matches(row, &c)) group_ok = 0;
+    }
+    if (group_ok) result = 1;
+    return result;
+}
+
+/* In-place filter: drops rows that don't match, freeing their field
+ * memory, preserving order of the rows that stay. Used for HAVING and
+ * post-JOIN WHERE, both of which need to filter an already-materialized
+ * KdbRows rather than fetch from a stored table. */
+static void sql__filter_rows(KdbRows *rows, char *const *filters, int nfilt) {
+    if (!rows || nfilt == 0) return;
+    size_t kept = 0;
+    for (size_t i = 0; i < rows->count; i++) {
+        if (sql__row_matches_filters(&rows->rows[i], filters, nfilt)) {
+            if (kept != i) rows->rows[kept] = rows->rows[i];
+            kept++;
+        } else {
+            sql__free_row_fields(&rows->rows[i]);
+        }
+    }
+    rows->count = kept;
+}
+
 #define KDB_SQL_MAX_GROUPS 512
 
 typedef struct {
@@ -1143,6 +1343,16 @@ static KdbStatus sql__exec_select(SqlParser *p, KumDB *db, KdbRows **rows_out) {
         }
     }
 
+    char *having_filters[KDB_SQL_MAX_COND];
+    int   nhaving = 0;
+    if (sql__kw_is(&p->cur, "HAVING")) {
+        if (!has_aggregate && !has_group_by) {
+            sql__free_filters(filters, nfilt);
+            return sql__err("HAVING requires GROUP BY or an aggregate function -- use WHERE to filter plain columns");
+        }
+        if (!sql__parse_having(p, having_filters, &nhaving)) { sql__free_filters(filters, nfilt); return kdb_last_status(); }
+    }
+
     KdbFindOpts opts;
     memset(&opts, 0, sizeof(opts));
     opts.ascending = 1;
@@ -1151,10 +1361,10 @@ static KdbStatus sql__exec_select(SqlParser *p, KumDB *db, KdbRows **rows_out) {
 
     if (sql__kw_is(&p->cur, "ORDER")) {
         sql__advance(p);
-        if (!sql__kw_is(&p->cur, "BY")) { sql__free_filters(filters, nfilt); return sql__err("expected BY after ORDER"); }
+        if (!sql__kw_is(&p->cur, "BY")) { sql__free_filters(filters, nfilt); sql__free_filters(having_filters, nhaving); return sql__err("expected BY after ORDER"); }
         sql__advance(p);
         const char *ocol;
-        if (!sql__ident_text(&p->cur, &ocol)) { sql__free_filters(filters, nfilt); return sql__err("expected a column name after ORDER BY"); }
+        if (!sql__ident_text(&p->cur, &ocol)) { sql__free_filters(filters, nfilt); sql__free_filters(having_filters, nhaving); return sql__err("expected a column name after ORDER BY"); }
         snprintf(order_col, sizeof(order_col), "%.255s", ocol);
         opts.order_by = order_col;
         sql__advance(p);
@@ -1164,12 +1374,12 @@ static KdbStatus sql__exec_select(SqlParser *p, KumDB *db, KdbRows **rows_out) {
 
     if (sql__kw_is(&p->cur, "LIMIT")) {
         sql__advance(p);
-        if (p->cur.type != SQLTOK_NUMBER) { sql__free_filters(filters, nfilt); return sql__err("expected a number after LIMIT"); }
+        if (p->cur.type != SQLTOK_NUMBER) { sql__free_filters(filters, nfilt); sql__free_filters(having_filters, nhaving); return sql__err("expected a number after LIMIT"); }
         opts.limit = (size_t)atoll(p->cur.text);
         sql__advance(p);
         if (sql__kw_is(&p->cur, "OFFSET")) {
             sql__advance(p);
-            if (p->cur.type != SQLTOK_NUMBER) { sql__free_filters(filters, nfilt); return sql__err("expected a number after OFFSET"); }
+            if (p->cur.type != SQLTOK_NUMBER) { sql__free_filters(filters, nfilt); sql__free_filters(having_filters, nhaving); return sql__err("expected a number after OFFSET"); }
             opts.offset = (size_t)atoll(p->cur.text);
             sql__advance(p);
         }
@@ -1185,13 +1395,15 @@ static KdbStatus sql__exec_select(SqlParser *p, KumDB *db, KdbRows **rows_out) {
          * passed to the fetch. */
         KdbRows *all = kdb_find_ex(db, table_name, nfilt > 0 ? filter_ptrs : NULL, NULL);
         sql__free_filters(filters, nfilt);
-        if (!all) return kdb_last_status();
+        if (!all) { sql__free_filters(having_filters, nhaving); return kdb_last_status(); }
 
         KdbRows *agg = NULL;
         KdbStatus ast = sql__compute_aggregates(all, items, nitems, has_group_by, group_col, &agg);
         kdb_rows_free(all);
-        if (ast != KDB_OK) return ast;
+        if (ast != KDB_OK) { sql__free_filters(having_filters, nhaving); return ast; }
 
+        if (nhaving > 0) sql__filter_rows(agg, having_filters, nhaving);
+        sql__free_filters(having_filters, nhaving);
         if (distinct) sql__dedupe_rows(agg);
         if (opts.order_by) sql__sort_rows(agg, opts.order_by, opts.ascending);
         if (opts.offset > 0 || opts.limit > 0) sql__limit_rows(agg, opts.offset, opts.limit);
