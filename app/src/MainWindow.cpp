@@ -180,8 +180,11 @@ void MainWindow::reloadDatasheet() {
     if (table.isEmpty() || !m_db.isOpen()) { m_datasheetModel->clear(); return; }
 
     QVector<KColumnMeta> schema = m_db.schema(table);
-    QStringList columns;
-    for (const auto &c : schema) columns << c.name;
+    QStringList columns, readOnlyColumns;
+    for (const auto &c : schema) {
+        columns << c.name;
+        if (c.type == KDB_TYPE_ARRAY || c.type == KDB_TYPE_OBJECT) readOnlyColumns << c.name;
+    }
 
     QString err;
     QVector<KRow> rows = m_db.find(table, {}, &err);
@@ -197,7 +200,7 @@ void MainWindow::reloadDatasheet() {
                 if (!columns.contains(f.first)) columns << f.first;
     }
 
-    m_datasheetModel->setData(table, columns, rows, true);
+    m_datasheetModel->setData(table, columns, rows, true, readOnlyColumns);
     m_datasheet->resizeColumnsToContents();
     m_statusLabel->setText(QString("%1: %2 row(s)").arg(table).arg(rows.size()));
 }

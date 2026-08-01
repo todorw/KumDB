@@ -3,12 +3,14 @@
 RowTableModel::RowTableModel(KumDbHandle *db, QObject *parent)
     : QAbstractTableModel(parent), m_db(db) {}
 
-void RowTableModel::setData(const QString &table, const QStringList &columns, const QVector<KRow> &rows, bool editable) {
+void RowTableModel::setData(const QString &table, const QStringList &columns, const QVector<KRow> &rows,
+                            bool editable, const QStringList &readOnlyColumns) {
     beginResetModel();
     m_table = table;
     m_columns = columns;
     m_rows = rows;
     m_editable = editable;
+    m_readOnlyColumns = readOnlyColumns;
     endResetModel();
 }
 
@@ -18,6 +20,7 @@ void RowTableModel::clear() {
     m_columns.clear();
     m_rows.clear();
     m_editable = false;
+    m_readOnlyColumns.clear();
     endResetModel();
 }
 
@@ -69,6 +72,7 @@ bool RowTableModel::setData(const QModelIndex &index, const QVariant &value, int
     if (!m_editable) return false;
 
     const QString colName = m_columns[index.column() - 1];
+    if (m_readOnlyColumns.contains(colName)) return false;
     quint64 id = idAt(index.row());
 
     QString err;
@@ -102,6 +106,9 @@ QVariant RowTableModel::headerData(int section, Qt::Orientation orientation, int
 
 Qt::ItemFlags RowTableModel::flags(const QModelIndex &index) const {
     Qt::ItemFlags f = QAbstractTableModel::flags(index);
-    if (index.isValid() && index.column() != 0 && m_editable) f |= Qt::ItemIsEditable;
+    if (index.isValid() && index.column() != 0 && m_editable) {
+        const QString colName = m_columns[index.column() - 1];
+        if (!m_readOnlyColumns.contains(colName)) f |= Qt::ItemIsEditable;
+    }
     return f;
 }

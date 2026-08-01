@@ -21,6 +21,41 @@ void KumDbHandle::close() {
     m_dataDir.clear();
 }
 
+/* Compact JSON-ish text, read-only display only -- the datasheet grid edits
+ * scalar cells in place, it doesn't offer a nested-value editor. Good enough
+ * to see what's there without silently showing a blank cell. */
+static QString fieldToDisplayString(const KdbField &f);
+
+static QString arrayToDisplayString(const KdbField &f) {
+    QStringList parts;
+    for (size_t i = 0; i < f.v.as_array.count; i++)
+        parts << fieldToDisplayString(f.v.as_array.items[i]);
+    return "[" + parts.join(", ") + "]";
+}
+
+static QString objectToDisplayString(const KdbField &f) {
+    QStringList parts;
+    if (f.v.as_object) {
+        for (const KdbField *sub = f.v.as_object; sub->name != nullptr; sub++)
+            parts << QString("%1: %2").arg(QString::fromUtf8(sub->name), fieldToDisplayString(*sub));
+    }
+    return "{" + parts.join(", ") + "}";
+}
+
+static QString fieldToDisplayString(const KdbField &f) {
+    switch (f.type) {
+        case KDB_TYPE_INT:    return QString::number(f.v.as_int);
+        case KDB_TYPE_FLOAT:  return QString::number(f.v.as_float);
+        case KDB_TYPE_BOOL:   return f.v.as_bool ? "true" : "false";
+        case KDB_TYPE_STRING: return QString("\"%1\"").arg(QString::fromUtf8(f.v.as_string ? f.v.as_string : ""));
+        case KDB_TYPE_BLOB:   return QString("<blob: %1 bytes>").arg((qulonglong)f.v.as_blob.len);
+        case KDB_TYPE_ARRAY:  return arrayToDisplayString(f);
+        case KDB_TYPE_OBJECT: return objectToDisplayString(f);
+        case KDB_TYPE_NULL:
+        default:              return "null";
+    }
+}
+
 QVariant KumDbHandle::valueFromField(const KdbField &f) {
     switch (f.type) {
         case KDB_TYPE_INT:    return QVariant::fromValue<qint64>(f.v.as_int);
@@ -28,6 +63,8 @@ QVariant KumDbHandle::valueFromField(const KdbField &f) {
         case KDB_TYPE_BOOL:   return QVariant(f.v.as_bool != 0);
         case KDB_TYPE_STRING: return QVariant(QString::fromUtf8(f.v.as_string ? f.v.as_string : ""));
         case KDB_TYPE_BLOB:   return QVariant(QString("<blob: %1 bytes>").arg((qulonglong)f.v.as_blob.len));
+        case KDB_TYPE_ARRAY:  return QVariant(arrayToDisplayString(f));
+        case KDB_TYPE_OBJECT: return QVariant(objectToDisplayString(f));
         case KDB_TYPE_NULL:
         default:              return QVariant();
     }

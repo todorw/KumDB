@@ -16,7 +16,12 @@ class RowTableModel : public QAbstractTableModel {
 public:
     explicit RowTableModel(KumDbHandle *db, QObject *parent = nullptr);
 
-    void setData(const QString &table, const QStringList &columns, const QVector<KRow> &rows, bool editable);
+    // readOnlyColumns: columns that must never be edited in place even when
+    // editable is true (ARRAY/OBJECT columns -- the grid shows them as text,
+    // but writing that text back would silently replace the structured
+    // value with a plain string).
+    void setData(const QString &table, const QStringList &columns, const QVector<KRow> &rows,
+                bool editable, const QStringList &readOnlyColumns = {});
     void clear();
 
     quint64 idAt(int row) const;
@@ -39,4 +44,5 @@ private:
     QStringList   m_columns;
     QVector<KRow> m_rows;
     bool          m_editable = false;
+    QStringList   m_readOnlyColumns;
 };
