@@ -10,6 +10,7 @@ KdbStatus kdb_value_from_int   (int64_t v,   KdbValue *out);
 KdbStatus kdb_value_from_float (double v,    KdbValue *out);
 KdbStatus kdb_value_from_bool  (uint8_t v,   KdbValue *out);
 KdbStatus kdb_value_from_null  (KdbValue *out);
+KdbStatus kdb_value_from_blob  (const void *data, size_t len, KdbValue *out);
 
 KdbStatus kdb_value_copy(const KdbValue *src, KdbValue *dst);
 void      kdb_value_free(KdbValue *v);

@@ -92,6 +92,7 @@ KdbStatus kdb_row_get_int   (const KdbRow *row, const char *col, int64_t    *out
 KdbStatus kdb_row_get_float (const KdbRow *row, const char *col, double     *out);
 KdbStatus kdb_row_get_bool  (const KdbRow *row, const char *col, int        *out);
 KdbStatus kdb_row_get_string(const KdbRow *row, const char *col, const char **out);
+KdbStatus kdb_row_get_blob  (const KdbRow *row, const char *col, const void **data_out, size_t *len_out);
 
 const char *kdb_last_error (void);
 KdbStatus   kdb_last_status(void);
@@ -108,6 +109,12 @@ static inline KdbField kdb_field_bool  (const char *n, int         v) { KdbField
 static inline KdbField kdb_field_string(const char *n, const char *v) { KdbField f = {n, KDB_TYPE_STRING, .v.as_string = v}; return f; }
 static inline KdbField kdb_field_null  (const char *n)                { KdbField f = {n, KDB_TYPE_NULL,   {0}           }; return f; }
 static inline KdbField kdb_field_end   (void)                         { KdbField f = {NULL, KDB_TYPE_NULL, {0}           }; return f; }
+static inline KdbField kdb_field_blob  (const char *n, const void *data, size_t len) {
+    KdbField f = {n, KDB_TYPE_BLOB, {0}};
+    f.v.as_blob.data = data;
+    f.v.as_blob.len  = len;
+    return f;
+}
 
 #ifdef __cplusplus
 }

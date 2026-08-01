@@ -111,6 +111,12 @@ static KdbRecord *kdb__fields_to_record(const KdbField *fields) {
             case KDB_TYPE_NULL:
                 kdb_value_from_null(&val);
                 break;
+            case KDB_TYPE_BLOB:
+                if (kdb_value_from_blob(f->v.as_blob.data, f->v.as_blob.len, &val) != KDB_OK) {
+                    kdb_record_free(r);
+                    return NULL;
+                }
+                break;
             default:
                 kdb_value_from_null(&val);
                 break;
@@ -243,6 +249,20 @@ static KdbRow *kdb__record_to_row(const KdbRecord *r) {
                         }
                     }
                     dst->v.as_string = str_copy;
+                    break;
+                }
+                case KDB_TYPE_BLOB: {
+                    dst->type = KDB_TYPE_BLOB;
+                    void *blob_copy = NULL;
+                    if (src->value.v.as_blob.len > 0 && src->value.v.as_blob.data) {
+                        blob_copy = malloc(src->value.v.as_blob.len);
+                        if (blob_copy) {
+                            memcpy(blob_copy, src->value.v.as_blob.data,
+                                   src->value.v.as_blob.len);
+                        }
+                    }
+                    dst->v.as_blob.data = blob_copy;
+                    dst->v.as_blob.len  = src->value.v.as_blob.len;
                     break;
                 }
                 case KDB_TYPE_NULL:
@@ -684,6 +704,15 @@ KdbStatus kdb_row_get_string(const KdbRow *row, const char *col, const char **ou
     if (!f)                          { kdb_err_field_not_found(col, "row"); return KDB_ERR_NOT_FOUND; }
     if (f->type != KDB_TYPE_STRING)  { kdb_err_bad_type(col, KDB_TYPE_STRING, (KdbType)f->type); return KDB_ERR_BAD_TYPE; }
     *out = f->v.as_string;
+    return KDB_OK;
+}
+
+KdbStatus kdb_row_get_blob(const KdbRow *row, const char *col, const void **data_out, size_t *len_out) {
+    const KdbField *f = kdb_row_get(row, col);
+    if (!f)                          { kdb_err_field_not_found(col, "row"); return KDB_ERR_NOT_FOUND; }
+    if (f->type != KDB_TYPE_BLOB)    { kdb_err_bad_type(col, KDB_TYPE_BLOB, (KdbType)f->type); return KDB_ERR_BAD_TYPE; }
+    *data_out = f->v.as_blob.data;
+    *len_out  = f->v.as_blob.len;
     return KDB_OK;
 }
 

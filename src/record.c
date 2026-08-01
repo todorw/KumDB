@@ -141,6 +141,15 @@ KdbStatus kdb_record_set_null(KdbRecord *r, const char *col) {
     return kdb_record_set_field(r, col, &val);
 }
 
+KdbStatus kdb_record_set_blob(KdbRecord *r, const char *col, const void *data, size_t len) {
+    KdbValue val;
+    KdbStatus st = kdb_value_from_blob(data, len, &val);
+    if (st != KDB_OK) return st;
+    st = kdb_record_set_field(r, col, &val);
+    kdb_value_free(&val);
+    return st;
+}
+
 KdbStatus kdb_record_update_field(KdbRecord      *r,
                                   const char     *col_name,
                                   const KdbValue *new_value) {
@@ -212,6 +221,18 @@ KdbStatus kdb_record_get_string(const KdbRecord *r, const char *col, const char 
         return KDB_ERR_BAD_TYPE;
     }
     *out = f->value.v.as_string.data;
+    return KDB_OK;
+}
+
+KdbStatus kdb_record_get_blob(const KdbRecord *r, const char *col, const uint8_t **data_out, size_t *len_out) {
+    const KdbRecordField *f = kdb_record_get_field(r, col);
+    if (!f) { kdb_err_field_not_found(col, "record"); return KDB_ERR_NOT_FOUND; }
+    if (f->value.type != KDB_TYPE_BLOB) {
+        kdb_err_bad_type(col, KDB_TYPE_BLOB, f->value.type);
+        return KDB_ERR_BAD_TYPE;
+    }
+    *data_out = f->value.v.as_blob.data;
+    *len_out  = f->value.v.as_blob.len;
     return KDB_OK;
 }
 

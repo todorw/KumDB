@@ -27,6 +27,7 @@ KdbStatus kdb_record_set_float (KdbRecord *r, const char *col, double   v);
 KdbStatus kdb_record_set_bool  (KdbRecord *r, const char *col, uint8_t  v);
 KdbStatus kdb_record_set_string(KdbRecord *r, const char *col, const char *v);
 KdbStatus kdb_record_set_null  (KdbRecord *r, const char *col);
+KdbStatus kdb_record_set_blob  (KdbRecord *r, const char *col, const void *data, size_t len);
 
 
 KdbStatus kdb_record_update_field(KdbRecord      *r,
@@ -41,6 +42,7 @@ KdbStatus kdb_record_get_int   (const KdbRecord *r, const char *col, int64_t  *o
 KdbStatus kdb_record_get_float (const KdbRecord *r, const char *col, double   *out);
 KdbStatus kdb_record_get_bool  (const KdbRecord *r, const char *col, uint8_t  *out);
 KdbStatus kdb_record_get_string(const KdbRecord *r, const char *col, const char **out);
+KdbStatus kdb_record_get_blob  (const KdbRecord *r, const char *col, const uint8_t **data_out, size_t *len_out);
 
 
 int kdb_record_is_null(const KdbRecord *r, const char *col_name);

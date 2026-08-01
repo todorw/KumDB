@@ -118,6 +118,24 @@ KdbStatus kdb_value_from_null(KdbValue *out) {
     return KDB_OK;
 }
 
+KdbStatus kdb_value_from_blob(const void *data, size_t len, KdbValue *out) {
+    if (!out) return KDB_ERR_BAD_ARG;
+    memset(out, 0, sizeof(*out));
+    out->type = KDB_TYPE_BLOB;
+    if (len == 0) {
+        out->v.as_blob.data = NULL;
+        out->v.as_blob.len  = 0;
+        return KDB_OK;
+    }
+    if (!data) return KDB_ERR_BAD_ARG;
+    uint8_t *copy = malloc(len);
+    if (!copy) { kdb_err_oom("blob value"); return KDB_ERR_OOM; }
+    memcpy(copy, data, len);
+    out->v.as_blob.data = copy;
+    out->v.as_blob.len  = len;
+    return KDB_OK;
+}
+
 KdbStatus kdb_value_from_string(const char *raw, KdbType hint, KdbValue *out) {
     if (!out) return KDB_ERR_BAD_ARG;
     memset(out, 0, sizeof(*out));
@@ -193,6 +211,11 @@ KdbStatus kdb_value_copy(const KdbValue *src, KdbValue *dst) {
             break;
         }
         case KDB_TYPE_BLOB: {
+            if (src->v.as_blob.len == 0) {
+                dst->v.as_blob.data = NULL;
+                dst->v.as_blob.len  = 0;
+                break;
+            }
             uint8_t *copy = malloc(src->v.as_blob.len);
             if (!copy) { kdb_err_oom("blob copy"); return KDB_ERR_OOM; }
             memcpy(copy, src->v.as_blob.data, src->v.as_blob.len);
