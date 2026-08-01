@@ -15,6 +15,7 @@ the CLI. For a quick pitch and build instructions, see
 - [CLI](#cli)
 - [Tools](#tools)
 - [KumDB Studio](#kumdb-studio)
+- [Installers](#installers)
 
 ## Core concepts
 
@@ -426,3 +427,42 @@ Array/object columns show as read-only text in the grid (editing a
 nested-value cell in place isn't supported — it would just overwrite the
 structured value with plain text). See [`app/README.md`](app/README.md)
 for build instructions.
+
+## Installers
+
+`scripts/package.sh` builds Studio in release mode and packages it into two
+tiers with CPack:
+
+- **easy** -- just `kumdb_studio`, for someone who wants the desktop app
+  and nothing else.
+- **full** -- easy + `kumdb_cli`, `kumdb_dump`, and the C headers/static
+  lib, for anyone who also wants the command line tools or to embed KumDB
+  in their own program.
+
+```bash
+./scripts/package.sh
+# app/build/KumDBStudio-<version>-<platform>-easy.*
+# app/build/KumDBStudio-<version>-<platform>-full.*
+```
+
+Run it natively on each target OS -- it doesn't cross-compile Qt. What you
+get per platform:
+
+- **Linux**: a `.tar.gz` and a `.deb` for each tier.
+- **macOS**: a `.dmg` (CPack's DragNDrop generator) for each tier. Run
+  `macdeployqt` on the built `.app` bundle before packaging if you need the
+  Qt frameworks bundled in (otherwise the `.dmg` assumes Qt is already
+  installed on the target machine).
+- **Windows**: an NSIS installer `.exe` and a `.zip` for each tier. Run
+  `windeployqt` on the built `kumdb_studio.exe` before packaging for the
+  same reason -- CPack doesn't chase down and bundle DLL dependencies for
+  you, `windeployqt` does.
+
+The engine itself (`src/*.c`) compiles clean on Windows too now --
+`include/platform.h` swaps the POSIX bits (fcntl locking, fsync, mkdir)
+for their Windows equivalents (LockFileEx, \_commit, \_mkdir) under
+`#ifdef _WIN32`, verified by cross-compiling the whole library and the CLI
+tools with mingw-w64. Locking semantics match (one exclusive whole-file
+holder either way); the one thing that's a deliberate no-op on Windows is
+the post-rename parent-directory fsync durability trick, which is a
+POSIX-only idiom with no equivalent (NTFS handles this differently).

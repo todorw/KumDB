@@ -21,7 +21,7 @@ static void kdb__evict_table(KumDB *db, const char *table_name);
 
 
 const char *kdb_version(void) {
-    return "1.0.0";
+    return KDB_VERSION_MAJOR_STR "." KDB_VERSION_MINOR_STR "." KDB_VERSION_PATCH_STR;
 }
 
 

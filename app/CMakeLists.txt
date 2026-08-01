@@ -78,3 +78,83 @@ add_executable(kumdb_studio_handle_test
 )
 target_link_libraries(kumdb_studio_handle_test PRIVATE Qt${QT_VERSION_MAJOR}::Core kumdb)
 add_test(NAME handle_test COMMAND kumdb_studio_handle_test)
+
+# Plain C command-line tools -- no Qt dependency, built here too so the
+# "full" install tier (see packaging below) can ship them alongside Studio.
+add_executable(kumdb_cli  ${KUMDB_ROOT}/tools/kumdb_cli.c)
+add_executable(kumdb_dump ${KUMDB_ROOT}/tools/dump.c)
+target_link_libraries(kumdb_cli  PRIVATE kumdb)
+target_link_libraries(kumdb_dump PRIVATE kumdb)
+
+# ---------------------------------------------------------------------------
+# Packaging: two install tiers via CPack components.
+#   easy = kumdb_studio only, for someone who just wants the desktop app.
+#   full = easy + the CLI tools + headers/static lib, for embedding KumDB
+#          in your own programs.
+# Build both with scripts/package.sh (repo root) -- it runs cpack twice,
+# once per tier. Bundling the actual Qt runtime into the installer
+# (windeployqt / macdeployqt) has to happen on that target OS; this only
+# sets up the CPack side, which is platform-generic.
+# ---------------------------------------------------------------------------
+
+install(TARGETS kumdb_studio
+    RUNTIME DESTINATION bin COMPONENT studio
+    BUNDLE  DESTINATION .   COMPONENT studio
+)
+
+install(TARGETS kumdb_cli kumdb_dump
+    RUNTIME DESTINATION bin
+    COMPONENT devtools
+)
+
+install(TARGETS kumdb
+    ARCHIVE DESTINATION lib
+    COMPONENT devtools
+)
+
+install(DIRECTORY ${KUMDB_ROOT}/include/
+    DESTINATION include/kumdb
+    COMPONENT devtools
+    FILES_MATCHING PATTERN "*.h"
+)
+
+set(CPACK_PACKAGE_NAME "KumDBStudio")
+set(CPACK_PACKAGE_VENDOR "KumDB")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "KumDB Studio -- desktop front end for the KumDB embedded database")
+set(CPACK_PACKAGE_VERSION_MAJOR 1)
+set(CPACK_PACKAGE_VERSION_MINOR 1)
+set(CPACK_PACKAGE_VERSION_PATCH 0)
+set(CPACK_PACKAGE_INSTALL_DIRECTORY "KumDB Studio")
+set(CPACK_RESOURCE_FILE_LICENSE "${KUMDB_ROOT}/LICENSE")
+
+set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)
+set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
+set(CPACK_DEB_COMPONENT_INSTALL ON)
+
+if(WIN32)
+    set(CPACK_GENERATOR "ZIP;NSIS")
+    set(CPACK_NSIS_MUI_ICON "${KUMDB_ROOT}/assets/icon/icon.ico")
+    set(CPACK_NSIS_INSTALLED_ICON_NAME "bin\\\\kumdb_studio.exe")
+    set(CPACK_NSIS_PACKAGE_NAME "KumDB Studio")
+    set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
+elseif(APPLE)
+    set(CPACK_GENERATOR "DragNDrop")
+else()
+    set(CPACK_GENERATOR "TGZ;DEB")
+    set(CPACK_DEBIAN_PACKAGE_MAINTAINER "KumDB")
+    set(CPACK_DEBIAN_PACKAGE_SECTION "database")
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+endif()
+
+include(CPack)
+
+cpack_add_component(studio
+    DISPLAY_NAME "KumDB Studio"
+    DESCRIPTION "The desktop app -- browse tables, edit cells, run NoSQL or SQL queries."
+    REQUIRED
+)
+cpack_add_component(devtools
+    DISPLAY_NAME "Developer tools"
+    DESCRIPTION "kumdb_cli, kumdb_dump, and the C headers/static lib for embedding KumDB in your own programs."
+    DEPENDS studio
+)
