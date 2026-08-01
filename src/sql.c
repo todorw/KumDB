@@ -964,6 +964,48 @@ static void sql__limit_rows(KdbRows *rows, size_t offset, size_t limit) {
     }
 }
 
+/* Full-row equality (same field count, same names in the same order, same
+ * values) -- used by DISTINCT and UNION (not UNION ALL). Rows compared here
+ * have already gone through the same projection, so name order lining up
+ * is a safe assumption, not a limitation. */
+static int sql__row_equal(const KdbRow *a, const KdbRow *b) {
+    if (a->field_count != b->field_count) return 0;
+    for (uint32_t i = 0; i < a->field_count; i++) {
+        const KdbField *fa = &a->fields[i];
+        const KdbField *fb = &b->fields[i];
+        if (strcmp(fa->name ? fa->name : "", fb->name ? fb->name : "") != 0) return 0;
+        if (fa->type != fb->type) return 0;
+        if (fa->type == KDB_TYPE_NULL) continue; /* both null (type check above already matched): equal */
+        /* sql__field_equal covers numeric (incl. bool) and string; blob,
+         * array, and object always compare unequal here -- good enough for
+         * DISTINCT/UNION on the row shapes SQL SELECT actually produces,
+         * deep-equality on nested values isn't worth the plumbing for it. */
+        if (!sql__field_equal(fa, fb)) return 0;
+    }
+    return 1;
+}
+
+/* Removes rows that exactly duplicate an earlier row (freeing the
+ * duplicate's field memory), preserving first-occurrence order. O(n^2)
+ * comparisons, which is fine at the row counts this engine targets. */
+static void sql__dedupe_rows(KdbRows *rows) {
+    if (!rows || rows->count == 0) return;
+    size_t kept = 0;
+    for (size_t i = 0; i < rows->count; i++) {
+        int dup = 0;
+        for (size_t j = 0; j < kept; j++) {
+            if (sql__row_equal(&rows->rows[i], &rows->rows[j])) { dup = 1; break; }
+        }
+        if (dup) {
+            sql__free_row_fields(&rows->rows[i]);
+        } else {
+            if (kept != i) rows->rows[kept] = rows->rows[i];
+            kept++;
+        }
+    }
+    rows->count = kept;
+}
+
 static KdbStatus sql__project_rows(KdbRows *rows, char proj_cols[][KDB_SQL_IDENT_BUF], uint32_t nproj) {
     for (size_t r = 0; r < rows->count; r++) {
         KdbRow *row = &rows->rows[r];
@@ -995,6 +1037,9 @@ static KdbStatus sql__project_rows(KdbRows *rows, char proj_cols[][KDB_SQL_IDENT
 
 static KdbStatus sql__exec_select(SqlParser *p, KumDB *db, KdbRows **rows_out) {
     sql__advance(p); /* SELECT */
+
+    int distinct = 0;
+    if (sql__kw_is(&p->cur, "DISTINCT")) { distinct = 1; sql__advance(p); }
 
     int project_all = 0;
     SqlSelectItem items[KDB_SQL_MAX_COLUMNS];
@@ -1147,6 +1192,7 @@ static KdbStatus sql__exec_select(SqlParser *p, KumDB *db, KdbRows **rows_out) {
         kdb_rows_free(all);
         if (ast != KDB_OK) return ast;
 
+        if (distinct) sql__dedupe_rows(agg);
         if (opts.order_by) sql__sort_rows(agg, opts.order_by, opts.ascending);
         if (opts.offset > 0 || opts.limit > 0) sql__limit_rows(agg, opts.offset, opts.limit);
 
@@ -1155,9 +1201,15 @@ static KdbStatus sql__exec_select(SqlParser *p, KumDB *db, KdbRows **rows_out) {
         return KDB_OK;
     }
 
-    KdbRows *rows = kdb_find_ex(db, table_name, nfilt > 0 ? filter_ptrs : NULL, &opts);
+    /* DISTINCT can drop rows a plain kdb_find_ex() LIMIT would've kept, so
+     * when both are in play, dedupe before limiting rather than asking the
+     * storage layer to limit for us. */
+    KdbFindOpts *fetch_opts = distinct ? NULL : &opts;
+    KdbRows *rows = kdb_find_ex(db, table_name, nfilt > 0 ? filter_ptrs : NULL, fetch_opts);
     sql__free_filters(filters, nfilt);
     if (!rows) return kdb_last_status();
+
+    if (distinct && opts.order_by) sql__sort_rows(rows, opts.order_by, opts.ascending);
 
     if (!project_all) {
         char proj_cols[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
@@ -1165,6 +1217,11 @@ static KdbStatus sql__exec_select(SqlParser *p, KumDB *db, KdbRows **rows_out) {
             snprintf(proj_cols[i], sizeof(proj_cols[0]), "%s", items[i].arg_col);
         KdbStatus pst = sql__project_rows(rows, proj_cols, nitems);
         if (pst != KDB_OK) { kdb_rows_free(rows); return pst; }
+    }
+
+    if (distinct) {
+        sql__dedupe_rows(rows);
+        if (opts.offset > 0 || opts.limit > 0) sql__limit_rows(rows, opts.offset, opts.limit);
     }
 
     if (rows_out) *rows_out = rows;

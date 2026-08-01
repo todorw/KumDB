@@ -300,8 +300,7 @@ meant for wrapping bulk operations on a huge one.
 ## SQL
 
 `kdb_exec_sql(db, sql, &rows_out, &affected_out)` runs one statement and
-hits the exact same storage/query engine the NoSQL API uses. Single table
-only: no `JOIN`, no subqueries.
+hits the exact same storage/query engine the NoSQL API uses.
 
 ```sql
 CREATE TABLE t (col TYPE [NOT NULL] [INDEX], ...)
@@ -311,7 +310,7 @@ DROP TABLE t
 
 INSERT INTO t (col, ...) VALUES (val, ...)
 
-SELECT * | item, ... FROM t
+SELECT [DISTINCT] * | item, ... FROM t
     [WHERE cond [AND|OR cond ...]]
     [GROUP BY col]
     [ORDER BY col [ASC|DESC]]
@@ -346,6 +345,13 @@ real SQL uses. `SELECT col FROM t GROUP BY col` with no aggregate at all is
 a valid way to get distinct values. `SUM`/`AVG` always come back as `FLOAT`
 regardless of the source column's type. No `HAVING`, no grouping by more
 than one column, no window functions.
+
+**`SELECT DISTINCT`** dedupes the result by the exact set of selected
+columns (after projection, so `SELECT DISTINCT col` dedupes on `col`
+alone, not the whole row). `id`/`created_at`/`updated_at` aren't part of
+what `*` projects (same as plain `SELECT *`), so `SELECT DISTINCT *` on a
+table with repeated column values still collapses them. Works with `GROUP
+BY` too (dedupes the aggregated output, rarely useful but not rejected).
 
 ```sql
 CREATE TABLE sales (region TEXT, amount FLOAT)

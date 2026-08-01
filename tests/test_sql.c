@@ -280,6 +280,57 @@ static void test_group_by_and_aggregates(void) {
     teardown(db);
 }
 
+static void test_distinct(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (name TEXT, grp INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, grp) VALUES ('a', 1)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, grp) VALUES ('a', 1)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, grp) VALUES ('b', 2)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, grp) VALUES ('a', 1)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, grp) VALUES ('c', 3)"));
+
+    KdbRows *rows = NULL;
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT DISTINCT name FROM t ORDER BY name ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        const char *n0 = NULL, *n1 = NULL, *n2 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &n0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "name", &n1));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[2], "name", &n2));
+        ASSERT_STR(n0, "a");
+        ASSERT_STR(n1, "b");
+        ASSERT_STR(n2, "c");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* SELECT DISTINCT * : id/created_at/updated_at live outside row->fields
+     * (they're KdbRow struct members, not projected columns), so '*' here
+     * dedupes on (name, grp) same as a plain SELECT * always only exposes
+     * the user-defined columns -- 3 unique combos, not 5 rows. */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT DISTINCT * FROM t", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* dedupe on the full projected (name, grp) pair */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT DISTINCT name, grp FROM t", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* DISTINCT + ORDER BY + LIMIT applies limit to the deduped set */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT DISTINCT name FROM t ORDER BY name DESC LIMIT 2", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const char *n0 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &n0));
+        ASSERT_STR(n0, "c");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    teardown(db);
+}
+
 static void test_alter_table(void) {
     KumDB *db;
     setup(&db);
@@ -429,6 +480,7 @@ int main(void) {
     test_where_operators();
     test_or();
     test_group_by_and_aggregates();
+    test_distinct();
     test_alter_table();
     test_nested_values_through_sql();
     test_reserved_columns_skipped();
