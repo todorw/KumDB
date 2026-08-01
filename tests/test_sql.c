@@ -219,6 +219,67 @@ static void test_or(void) {
     teardown(db);
 }
 
+static void test_group_by_and_aggregates(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE sales (region TEXT, amount FLOAT, qty INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount, qty) VALUES ('east', 100.0, 5)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount, qty) VALUES ('east', 200.0, 3)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount, qty) VALUES ('west', 50.0, 10)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount, qty) VALUES ('west', 75.0, 2)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount, qty) VALUES ('north', 500.0, 1)"));
+
+    KdbRows *rows = NULL;
+
+    /* no GROUP BY: one summary row */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT COUNT(*), SUM(amount), AVG(amount), MIN(qty), MAX(qty) FROM sales", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        int64_t cnt = 0; double sum = 0, avg = 0, mn = 0, mx = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "COUNT(*)", &cnt));
+        ASSERT_EQ(cnt, 5);
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "SUM(amount)", &sum));
+        ASSERT(sum > 924.9 && sum < 925.1);
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "AVG(amount)", &avg));
+        ASSERT(avg > 184.9 && avg < 185.1);
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "MIN(qty)", &mn));
+        ASSERT(mn > 0.9 && mn < 1.1);
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "MAX(qty)", &mx));
+        ASSERT(mx > 9.9 && mx < 10.1);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* GROUP BY with COUNT + aliased SUM */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT region, COUNT(*), SUM(amount) AS total FROM sales GROUP BY region ORDER BY total DESC", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        const char *region = NULL;
+        double total = 0;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "region", &region));
+        ASSERT_STR(region, "north"); /* highest total (500), DESC order */
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "total", &total));
+        ASSERT(total > 499.9 && total < 500.1);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* LIMIT on the aggregated/sorted output */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT region, SUM(amount) AS total FROM sales GROUP BY region ORDER BY total DESC LIMIT 1", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* GROUP BY on a plain column with no aggregate = distinct-like */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT region FROM sales GROUP BY region", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* validation errors */
+    ASSERT_ERR(sql(db, "SELECT region, amount FROM sales GROUP BY region")); /* amount not grouped/aggregated */
+    ASSERT_ERR(sql(db, "SELECT * FROM sales GROUP BY region"));              /* '*' with GROUP BY */
+    ASSERT_ERR(sql(db, "SELECT SUM(*) FROM sales"));                        /* only COUNT(*) is valid */
+
+    teardown(db);
+}
+
 static void test_reserved_columns_skipped(void) {
     KumDB *db;
     setup(&db);
@@ -277,6 +338,7 @@ int main(void) {
     test_update_delete();
     test_where_operators();
     test_or();
+    test_group_by_and_aggregates();
     test_reserved_columns_skipped();
     test_drop_table();
     test_syntax_errors();

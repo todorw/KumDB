@@ -17,14 +17,27 @@ extern "C" {
  *   CREATE TABLE t (col TYPE [NOT NULL] [INDEX], ...)
  *   DROP TABLE t
  *   INSERT INTO t (col, ...) VALUES (val, ...)
- *   SELECT * | col, ... FROM t [WHERE cond [AND|OR cond ...]]
- *                              [ORDER BY col [ASC|DESC]]
- *                              [LIMIT n [OFFSET m]]
+ *   SELECT * | item, ... FROM t [WHERE cond [AND|OR cond ...]]
+ *                               [GROUP BY col]
+ *                               [ORDER BY col [ASC|DESC]]
+ *                               [LIMIT n [OFFSET m]]
  *   UPDATE t SET col = val, ... [WHERE cond [AND|OR cond ...]]
  *   DELETE FROM t [WHERE cond [AND|OR cond ...]]
  *
  * AND binds tighter than OR, standard SQL precedence, no parens/nesting:
  * "a=1 AND b=2 OR c=3" means "(a=1 AND b=2) OR (c=3)".
+ *
+ * A SELECT item is a plain column, or an aggregate call --
+ * COUNT(*)/COUNT(col)/SUM(col)/AVG(col)/MIN(col)/MAX(col) -- optionally
+ * renamed with "AS alias" (default alias is e.g. "SUM(amount)"). Without
+ * GROUP BY, one or more aggregate items collapse the whole result into a
+ * single summary row. With GROUP BY col, you get one row per distinct
+ * value of col; every other selected item must be an aggregate call (same
+ * rule SQL uses -- a plain column that isn't the GROUP BY column is
+ * rejected). "SELECT col FROM t GROUP BY col" with no aggregate at all
+ * is a valid way to get distinct values. SUM/AVG always come back as
+ * FLOAT regardless of the source column's type. No HAVING, no grouping
+ * by more than one column, no window functions.
  *
  * Types: INT/INTEGER, FLOAT/REAL/DOUBLE, BOOL/BOOLEAN, TEXT/STRING/VARCHAR,
  * BLOB. VARCHAR(n)/CHAR(n) length specs are accepted and ignored (KumDB

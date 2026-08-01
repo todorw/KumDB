@@ -196,6 +196,7 @@ version                             show CLI/engine version
 kumdb> sql CREATE TABLE users (name TEXT NOT NULL, age INT INDEX)
 kumdb> sql INSERT INTO users (name, age) VALUES ('Alice', 30)
 kumdb> sql SELECT * FROM users WHERE age > 21 ORDER BY age DESC LIMIT 10
+kumdb> sql SELECT region, COUNT(*), SUM(amount) AS total FROM sales GROUP BY region ORDER BY total DESC
 kumdb> sql UPDATE users SET age = 31 WHERE name = 'Alice'
 kumdb> sql DELETE FROM users WHERE age < 18
 kumdb> sql DROP TABLE users
@@ -203,8 +204,12 @@ kumdb> sql DROP TABLE users
 No `JOIN`, no subqueries. `WHERE` supports `=`, `!=`/`<>`, `>`, `>=`, `<`, `<=`,
 `BETWEEN a AND b`, `IN (a, b, c)`, `IS [NOT] NULL`, `LIKE 'pat'` (leading/trailing `%`
 only), and `AND`/`OR` at standard SQL precedence (`AND` binds tighter than `OR`, no
-parens/nesting -- `a=1 AND b=2 OR c=3` means `(a=1 AND b=2) OR (c=3)`). Also callable
-directly from C via `kdb_exec_sql()` in `sql.h` --- both syntaxes hit the exact same
+parens/nesting -- `a=1 AND b=2 OR c=3` means `(a=1 AND b=2) OR (c=3)`). `SELECT` items
+can be `COUNT(*)`/`COUNT(col)`/`SUM(col)`/`AVG(col)`/`MIN(col)`/`MAX(col)`, optionally
+`AS alias`'d, with an optional `GROUP BY col` (one column, no `HAVING`) -- same rule as
+real SQL: a plain column in a `GROUP BY` query has to either be the grouping column or
+be wrapped in an aggregate. Also callable directly from C via `kdb_exec_sql()` in
+`sql.h` --- both syntaxes hit the exact same
 storage and query code, so results are always consistent between them.
 
 ---
