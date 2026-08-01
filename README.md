@@ -2,10 +2,6 @@
 
 *The database that doesn't waste your time.*
 
-<p align="center">
-<img src="logo.png" alt="KumDB Logo" width="200"/>
-</p>
-
 ## What is it
 
 KumDB is a lightweight embedded database engine written in pure C11. No
