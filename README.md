@@ -136,6 +136,17 @@ Multiple filters = AND logic. No OR for now, cry about it.
 
 ---
 
+## **🖥️ KumDB Studio**
+
+A desktop app (Windows/Mac/Linux, Qt) for people who'd rather click than type:
+table browser, editable datasheet grid, and a query console that toggles
+between NoSQL filters and SQL. Not an Access form/report designer clone --
+just the "view and edit my data, run some queries" part, which is most of
+what Access gets used for anyway. See [`app/README.md`](app/README.md) for
+build instructions.
+
+---
+
 ## **🛠️ Tools**
 
 ```bash
