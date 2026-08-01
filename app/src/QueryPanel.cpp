@@ -35,9 +35,11 @@ QueryPanel::QueryPanel(KumDbHandle *db, QWidget *parent)
     tableRow->addWidget(m_tableBox);
     tableRow->addStretch();
     nosqlLayout->addLayout(tableRow);
-    nosqlLayout->addWidget(new QLabel("Filters, one per line (e.g. age__gt=21) -- empty = all rows:", nosqlPage));
+    nosqlLayout->addWidget(new QLabel(
+        "Filters, one per line (e.g. age__gt=21) -- empty = all rows. AND by default; "
+        "prefix a line with OR: to start a new OR'd group:", nosqlPage));
     m_filterEdit = new QPlainTextEdit(nosqlPage);
-    m_filterEdit->setPlaceholderText("age__gt=21\nname__startswith=Al");
+    m_filterEdit->setPlaceholderText("age__gt=21\nname__startswith=Al\nOR:vip=true");
     m_filterEdit->setMaximumHeight(90);
     nosqlLayout->addWidget(m_filterEdit);
     m_inputStack->addWidget(nosqlPage);
@@ -45,7 +47,7 @@ QueryPanel::QueryPanel(KumDbHandle *db, QWidget *parent)
     // SQL page: one statement
     auto *sqlPage = new QWidget(this);
     auto *sqlLayout = new QVBoxLayout(sqlPage);
-    sqlLayout->addWidget(new QLabel("SQL statement (one per run -- no JOIN/subqueries/OR):", sqlPage));
+    sqlLayout->addWidget(new QLabel("SQL statement (one per run -- no JOIN/subqueries):", sqlPage));
     m_sqlEdit = new QPlainTextEdit(sqlPage);
     m_sqlEdit->setPlaceholderText("SELECT * FROM users WHERE age > 21 ORDER BY age DESC LIMIT 20");
     m_sqlEdit->setMaximumHeight(90);

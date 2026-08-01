@@ -336,6 +336,11 @@ static int sql__parse_where(SqlParser *p, char *filters_buf[KDB_SQL_MAX_COND], i
     if (!sql__kw_is(&p->cur, "WHERE")) return 1;
     sql__advance(p);
 
+    /* AND binds tighter than OR, same as standard SQL -- no parens/nesting.
+     * "a=1 AND b=2 OR c=3" means (a=1 AND b=2) OR (c=3). Groups get built
+     * by prefixing the first condition of each OR'd group with "OR:",
+     * the same convention kdb_find()/kdb_update()/kdb_delete() understand. */
+    int start_new_group = 0;
     for (;;) {
         if (n >= KDB_SQL_MAX_COND) {
             sql__err("too many WHERE conditions (max %d)", KDB_SQL_MAX_COND);
@@ -344,12 +349,27 @@ static int sql__parse_where(SqlParser *p, char *filters_buf[KDB_SQL_MAX_COND], i
         }
         char *f = sql__parse_condition(p);
         if (!f) { sql__free_filters(filters_buf, n); return 0; }
+
+        if (start_new_group) {
+            size_t need = strlen(f) + 4;
+            char *prefixed = malloc(need);
+            if (!prefixed) {
+                kdb_err_oom("OR-prefixed filter string");
+                free(f);
+                sql__free_filters(filters_buf, n);
+                return 0;
+            }
+            snprintf(prefixed, need, "OR:%s", f);
+            free(f);
+            f = prefixed;
+            start_new_group = 0;
+        }
         filters_buf[n++] = f;
 
         if (sql__kw_is(&p->cur, "OR")) {
-            sql__err("OR isn't supported -- KumDB's query engine is AND-only, same as the NoSQL filter API");
-            sql__free_filters(filters_buf, n);
-            return 0;
+            sql__advance(p);
+            start_new_group = 1;
+            continue;
         }
         if (sql__kw_is(&p->cur, "AND")) { sql__advance(p); continue; }
         break;

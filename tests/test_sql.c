@@ -190,6 +190,35 @@ static void test_where_operators(void) {
     teardown(db);
 }
 
+static void test_or(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (n INT, s TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (n, s) VALUES (0, 'zero')"));
+    ASSERT_OK(sql(db, "INSERT INTO t (n, s) VALUES (1, 'one')"));
+    ASSERT_OK(sql(db, "INSERT INTO t (n, s) VALUES (5, 'five')"));
+    ASSERT_OK(sql(db, "INSERT INTO t (n, s) VALUES (10, 'ten')"));
+
+    KdbRows *rows = NULL;
+
+    /* n < 1 OR n > 5 -> 0 and 10 */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE n < 1 OR n > 5", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* AND binds tighter than OR: (n = 5 AND s = 'five') OR n = 0 -> two rows */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE n = 5 AND s = 'five' OR n = 0", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* same precedence check but the AND-condition shouldn't match on its own terms */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE n = 5 AND s = 'wrong' OR n = 0", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    teardown(db);
+}
+
 static void test_reserved_columns_skipped(void) {
     KumDB *db;
     setup(&db);
@@ -225,7 +254,6 @@ static void test_syntax_errors(void) {
     ASSERT_OK(sql(db, "INSERT INTO t (n) VALUES (1)"));
 
     ASSERT_ERR(sql(db, "SELEKT * FROM t"));
-    ASSERT_ERR(sql(db, "SELECT * FROM t WHERE n > 0 OR n < -5"));
     ASSERT_ERR(sql(db, "SELECT * FROM t WHERE n = NULL"));
     ASSERT_ERR(sql(db, "SELECT * FROM t WHERE n LIKE '%mid%dle%'"));
     ASSERT_ERR(sql(db, "INSERT INTO t VALUES (1)"));                 /* no column list */
@@ -248,6 +276,7 @@ int main(void) {
     test_limit_offset();
     test_update_delete();
     test_where_operators();
+    test_or();
     test_reserved_columns_skipped();
     test_drop_table();
     test_syntax_errors();

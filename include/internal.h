@@ -19,6 +19,7 @@
 #define KDB_MAX_STRING_LEN     4096
 #define KDB_MAX_RECORDS        (1 << 24)   
 #define KDB_MAX_FILTER_KEYS    32
+#define KDB_MAX_FILTER_GROUPS  4
 #define KDB_MAX_BATCH_SIZE     65536
 #define KDB_PAGE_SIZE          4096
 #define KDB_INDEX_BUCKETS      1024
@@ -126,6 +127,14 @@ typedef struct {
 typedef struct {
     KdbFilter filters[KDB_MAX_FILTER_KEYS];
     uint32_t  count;
+} KdbFilterGroup;
+
+/* Groups are OR'd together; filters within a group are AND'd (same
+ * precedence as SQL: AND binds tighter than OR, no parens/nesting). A
+ * fresh query starts with one empty group, same as always. */
+typedef struct {
+    KdbFilterGroup groups[KDB_MAX_FILTER_GROUPS];
+    uint32_t       group_count;
 } KdbQuery;
 
 

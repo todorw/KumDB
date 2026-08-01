@@ -11,6 +11,23 @@
 void kdb_query_init(KdbQuery *q) {
     if (!q) return;
     memset(q, 0, sizeof(*q));
+    q->group_count = 1; /* one empty AND-group; OR starts additional ones */
+}
+
+KdbStatus kdb_query_start_or_group(KdbQuery *q) {
+    if (!q) {
+        kdb_err_null_arg("q", "kdb_query_start_or_group");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (q->group_count >= KDB_MAX_FILTER_GROUPS) {
+        kdb_set_error(KDB_ERR_FULL,
+            "Query already has %d OR'd groups. That's the limit. "
+            "Simplify your query or split it up.",
+            KDB_MAX_FILTER_GROUPS);
+        return KDB_ERR_FULL;
+    }
+    q->group_count++;
+    return KDB_OK;
 }
 
 KdbStatus kdb_query_add_filter(KdbQuery   *q,
@@ -21,21 +38,22 @@ KdbStatus kdb_query_add_filter(KdbQuery   *q,
         kdb_err_null_arg("q/key", "kdb_query_add_filter");
         return KDB_ERR_BAD_ARG;
     }
-    if (q->count >= KDB_MAX_FILTER_KEYS) {
+    KdbFilterGroup *grp = &q->groups[q->group_count - 1];
+    if (grp->count >= KDB_MAX_FILTER_KEYS) {
         kdb_set_error(KDB_ERR_FULL,
-            "Query already has %d filters. That's the limit. "
+            "Query already has %d filters in this AND-group. That's the limit. "
             "Simplify your query or split it up.",
             KDB_MAX_FILTER_KEYS);
         return KDB_ERR_FULL;
     }
 
-    KdbFilter *f = &q->filters[q->count];
+    KdbFilter *f = &grp->filters[grp->count];
     memset(f, 0, sizeof(*f));
 
     KdbStatus st = kdb_parse_filter_key(key, f->col_name, &f->op);
     if (st != KDB_OK) return st;
 
-    
+
     if (raw_value) {
         KdbType hint = kdb_type_infer(raw_value);
         st = kdb_value_from_string(raw_value, hint, &f->value);
@@ -44,7 +62,7 @@ KdbStatus kdb_query_add_filter(KdbQuery   *q,
         kdb_value_from_null(&f->value);
     }
 
-    
+
     if (raw_value2 && f->op == KDB_OP_BETWEEN) {
         KdbType hint2 = kdb_type_infer(raw_value2);
         st = kdb_value_from_string(raw_value2, hint2, &f->value2);
@@ -56,7 +74,7 @@ KdbStatus kdb_query_add_filter(KdbQuery   *q,
         kdb_value_from_null(&f->value2);
     }
 
-    q->count++;
+    grp->count++;
     return KDB_OK;
 }
 
@@ -69,12 +87,13 @@ KdbStatus kdb_query_add_filter_value(KdbQuery       *q,
         kdb_err_null_arg("q/col_name", "kdb_query_add_filter_value");
         return KDB_ERR_BAD_ARG;
     }
-    if (q->count >= KDB_MAX_FILTER_KEYS) {
-        kdb_set_error(KDB_ERR_FULL, "Query filter limit reached (%d).", KDB_MAX_FILTER_KEYS);
+    KdbFilterGroup *grp = &q->groups[q->group_count - 1];
+    if (grp->count >= KDB_MAX_FILTER_KEYS) {
+        kdb_set_error(KDB_ERR_FULL, "Query filter limit reached (%d) in this AND-group.", KDB_MAX_FILTER_KEYS);
         return KDB_ERR_FULL;
     }
 
-    KdbFilter *f = &q->filters[q->count];
+    KdbFilter *f = &grp->filters[grp->count];
     memset(f, 0, sizeof(*f));
     KDB_STRLCPY(f->col_name, col_name, KDB_MAX_NAME_LEN);
     f->op = op;
@@ -93,21 +112,25 @@ KdbStatus kdb_query_add_filter_value(KdbQuery       *q,
         kdb_value_from_null(&f->value2);
     }
 
-    q->count++;
+    grp->count++;
     return KDB_OK;
 }
 
 void kdb_query_free(KdbQuery *q) {
     if (!q) return;
-    for (uint32_t i = 0; i < q->count; i++) {
-        kdb_value_free(&q->filters[i].value);
-        kdb_value_free(&q->filters[i].value2);
+    for (uint32_t g = 0; g < q->group_count; g++) {
+        KdbFilterGroup *grp = &q->groups[g];
+        for (uint32_t i = 0; i < grp->count; i++) {
+            kdb_value_free(&grp->filters[i].value);
+            kdb_value_free(&grp->filters[i].value2);
+        }
+        grp->count = 0;
     }
-    q->count = 0;
+    q->group_count = 0;
 }
 
 int kdb_query_is_empty(const KdbQuery *q) {
-    return !q || q->count == 0;
+    return !q || q->group_count == 0 || (q->group_count == 1 && q->groups[0].count == 0);
 }
 
 
@@ -127,14 +150,9 @@ static int kdb__pseudo_column_value(const KdbRecord *r, const char *col_name, Kd
     return 0;
 }
 
-int kdb_query_matches(const KdbQuery *q, const KdbRecord *r) {
-    if (!q || !r) return 0;
-    if (r->deleted) return 0;
-    if (q->count == 0) return 1;
-
-    for (uint32_t i = 0; i < q->count; i++) {
-        const KdbFilter *f = &q->filters[i];
-
+static int kdb__group_matches(const KdbFilterGroup *grp, const KdbRecord *r) {
+    for (uint32_t i = 0; i < grp->count; i++) {
+        const KdbFilter *f = &grp->filters[i];
 
         KdbValue pseudo_val;
         const KdbValue *val;
@@ -143,8 +161,7 @@ int kdb_query_matches(const KdbQuery *q, const KdbRecord *r) {
         } else {
             const KdbRecordField *field = kdb_record_get_field(r, f->col_name);
             if (!field) {
-                if (f->op == KDB_OP_IS_NULL)     { continue; }
-                if (f->op == KDB_OP_IS_NOT_NULL) { return 0; }
+                if (f->op == KDB_OP_IS_NULL) { continue; }
                 return 0;
             }
             val = &field->value;
@@ -154,6 +171,17 @@ int kdb_query_matches(const KdbQuery *q, const KdbRecord *r) {
             return 0;
     }
     return 1;
+}
+
+int kdb_query_matches(const KdbQuery *q, const KdbRecord *r) {
+    if (!q || !r) return 0;
+    if (r->deleted) return 0;
+    if (q->group_count == 0) return 1;
+
+    for (uint32_t g = 0; g < q->group_count; g++) {
+        if (kdb__group_matches(&q->groups[g], r)) return 1;
+    }
+    return 0;
 }
 
 
@@ -346,8 +374,9 @@ KdbStatus kdb_query_execute(KdbTable       *tbl,
 
     
 
-    if (q->count == 1 && q->filters[0].op == KDB_OP_EQ && tbl->index_count > 0) {
-        const KdbFilter *f   = &q->filters[0];
+    if (q->group_count == 1 && q->groups[0].count == 1 &&
+        q->groups[0].filters[0].op == KDB_OP_EQ && tbl->index_count > 0) {
+        const KdbFilter *f   = &q->groups[0].filters[0];
         KdbIndex        *idx = kdb_index_find(tbl->indices, tbl->index_count, f->col_name);
         if (idx) {
             uint64_t offsets[KDB_INDEX_BUCKETS];
@@ -420,17 +449,21 @@ KdbStatus kdb_query_count(KdbTable       *tbl,
 
 void kdb_query_print(const KdbQuery *q, FILE *fp) {
     if (!q || !fp) return;
-    fprintf(fp, "Query (%u filters):\n", q->count);
+    fprintf(fp, "Query (%u OR'd group(s)):\n", q->group_count);
     char vbuf[256];
-    for (uint32_t i = 0; i < q->count; i++) {
-        const KdbFilter *f = &q->filters[i];
-        kdb_value_to_str(&f->value, vbuf, sizeof(vbuf));
-        fprintf(fp, "  [%u] %s __%s %s", i, f->col_name, kdb_op_name(f->op), vbuf);
-        if (f->op == KDB_OP_BETWEEN) {
-            char vbuf2[256];
-            kdb_value_to_str(&f->value2, vbuf2, sizeof(vbuf2));
-            fprintf(fp, " AND %s", vbuf2);
+    for (uint32_t g = 0; g < q->group_count; g++) {
+        const KdbFilterGroup *grp = &q->groups[g];
+        if (g > 0) fprintf(fp, "  OR\n");
+        for (uint32_t i = 0; i < grp->count; i++) {
+            const KdbFilter *f = &grp->filters[i];
+            kdb_value_to_str(&f->value, vbuf, sizeof(vbuf));
+            fprintf(fp, "  [%u.%u] %s __%s %s", g, i, f->col_name, kdb_op_name(f->op), vbuf);
+            if (f->op == KDB_OP_BETWEEN) {
+                char vbuf2[256];
+                kdb_value_to_str(&f->value2, vbuf2, sizeof(vbuf2));
+                fprintf(fp, " AND %s", vbuf2);
+            }
+            fprintf(fp, "\n");
         }
-        fprintf(fp, "\n");
     }
 }

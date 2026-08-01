@@ -8,6 +8,11 @@
 
 void kdb_query_init(KdbQuery *q);
 
+/* Starts a new AND-group, OR'd against whatever groups came before it.
+ * Filters added after this call land in the new group until the next
+ * call (if any). Same precedence as SQL: AND binds tighter than OR. */
+KdbStatus kdb_query_start_or_group(KdbQuery *q);
+
 KdbStatus kdb_query_add_filter(KdbQuery   *q,
                                const char *key,
                                const char *raw_value,

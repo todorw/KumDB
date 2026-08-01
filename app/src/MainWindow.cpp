@@ -309,6 +309,6 @@ void MainWindow::showAbout() {
         QString("<b>KumDB Studio</b><br>"
                 "A desktop front end for KumDB (engine v%1) -- browse and edit tables, "
                 "run NoSQL filters or SQL, all against the same embedded database file.<br><br>"
-                "No JOINs, no subqueries, no OR -- same limits as the engine itself.")
+                "No JOINs, no subqueries -- same limits as the engine itself.")
             .arg(QString::fromUtf8(kdb_version())));
 }

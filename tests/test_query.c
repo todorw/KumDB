@@ -151,6 +151,44 @@ static void test_multi_filter_and(void) {
     kdb_rows_free(rows);
 }
 
+static void test_or_filter(void) {
+    /* name=alpha(score10) OR score__gt=45(epsilon,50) -> 2 rows */
+    const char *f[] = { "name=alpha", "OR:score__gt=45", NULL };
+    KdbRows *rows = kdb_find(db, TABLE, f);
+    ASSERT(rows != NULL);
+    ASSERT_EQ(rows->count, 2u);
+    kdb_rows_free(rows);
+
+    /* AND binds tighter than OR:
+       (active=true AND score__lt=20 -> alpha) OR (name=delta -> delta) = 2 rows */
+    const char *f2[] = { "active=true", "score__lt=20", "OR:name=delta", NULL };
+    rows = kdb_find(db, TABLE, f2);
+    ASSERT(rows != NULL);
+    ASSERT_EQ(rows->count, 2u);
+    kdb_rows_free(rows);
+
+    /* the AND-group doesn't match on its own, only the OR fallback should */
+    const char *f3[] = { "active=true", "score__lt=20", "OR:name=beta", NULL };
+    rows = kdb_find(db, TABLE, f3);
+    ASSERT(rows != NULL);
+    ASSERT_EQ(rows->count, 2u); /* alpha (matches first group too) + beta */
+    kdb_rows_free(rows);
+}
+
+static void test_in_filter(void) {
+    const char *f[] = { "score__in=10,30,50", NULL };
+    KdbRows *rows = kdb_find(db, TABLE, f);
+    ASSERT(rows != NULL);
+    ASSERT_EQ(rows->count, 3u);
+    kdb_rows_free(rows);
+
+    const char *f2[] = { "name__in=beta,delta", NULL };
+    rows = kdb_find(db, TABLE, f2);
+    ASSERT(rows != NULL);
+    ASSERT_EQ(rows->count, 2u);
+    kdb_rows_free(rows);
+}
+
 static void test_find_all(void) {
     KdbRows *rows = kdb_find(db, TABLE, NULL);
     ASSERT(rows != NULL);
@@ -188,6 +226,8 @@ int main(void) {
     test_startswith();
     test_endswith();
     test_multi_filter_and();
+    test_or_filter();
+    test_in_filter();
     test_find_all();
     test_no_results();
     test_float_filter();

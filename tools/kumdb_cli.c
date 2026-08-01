@@ -35,11 +35,12 @@ static void print_help(void) {
     printf("  import <table> <file>              Bulk-insert k=v lines from a file\n");
     printf("  drop <table>                       Drop a table\n");
     printf("  compact <table>                    Compact a table\n");
+    printf("  (filters/where AND by default; prefix a filter with OR: to start a new OR'd group)\n");
     printf("\nSQL:\n");
     printf("  sql <statement>                    Run one SQL statement against the open db\n");
     printf("                                      e.g. sql SELECT * FROM users WHERE age > 21\n");
     printf("                                      Same engine as the commands above -- see README\n");
-    printf("                                      for what's supported (no JOIN/subqueries/OR).\n");
+    printf("                                      for what's supported (no JOIN/subqueries).\n");
     printf("\nOther:\n");
     printf("  version                            Show CLI/engine version\n");
     printf("  help                               Show this help\n");

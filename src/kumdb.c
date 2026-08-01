@@ -137,7 +137,16 @@ static KdbStatus kdb__build_query(const char **filters, KdbQuery *q) {
     for (int i = 0; filters[i] != NULL; i++) {
         const char *filter = filters[i];
 
-        
+        /* "OR:" prefix starts a new AND-group, OR'd against what came
+         * before it -- e.g. {"age__lt=18", "OR:age__gt=65", NULL} means
+         * age < 18 OR age > 65. The rest of the string after "OR:" is a
+         * normal filter and falls through to the parsing below. */
+        if (strncmp(filter, "OR:", 3) == 0) {
+            KdbStatus st = kdb_query_start_or_group(q);
+            if (st != KDB_OK) { kdb_query_free(q); return st; }
+            filter += 3;
+        }
+
         const char *eq = strchr(filter, '=');
         if (!eq) {
             

@@ -10,18 +10,21 @@ extern "C" {
 /*
  * A thin SQL front end over the exact same engine kdb_add/kdb_find/etc.
  * use underneath -- same storage, same query semantics, just a different
- * syntax on top. Single table only: no JOIN, no subqueries, no OR (the
- * engine itself is AND-only). One statement per call.
+ * syntax on top. Single table only: no JOIN, no subqueries. One statement
+ * per call.
  *
  * Supported:
  *   CREATE TABLE t (col TYPE [NOT NULL] [INDEX], ...)
  *   DROP TABLE t
  *   INSERT INTO t (col, ...) VALUES (val, ...)
- *   SELECT * | col, ... FROM t [WHERE cond [AND cond ...]]
+ *   SELECT * | col, ... FROM t [WHERE cond [AND|OR cond ...]]
  *                              [ORDER BY col [ASC|DESC]]
  *                              [LIMIT n [OFFSET m]]
- *   UPDATE t SET col = val, ... [WHERE cond [AND cond ...]]
- *   DELETE FROM t [WHERE cond [AND cond ...]]
+ *   UPDATE t SET col = val, ... [WHERE cond [AND|OR cond ...]]
+ *   DELETE FROM t [WHERE cond [AND|OR cond ...]]
+ *
+ * AND binds tighter than OR, standard SQL precedence, no parens/nesting:
+ * "a=1 AND b=2 OR c=3" means "(a=1 AND b=2) OR (c=3)".
  *
  * Types: INT/INTEGER, FLOAT/REAL/DOUBLE, BOOL/BOOLEAN, TEXT/STRING/VARCHAR,
  * BLOB. VARCHAR(n)/CHAR(n) length specs are accepted and ignored (KumDB

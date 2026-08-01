@@ -133,7 +133,17 @@ kdb_drop_table(db, "users");
 | `__isnull` | `"notes__isnull"` | field is null |
 | `__isnotnull` | `"notes__isnotnull"` | field is not null |
 
-Multiple filters = AND logic. No OR for now, cry about it.
+Multiple filters = AND logic. For OR, prefix a filter with `"OR:"` to start a new
+AND-group that gets OR'd against everything before it -- same precedence as SQL
+(AND binds tighter than OR, no parens/nesting):
+
+```c
+// age < 18 OR age > 65
+const char *filters[] = { "age__lt=18", "OR:age__gt=65", NULL };
+
+// (active=true AND score__gt=90) OR (vip=true)
+const char *filters2[] = { "active=true", "score__gt=90", "OR:vip=true", NULL };
+```
 
 ---
 
@@ -190,11 +200,12 @@ kumdb> sql UPDATE users SET age = 31 WHERE name = 'Alice'
 kumdb> sql DELETE FROM users WHERE age < 18
 kumdb> sql DROP TABLE users
 ```
-No `JOIN`, no subqueries, no `OR` (the engine is AND-only, same as the filter operators
-above). `WHERE` supports `=`, `!=`/`<>`, `>`, `>=`, `<`, `<=`, `BETWEEN a AND b`,
-`IN (a, b, c)`, `IS [NOT] NULL`, and `LIKE 'pat'` (leading/trailing `%` only). Also callable directly
-from C via `kdb_exec_sql()` in `sql.h` --- both syntaxes hit the exact same storage and
-query code, so results are always consistent between them.
+No `JOIN`, no subqueries. `WHERE` supports `=`, `!=`/`<>`, `>`, `>=`, `<`, `<=`,
+`BETWEEN a AND b`, `IN (a, b, c)`, `IS [NOT] NULL`, `LIKE 'pat'` (leading/trailing `%`
+only), and `AND`/`OR` at standard SQL precedence (`AND` binds tighter than `OR`, no
+parens/nesting -- `a=1 AND b=2 OR c=3` means `(a=1 AND b=2) OR (c=3)`). Also callable
+directly from C via `kdb_exec_sql()` in `sql.h` --- both syntaxes hit the exact same
+storage and query code, so results are always consistent between them.
 
 ---
 
