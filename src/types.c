@@ -351,9 +351,36 @@ int kdb_value_matches(const KdbValue *field,
             return (lo != INT32_MIN && hi != INT32_MIN && lo >= 0 && hi <= 0);
         }
 
-        case KDB_OP_IN:
-            
+        case KDB_OP_IN: {
+            if (!fv || fv->type != KDB_TYPE_STRING || !fv->v.as_string.data) return 0;
+
+            const char *p = fv->v.as_string.data;
+            while (*p) {
+                const char *comma = strchr(p, ',');
+                size_t len = comma ? (size_t)(comma - p) : strlen(p);
+
+                while (len > 0 && isspace((unsigned char)*p)) { p++; len--; }
+                while (len > 0 && isspace((unsigned char)p[len - 1])) len--;
+
+                if (len > 0) {
+                    char token[256];
+                    size_t tlen = len < sizeof(token) - 1 ? len : sizeof(token) - 1;
+                    memcpy(token, p, tlen);
+                    token[tlen] = '\0';
+
+                    KdbValue tv;
+                    if (kdb_value_from_string(token, kdb_type_infer(token), &tv) == KDB_OK) {
+                        int cmp = kdb_value_compare(field, &tv);
+                        kdb_value_free(&tv);
+                        if (cmp == 0) return 1;
+                    }
+                }
+
+                if (!comma) break;
+                p = comma + 1;
+            }
             return 0;
+        }
 
         default:
             return 0;

@@ -126,6 +126,7 @@ kdb_drop_table(db, "users");
 | `__lt` | `"age__lt=65"` | less than |
 | `__lte` | `"age__lte=65"` | less than or equal |
 | `__between` | `"age__between=18,30"` | inclusive range |
+| `__in` | `"age__in=18,21,30"` | matches any value in the list |
 | `__contains` | `"name__contains=ali"` | substring match |
 | `__startswith` | `"name__startswith=al"` | prefix match |
 | `__endswith` | `"name__endswith=ice"` | suffix match |
@@ -191,7 +192,7 @@ kumdb> sql DROP TABLE users
 ```
 No `JOIN`, no subqueries, no `OR` (the engine is AND-only, same as the filter operators
 above). `WHERE` supports `=`, `!=`/`<>`, `>`, `>=`, `<`, `<=`, `BETWEEN a AND b`,
-`IS [NOT] NULL`, and `LIKE 'pat'` (leading/trailing `%` only). Also callable directly
+`IN (a, b, c)`, `IS [NOT] NULL`, and `LIKE 'pat'` (leading/trailing `%` only). Also callable directly
 from C via `kdb_exec_sql()` in `sql.h` --- both syntaxes hit the exact same storage and
 query code, so results are always consistent between them.
 

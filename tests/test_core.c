@@ -92,6 +92,19 @@ static void test_find_with_filter(void) {
     ASSERT_EQ(rows->count, 5u);
     kdb_rows_free(rows);
 
+    /* __in used to be a stub that always matched nothing */
+    const char *in_filter[] = { "score__in=0,30,90", NULL };
+    rows = kdb_find(db, TABLE, in_filter);
+    ASSERT(rows != NULL);
+    ASSERT_EQ(rows->count, 3u);
+    kdb_rows_free(rows);
+
+    const char *in_none[] = { "score__in=5,15,25", NULL };
+    rows = kdb_find(db, TABLE, in_none);
+    ASSERT(rows != NULL);
+    ASSERT_EQ(rows->count, 0u);
+    kdb_rows_free(rows);
+
     teardown(db);
 }
 

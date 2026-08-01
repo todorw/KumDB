@@ -174,6 +174,15 @@ static void test_where_operators(void) {
     ASSERT(rows && rows->count == 2u);
     if (rows) { kdb_rows_free(rows); rows = NULL; }
 
+    /* IN used to have no SQL syntax at all, and the underlying operator was a broken stub */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE n IN (0, 5)", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE s IN ('one', 'nope')", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
     ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE id = 1", &rows, NULL));
     ASSERT(rows && rows->count == 1u);
     if (rows) { kdb_rows_free(rows); rows = NULL; }

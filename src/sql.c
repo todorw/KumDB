@@ -226,6 +226,47 @@ static char *sql__parse_condition(SqlParser *p) {
         return buf;
     }
 
+    if (sql__kw_is(&p->cur, "IN")) {
+        sql__advance(p);
+        if (p->cur.type != SQLTOK_LPAREN) { sql__err("expected '(' after IN on '%s'", col_buf); return NULL; }
+        sql__advance(p);
+
+        char list[KDB_SQL_TOK_MAX];
+        size_t list_len = 0;
+        list[0] = '\0';
+        int n = 0;
+
+        for (;;) {
+            char *val_text = sql__value_text(&p->cur);
+            if (!val_text) { sql__err("expected a value in the IN list for '%s'", col_buf); return NULL; }
+            sql__advance(p);
+
+            size_t vlen = strlen(val_text);
+            size_t need = list_len + (n > 0 ? 1 : 0) + vlen;
+            if (need >= sizeof(list)) {
+                sql__err("IN list too long for '%s'", col_buf);
+                free(val_text);
+                return NULL;
+            }
+            if (n > 0) list[list_len++] = ',';
+            memcpy(list + list_len, val_text, vlen);
+            list_len += vlen;
+            list[list_len] = '\0';
+            free(val_text);
+            n++;
+
+            if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+            break;
+        }
+        if (p->cur.type != SQLTOK_RPAREN) { sql__err("expected ')' closing the IN list for '%s'", col_buf); return NULL; }
+        sql__advance(p);
+
+        size_t need = strlen(col_buf) + list_len + 8;
+        char *buf = malloc(need);
+        if (buf) snprintf(buf, need, "%s__in=%s", col_buf, list);
+        return buf;
+    }
+
     if (sql__kw_is(&p->cur, "LIKE")) {
         sql__advance(p);
         if (p->cur.type != SQLTOK_STRING) { sql__err("expected a string pattern after LIKE on '%s'", col_buf); return NULL; }

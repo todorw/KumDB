@@ -31,7 +31,7 @@ extern "C" {
  * "id INTEGER PRIMARY KEY" doesn't blow up on you.
  *
  * WHERE conditions: col = val, != / <>, >, >=, <, <=, BETWEEN a AND b,
- * IS NULL, IS NOT NULL, LIKE 'pat' (pat may have a leading and/or
+ * IN (a, b, c), IS NULL, IS NOT NULL, LIKE 'pat' (pat may have a leading and/or
  * trailing '%' for startswith/endswith/contains -- no '_' wildcard, no
  * mid-string '%').
  *
