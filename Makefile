@@ -45,7 +45,8 @@ TESTS = \
 	$(BIN_DIR)/test_core    \
 	$(BIN_DIR)/test_query   \
 	$(BIN_DIR)/test_types   \
-	$(BIN_DIR)/test_storage
+	$(BIN_DIR)/test_storage \
+	$(BIN_DIR)/test_sql
 
 .PHONY: all release debug lib tools tests clean distclean help
 
@@ -91,6 +92,9 @@ $(BIN_DIR)/test_types: $(TEST_DIR)/test_types.c $(STATIC_LIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -I$(INC_DIR) $< $(STATIC_LIB) $(LDLIBS) -o $@
 
 $(BIN_DIR)/test_storage: $(TEST_DIR)/test_storage.c $(STATIC_LIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -I$(INC_DIR) $< $(STATIC_LIB) $(LDLIBS) -o $@
+
+$(BIN_DIR)/test_sql: $(TEST_DIR)/test_sql.c $(STATIC_LIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -I$(INC_DIR) $< $(STATIC_LIB) $(LDLIBS) -o $@
 
 .PHONY: check
