@@ -63,6 +63,16 @@ KdbRow  *kdb_find_one  (KumDB *db, const char *table_name, const char **filters)
 KdbRow  *kdb_find_by_id(KumDB *db, const char *table_name, uint64_t id);
 int64_t  kdb_count     (KumDB *db, const char *table_name, const char **filters);
 
+typedef struct {
+    const char *order_by;   /* column name ("id"/"created_at"/"updated_at" work too), or NULL */
+    int         ascending;  /* 1 = ASC, 0 = DESC; ignored if order_by is NULL */
+    size_t      limit;      /* 0 = no limit */
+    size_t      offset;     /* rows to skip, applied before limit */
+} KdbFindOpts;
+
+KdbRows *kdb_find_ex(KumDB *db, const char *table_name, const char **filters,
+                     const KdbFindOpts *opts);
+
 KdbStatus kdb_update(KumDB          *db,
                      const char     *table_name,
                      const char    **where_filters,
@@ -77,6 +87,21 @@ KdbStatus kdb_delete(KumDB      *db,
 KdbStatus kdb_drop_table  (KumDB *db, const char *table_name);
 KdbStatus kdb_compact     (KumDB *db, const char *table_name);
 int       kdb_table_exists(KumDB *db, const char *table_name);
+
+typedef struct {
+    const char  *name;
+    KdbFieldType type;
+    int          nullable;
+    int          indexed;
+} KdbColumnDef;
+
+/* Create a table with an explicit schema up front (indexed columns only take
+ * effect when declared here). Optional: kdb_add() on a table that doesn't
+ * exist yet will still create one and infer its schema from the first row,
+ * same as always -- this is for when you want to nail the schema down,
+ * including indexes, before any data goes in. */
+KdbStatus kdb_create_table(KumDB *db, const char *table_name,
+                           const KdbColumnDef *columns, uint32_t column_count);
 
 /* names_out entries point into thread-local storage owned by KumDB and are
  * valid until the next call to kdb_list_tables() on this thread. Copy them

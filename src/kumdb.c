@@ -427,6 +427,32 @@ KdbStatus kdb_batch_import(KumDB             *db,
     return st;
 }
 
+static KdbRows *kdb__result_to_rows(KdbResult *res) {
+    KdbRows *rows = (KdbRows *)calloc(1, sizeof(KdbRows));
+    if (!rows) { kdb_result_free(res); kdb_err_oom("KdbRows"); return NULL; }
+
+    rows->count = res->count;
+    if (res->count > 0) {
+        rows->rows = (KdbRow *)calloc(res->count, sizeof(KdbRow));
+        if (!rows->rows) {
+            kdb_result_free(res);
+            free(rows);
+            kdb_err_oom("KdbRow array");
+            return NULL;
+        }
+        for (size_t i = 0; i < res->count; i++) {
+            KdbRow *row = kdb__record_to_row(&res->rows[i]);
+            if (row) {
+                memcpy(&rows->rows[i], row, sizeof(KdbRow));
+                free(row);
+            }
+        }
+    }
+
+    kdb_result_free(res);
+    return rows;
+}
+
 KdbRows *kdb_find(KumDB *db, const char *table_name, const char **filters) {
     if (!db || !table_name) {
         kdb_err_null_arg("db/table_name", "kdb_find");
@@ -444,30 +470,34 @@ KdbRows *kdb_find(KumDB *db, const char *table_name, const char **filters) {
     kdb_query_free(&q);
     if (st != KDB_OK) return NULL;
 
-    
-    KdbRows *rows = (KdbRows *)calloc(1, sizeof(KdbRows));
-    if (!rows) { kdb_result_free(&res); kdb_err_oom("KdbRows"); return NULL; }
+    return kdb__result_to_rows(&res);
+}
 
-    rows->count = res.count;
-    if (res.count > 0) {
-        rows->rows = (KdbRow *)calloc(res.count, sizeof(KdbRow));
-        if (!rows->rows) {
-            kdb_result_free(&res);
-            free(rows);
-            kdb_err_oom("KdbRow array");
-            return NULL;
-        }
-        for (size_t i = 0; i < res.count; i++) {
-            KdbRow *row = kdb__record_to_row(&res.rows[i]);
-            if (row) {
-                memcpy(&rows->rows[i], row, sizeof(KdbRow));
-                free(row);
-            }
-        }
+KdbRows *kdb_find_ex(KumDB *db, const char *table_name, const char **filters,
+                     const KdbFindOpts *opts) {
+    if (!db || !table_name) {
+        kdb_err_null_arg("db/table_name", "kdb_find_ex");
+        return NULL;
     }
 
-    kdb_result_free(&res);
-    return rows;
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return NULL;
+
+    KdbQuery q;
+    if (kdb__build_query(filters, &q) != KDB_OK) return NULL;
+
+    KdbResult res;
+    KdbStatus st = kdb_query_execute(tbl, &q, &res);
+    kdb_query_free(&q);
+    if (st != KDB_OK) return NULL;
+
+    if (opts) {
+        if (opts->order_by) kdb_result_sort(&res, opts->order_by, opts->ascending);
+        if (opts->offset > 0) kdb_result_offset(&res, opts->offset);
+        if (opts->limit > 0) kdb_result_limit(&res, opts->limit);
+    }
+
+    return kdb__result_to_rows(&res);
 }
 
 KdbRow *kdb_find_one(KumDB *db, const char *table_name, const char **filters) {
@@ -578,13 +608,48 @@ KdbStatus kdb_delete(KumDB       *db,
 }
 
 
+KdbStatus kdb_create_table(KumDB *db, const char *table_name,
+                           const KdbColumnDef *columns, uint32_t column_count) {
+    if (!db || !table_name) {
+        kdb_err_null_arg("db/table_name", "kdb_create_table");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    if (column_count > KDB_MAX_COLUMNS) {
+        kdb_err_bad_arg("column_count", "exceeds KDB_MAX_COLUMNS");
+        return KDB_ERR_FULL;
+    }
+    if (column_count > 0 && !columns) {
+        kdb_err_null_arg("columns", "kdb_create_table");
+        return KDB_ERR_BAD_ARG;
+    }
+
+    KdbColumn cols[KDB_MAX_COLUMNS];
+    memset(cols, 0, sizeof(cols));
+    for (uint32_t i = 0; i < column_count; i++) {
+        if (!columns[i].name) {
+            kdb_err_bad_arg("columns[i].name", "must not be NULL");
+            return KDB_ERR_BAD_ARG;
+        }
+        KDB_STRLCPY(cols[i].name, columns[i].name, KDB_MAX_NAME_LEN);
+        cols[i].type     = (KdbType)columns[i].type;
+        cols[i].nullable = columns[i].nullable ? 1 : 0;
+        cols[i].indexed  = columns[i].indexed  ? 1 : 0;
+    }
+
+    return kdb_table_create(db->data_dir, table_name, cols, column_count);
+}
+
 KdbStatus kdb_drop_table(KumDB *db, const char *table_name) {
     if (!db || !table_name) {
         kdb_err_null_arg("db/table_name", "kdb_drop_table");
         return KDB_ERR_BAD_ARG;
     }
 
-    
+
     for (uint32_t i = 0; i < db->table_count; i++) {
         if (db->tables[i] && strcmp(db->tables[i]->name, table_name) == 0) {
             kdb_table_close(db->tables[i]);
