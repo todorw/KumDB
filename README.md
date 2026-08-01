@@ -10,9 +10,9 @@
 ## **⚠️ WARNING**
 
 This is **NOT** for:
-- SQL lovers ❌
 - ORM enjoyers ❌
 - People who enjoy writing `JOIN` statements ❌
+- People who need multi-table anything ❌
 
 This **IS** for:
 - Developers who want **dead-simple** data persistence ✅
@@ -24,10 +24,10 @@ This **IS** for:
 
 ## **💥 What Is It**
 
-KumDB is a lightweight embedded database engine written in pure C11. No SQL. No dependencies. No bullshit. Just a clean key-value-style API on top of a fast binary file format with atomic writes, type inference, and savage error messages.
+KumDB is a lightweight embedded database engine written in pure C11. No dependencies. No bullshit. A clean key-value-style API on top of a fast binary file format with atomic writes, type inference, and savage error messages -- and if you *want* SQL, it speaks that too, same engine underneath, your call. Still no `JOIN` statements though. We meant that part.
 
 ```c
-// How simple? THIS simple:
+// NoSQL: THIS simple
 KdbField fields[] = {
     kdb_field_string("name",   "John"),
     kdb_field_int   ("age",    30),
@@ -38,6 +38,9 @@ kdb_add(db, "users", fields);
 
 const char *filters[] = { "name=John", NULL };
 KdbRow *user = kdb_find_one(db, "users", filters);
+
+// Or SQL, if that's more your thing -- same table, same data, same engine
+kdb_exec_sql(db, "SELECT * FROM users WHERE name = 'John'", &rows, NULL);
 ```
 
 ---
@@ -148,19 +151,38 @@ Multiple filters = AND logic. No OR for now, cry about it.
 ./build/bin/dump ./mydata users --json --limit 50
 ```
 
-**CLI commands:**
+**CLI commands (NoSQL):**
 ```
 open <dir>                          open a database
+close                               close the current database
 tables                              list tables
 schema <table>                      show schema
-add <table> <k=v> [k=v ...]        insert a record
-find <table> [filter ...]          query records
+add <table> <k=v> [k=v ...]        insert a record (value can be @path for a blob)
+find <table> [filter ...] [order_by=col] [order=asc|desc] [limit=N] [offset=N]
+findbyid <table> <id>               find a single record by id
 count <table> [filter ...]         count records
 update <table> where <k=v> set <k=v>  update records
+import <table> <file>               bulk-insert k=v lines from a file
 delete <table> <filter> [...]      delete records
 compact <table>                     compact table file
 drop <table>                        drop table
+version                             show CLI/engine version
 ```
+
+**CLI commands (SQL):** same engine, different syntax --- one statement per line:
+```
+kumdb> sql CREATE TABLE users (name TEXT NOT NULL, age INT INDEX)
+kumdb> sql INSERT INTO users (name, age) VALUES ('Alice', 30)
+kumdb> sql SELECT * FROM users WHERE age > 21 ORDER BY age DESC LIMIT 10
+kumdb> sql UPDATE users SET age = 31 WHERE name = 'Alice'
+kumdb> sql DELETE FROM users WHERE age < 18
+kumdb> sql DROP TABLE users
+```
+No `JOIN`, no subqueries, no `OR` (the engine is AND-only, same as the filter operators
+above). `WHERE` supports `=`, `!=`/`<>`, `>`, `>=`, `<`, `<=`, `BETWEEN a AND b`,
+`IS [NOT] NULL`, and `LIKE 'pat'` (leading/trailing `%` only). Also callable directly
+from C via `kdb_exec_sql()` in `sql.h` --- both syntaxes hit the exact same storage and
+query code, so results are always consistent between them.
 
 ---
 
@@ -195,7 +217,7 @@ Numbers from `bench` on a mid-range machine. Your mileage may vary. Run `./build
 | Learning curve | 5 mins | 5 weeks | 5 years |
 | Setup | drop in 2 files | configure & build | install daemon |
 | Dependencies | none | none | entire ecosystem |
-| Query language | filter strings | SQL | BSON query objects |
+| Query language | filter strings *or* SQL, your pick | SQL | BSON query objects |
 | Debugging | readable errors | "syntax error near..." | "BSON serialization..." |
 | Street cred | 💯 | ❌ | 🤮 |
 
