@@ -61,6 +61,20 @@ extern "C" {
  * the source column's type. HAVING filters the aggregated output (needs
  * GROUP BY or an aggregate item).
  *
+ * Scalar functions also work as a SELECT item, freely alongside plain
+ * columns/CASE/window functions (not combined with GROUP BY/a plain
+ * aggregate, same restriction CASE and window functions have): UPPER(x)/
+ * LOWER(x), LENGTH(x), TRIM(x), SUBSTR(x,start[,len])/SUBSTRING(...) (1-
+ * based start), CONCAT(a,b,...) (2-4 args), ROUND(x[,ndigits]) (always
+ * FLOAT), ABS(x) (preserves INT/FLOAT), CEIL(x)/CEILING(x)/FLOOR(x)
+ * (always INT), MOD(a,b) (INT if both args are INT, FLOAT otherwise),
+ * COALESCE(a,b,...) (2-4 args), NULLIF(a,b), CAST(x AS type) (same type
+ * names as CREATE TABLE), NOW() (epoch seconds, INT). Every argument is a
+ * plain column or a literal -- never another function call/aggregate/
+ * CASE, no arbitrary expression nesting. A type-mismatched argument
+ * produces NULL for that row rather than erroring the query (CAST fails
+ * the same soft way -- an unparseable string casts to 0/0.0).
+ *
  * Window functions: ROW_NUMBER()/RANK()/DENSE_RANK() and COUNT/SUM/AVG/
  * MIN/MAX all work with OVER ([PARTITION BY col,...] [ORDER BY col
  * [ASC|DESC],...]) -- unlike GROUP BY, rows aren't collapsed, every row

@@ -3,6 +3,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <math.h>
+#include <time.h>
 
 #include "../include/sql.h"
 #include "../include/error.h"
@@ -1324,6 +1326,28 @@ typedef enum {
 #define KDB_SQL_CASE_VAL_BUF       512
 #define KDB_SQL_MAX_CASE_SUBCONDS  3
 
+typedef enum {
+    SQL_FN_UPPER, SQL_FN_LOWER, SQL_FN_LENGTH, SQL_FN_TRIM, SQL_FN_SUBSTR, SQL_FN_CONCAT,
+    SQL_FN_ROUND, SQL_FN_ABS, SQL_FN_CEIL, SQL_FN_FLOOR, SQL_FN_MOD,
+    SQL_FN_COALESCE, SQL_FN_NULLIF, SQL_FN_CAST, SQL_FN_NOW
+} SqlScalarFn;
+
+#define KDB_SQL_MAX_FUNC_ARGS 4
+
+/* One scalar-function argument -- a column reference or a literal, never
+ * another function call/aggregate/CASE (see SqlSelectItem.is_func). Same
+ * literal shape sql__case_value_from_token already produces for CASE's
+ * THEN/ELSE. */
+typedef struct {
+    int          is_col;
+    char         col[KDB_SQL_IDENT_BUF];
+    KdbFieldType lit_type;
+    int64_t      lit_int;
+    double       lit_float;
+    int          lit_bool;
+    char         lit_string[KDB_SQL_CASE_VAL_BUF];
+} SqlFuncArg;
+
 /* A CASE branch's value is a literal, resolved once at parse time, and its
  * WHEN condition -- despite now allowing AND/OR -- is still a small fixed
  * array of filter strings (same "OR:"-prefixed OR'd-AND-groups convention
@@ -1371,6 +1395,19 @@ typedef struct {
     char     window_order_cols[KDB_SQL_MAX_WINDOW_ORDER_COLS][KDB_SQL_IDENT_BUF];
     int      window_order_asc[KDB_SQL_MAX_WINDOW_ORDER_COLS];
     int      n_window_order_cols;
+
+    /* A scalar function call: UPPER(col), ROUND(col, 2), CONCAT(a, b),
+     * CAST(col AS INT), etc -- is_func==0 for everything else. Each
+     * argument is either a column reference or a literal (same "no
+     * arbitrary nesting" scope CASE's THEN/ELSE and aggregates' single
+     * column argument already use -- a function argument can't itself be
+     * another function call, an aggregate, or a CASE). All POD, same
+     * reasoning as SqlCaseBranch/the window fields above. */
+    int         is_func;
+    SqlScalarFn func_fn;
+    SqlFuncArg  func_args[KDB_SQL_MAX_FUNC_ARGS];
+    int         n_func_args;
+    KdbFieldType cast_target; /* CAST(... AS type) only */
 } SqlSelectItem;
 
 static int sql__agg_fn_from_ident(const char *s, SqlAggFn *out) {
@@ -1392,6 +1429,52 @@ static int sql__window_only_fn_from_ident(const char *s, SqlAggFn *out) {
     if (strcasecmp(s, "RANK")       == 0) { *out = SQL_AGG_RANK;       return 1; }
     if (strcasecmp(s, "DENSE_RANK") == 0) { *out = SQL_AGG_DENSE_RANK; return 1; }
     return 0;
+}
+
+static int sql__scalar_fn_from_ident(const char *s, SqlScalarFn *out) {
+    if (strcasecmp(s, "UPPER")     == 0) { *out = SQL_FN_UPPER;    return 1; }
+    if (strcasecmp(s, "LOWER")     == 0) { *out = SQL_FN_LOWER;    return 1; }
+    if (strcasecmp(s, "LENGTH")    == 0) { *out = SQL_FN_LENGTH;   return 1; }
+    if (strcasecmp(s, "TRIM")      == 0) { *out = SQL_FN_TRIM;     return 1; }
+    if (strcasecmp(s, "SUBSTR")    == 0 ||
+        strcasecmp(s, "SUBSTRING") == 0) { *out = SQL_FN_SUBSTR;   return 1; }
+    if (strcasecmp(s, "CONCAT")    == 0) { *out = SQL_FN_CONCAT;   return 1; }
+    if (strcasecmp(s, "ROUND")     == 0) { *out = SQL_FN_ROUND;    return 1; }
+    if (strcasecmp(s, "ABS")       == 0) { *out = SQL_FN_ABS;      return 1; }
+    if (strcasecmp(s, "CEIL")      == 0 ||
+        strcasecmp(s, "CEILING")   == 0) { *out = SQL_FN_CEIL;     return 1; }
+    if (strcasecmp(s, "FLOOR")     == 0) { *out = SQL_FN_FLOOR;    return 1; }
+    if (strcasecmp(s, "MOD")       == 0) { *out = SQL_FN_MOD;      return 1; }
+    if (strcasecmp(s, "COALESCE")  == 0) { *out = SQL_FN_COALESCE; return 1; }
+    if (strcasecmp(s, "NULLIF")    == 0) { *out = SQL_FN_NULLIF;   return 1; }
+    if (strcasecmp(s, "CAST")      == 0) { *out = SQL_FN_CAST;     return 1; }
+    if (strcasecmp(s, "NOW")       == 0) { *out = SQL_FN_NOW;      return 1; }
+    return 0;
+}
+
+/* Minimum/maximum argument count each function accepts -- checked once
+ * right after parsing the argument list, so a wrong count fails with one
+ * clear message instead of a confusing downstream error. */
+static void sql__scalar_fn_arity(SqlScalarFn fn, int *min_args, int *max_args) {
+    switch (fn) {
+        case SQL_FN_UPPER: case SQL_FN_LOWER: case SQL_FN_LENGTH: case SQL_FN_TRIM:
+        case SQL_FN_ABS:   case SQL_FN_CEIL:  case SQL_FN_FLOOR:
+            *min_args = 1; *max_args = 1; break;
+        case SQL_FN_ROUND:
+            *min_args = 1; *max_args = 2; break;
+        case SQL_FN_SUBSTR:
+            *min_args = 2; *max_args = 3; break;
+        case SQL_FN_MOD: case SQL_FN_NULLIF:
+            *min_args = 2; *max_args = 2; break;
+        case SQL_FN_CONCAT: case SQL_FN_COALESCE:
+            *min_args = 2; *max_args = KDB_SQL_MAX_FUNC_ARGS; break;
+        case SQL_FN_CAST:
+            *min_args = 1; *max_args = 1; break; /* CAST(x AS type) -- x is the only comma/paren-list argument, type is separate */
+        case SQL_FN_NOW:
+            *min_args = 0; *max_args = 0; break;
+        default:
+            *min_args = 0; *max_args = KDB_SQL_MAX_FUNC_ARGS; break;
+    }
 }
 
 /* OVER ([PARTITION BY col, ...] [ORDER BY col [ASC|DESC], ...]). p is
@@ -1490,6 +1573,89 @@ static int sql__case_value_from_token(const SqlToken *t, KdbFieldType *type_out,
         default:
             return 0;
     }
+}
+
+/* One function argument: a bare column name, or a literal (number,
+ * string, true/false/null -- same shapes sql__case_value_from_token
+ * accepts for CASE's THEN/ELSE). p is positioned at the argument's first
+ * token. Returns 0 on error (error already set), 1 on success. */
+static int sql__parse_func_arg(SqlParser *p, SqlFuncArg *arg) {
+    memset(arg, 0, sizeof(*arg));
+    if (p->cur.type == SQLTOK_IDENT &&
+        strcasecmp(p->cur.text, "true")  != 0 &&
+        strcasecmp(p->cur.text, "false") != 0 &&
+        strcasecmp(p->cur.text, "null")  != 0) {
+        arg->is_col = 1;
+        snprintf(arg->col, sizeof(arg->col), "%.255s", p->cur.text);
+        sql__advance(p);
+        return 1;
+    }
+    if (!sql__case_value_from_token(&p->cur, &arg->lit_type, &arg->lit_int, &arg->lit_float,
+                                    &arg->lit_bool, arg->lit_string, sizeof(arg->lit_string))) {
+        sql__err("expected a column name or a literal value as a function argument");
+        return 0;
+    }
+    sql__advance(p);
+    return 1;
+}
+
+/* FUNC(arg[, arg...]) | CAST(arg AS type) | NOW(). p is positioned at '('
+ * (not yet consumed) -- the function name identifier was already consumed
+ * by the caller, which is why it's passed in separately for error
+ * messages. Fills in item->is_func/func_fn/func_args/n_func_args/
+ * cast_target. Returns 0 on error (error already set), 1 on success. */
+static int sql__parse_func_call(SqlParser *p, SqlScalarFn fn, const char *fn_name, SqlSelectItem *item) {
+    sql__advance(p); /* ( */
+    item->is_func = 1;
+    item->func_fn = fn;
+    item->n_func_args = 0;
+
+    if (fn == SQL_FN_CAST) {
+        if (!sql__parse_func_arg(p, &item->func_args[0])) return 0;
+        item->n_func_args = 1;
+        if (!sql__kw_is(&p->cur, "AS")) { sql__err("expected AS in CAST(... AS type)"); return 0; }
+        sql__advance(p);
+        const char *tname;
+        if (!sql__ident_text(&p->cur, &tname)) { sql__err("expected a type name after CAST(... AS"); return 0; }
+        if (sql__type_from_ident(tname, &item->cast_target) != KDB_OK) {
+            sql__err("unknown CAST target type '%s'", tname);
+            return 0;
+        }
+        sql__advance(p);
+        if (p->cur.type != SQLTOK_RPAREN) { sql__err("expected ')' closing CAST(...)"); return 0; }
+        sql__advance(p);
+        return 1;
+    }
+
+    if (fn == SQL_FN_NOW) {
+        if (p->cur.type != SQLTOK_RPAREN) { sql__err("NOW() takes no arguments"); return 0; }
+        sql__advance(p);
+        return 1;
+    }
+
+    for (;;) {
+        if (item->n_func_args >= KDB_SQL_MAX_FUNC_ARGS) {
+            sql__err("too many arguments to %s() (max %d)", fn_name, KDB_SQL_MAX_FUNC_ARGS);
+            return 0;
+        }
+        if (!sql__parse_func_arg(p, &item->func_args[item->n_func_args])) return 0;
+        item->n_func_args++;
+        if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+        break;
+    }
+    if (p->cur.type != SQLTOK_RPAREN) { sql__err("expected ')' closing %s(...)", fn_name); return 0; }
+    sql__advance(p);
+
+    int min_args, max_args;
+    sql__scalar_fn_arity(fn, &min_args, &max_args);
+    if (item->n_func_args < min_args || item->n_func_args > max_args) {
+        if (min_args == max_args)
+            sql__err("%s() takes exactly %d argument%s, got %d", fn_name, min_args, min_args == 1 ? "" : "s", item->n_func_args);
+        else
+            sql__err("%s() takes %d to %d arguments, got %d", fn_name, min_args, max_args, item->n_func_args);
+        return 0;
+    }
+    return 1;
 }
 
 /* CASE WHEN cond THEN val [WHEN cond THEN val ...] [ELSE val] END. Each
@@ -1989,6 +2155,258 @@ static int sql__eval_case_item(const SqlSelectItem *item, const KdbRow *row, Kdb
     return 1;
 }
 
+/* Resolves one already-parsed function argument against a specific row --
+ * a column reference becomes a deep copy of that row's field (or NULL if
+ * the row doesn't have it), a literal becomes its typed value. *out is
+ * always caller-owned regardless of which path was taken (a literal
+ * STRING gets its own strdup'd copy too), so sql__eval_func_item can free
+ * every argument uniformly afterward without tracking which ones own
+ * their own memory. Returns 0 on OOM. */
+static int sql__resolve_func_arg(const SqlFuncArg *arg, const KdbRow *row, KdbField *out) {
+    memset(out, 0, sizeof(*out));
+    if (arg->is_col) {
+        const KdbField *f = kdb_row_get(row, arg->col);
+        if (!f) { out->type = KDB_TYPE_NULL; return 1; }
+        out->type = f->type;
+        return sql__copy_field_value(out, f);
+    }
+    out->type = arg->lit_type;
+    switch (arg->lit_type) {
+        case KDB_TYPE_INT:    out->v.as_int   = arg->lit_int;   return 1;
+        case KDB_TYPE_FLOAT:  out->v.as_float = arg->lit_float; return 1;
+        case KDB_TYPE_BOOL:   out->v.as_bool  = arg->lit_bool;  return 1;
+        case KDB_TYPE_STRING: out->v.as_string = strdup(arg->lit_string); return out->v.as_string != NULL;
+        default: return 1; /* NULL literal */
+    }
+}
+
+/* CAST(src AS target). NULL casts to NULL regardless of target. A value
+ * that can't convert (e.g. casting a non-numeric-looking string to INT)
+ * comes back as 0/0.0/false rather than erroring -- same "fail soft, not
+ * closed" latitude strtoll/strtod already have building on top of them,
+ * and consistent with this file's general philosophy of a computed
+ * expression preferring a defined-but-maybe-surprising result over
+ * aborting the whole query over one row's bad data. Returns 0 on OOM
+ * (string target only). */
+static int sql__cast_field(const KdbField *src, KdbFieldType target, KdbField *out) {
+    memset(out, 0, sizeof(*out));
+    if (src->type == KDB_TYPE_NULL) { out->type = KDB_TYPE_NULL; return 1; }
+    out->type = target;
+    double d = 0.0;
+    int have_d = sql__field_to_double(src, &d);
+    switch (target) {
+        case KDB_TYPE_INT:
+            if (src->type == KDB_TYPE_STRING) out->v.as_int = (int64_t)strtoll(src->v.as_string ? src->v.as_string : "", NULL, 10);
+            else out->v.as_int = have_d ? (int64_t)d : 0;
+            return 1;
+        case KDB_TYPE_FLOAT:
+            if (src->type == KDB_TYPE_STRING) out->v.as_float = strtod(src->v.as_string ? src->v.as_string : "", NULL);
+            else out->v.as_float = have_d ? d : 0.0;
+            return 1;
+        case KDB_TYPE_BOOL:
+            if (src->type == KDB_TYPE_STRING)
+                out->v.as_bool = (src->v.as_string && (strcasecmp(src->v.as_string, "true") == 0 || strcmp(src->v.as_string, "1") == 0)) ? 1 : 0;
+            else out->v.as_bool = have_d && d != 0.0;
+            return 1;
+        case KDB_TYPE_STRING: {
+            char buf[64];
+            if (src->type == KDB_TYPE_STRING) { out->v.as_string = strdup(src->v.as_string ? src->v.as_string : ""); return out->v.as_string != NULL; }
+            if (!sql__field_to_filter_text(src, buf, sizeof(buf))) { out->type = KDB_TYPE_NULL; return 1; }
+            out->v.as_string = strdup(buf);
+            return out->v.as_string != NULL;
+        }
+        default:
+            out->type = KDB_TYPE_NULL;
+            return 1;
+    }
+}
+
+/* Evaluates one already-parsed scalar-function item against a specific
+ * row. Writes straight into *out (caller-owned, out->name not set here --
+ * same convention sql__eval_case_item uses). A type-mismatched argument
+ * (e.g. UPPER() on a non-string) produces NULL rather than an error, same
+ * "computed value, not a hard failure" latitude as everywhere else a
+ * per-row expression can go sideways on one row's data. Returns 0 on OOM. */
+static int sql__eval_func_item(const SqlSelectItem *item, const KdbRow *row, KdbField *out) {
+    memset(out, 0, sizeof(*out));
+    KdbField args[KDB_SQL_MAX_FUNC_ARGS];
+    memset(args, 0, sizeof(args)); /* every slot gets filled by sql__resolve_func_arg below, but GCC's -O2 -Wmaybe-uninitialized can't prove that from n_func_args alone */
+    int ok = 1;
+    for (int i = 0; i < item->n_func_args && ok; i++) ok = sql__resolve_func_arg(&item->func_args[i], row, &args[i]);
+    if (!ok) {
+        for (int i = 0; i < item->n_func_args; i++) sql__free_field(&args[i]);
+        return 0;
+    }
+
+    int result_ok = 1;
+    switch (item->func_fn) {
+        case SQL_FN_NOW:
+            out->type = KDB_TYPE_INT;
+            out->v.as_int = (int64_t)time(NULL);
+            break;
+
+        case SQL_FN_UPPER:
+        case SQL_FN_LOWER: {
+            if (args[0].type != KDB_TYPE_STRING || !args[0].v.as_string) { out->type = KDB_TYPE_NULL; break; }
+            char *s = strdup(args[0].v.as_string);
+            if (!s) { result_ok = 0; break; }
+            for (char *c = s; *c; c++)
+                *c = (char)(item->func_fn == SQL_FN_UPPER ? toupper((unsigned char)*c) : tolower((unsigned char)*c));
+            out->type = KDB_TYPE_STRING;
+            out->v.as_string = s;
+            break;
+        }
+
+        case SQL_FN_LENGTH:
+            if (args[0].type != KDB_TYPE_STRING || !args[0].v.as_string) { out->type = KDB_TYPE_NULL; break; }
+            out->type = KDB_TYPE_INT;
+            out->v.as_int = (int64_t)strlen(args[0].v.as_string);
+            break;
+
+        case SQL_FN_TRIM: {
+            if (args[0].type != KDB_TYPE_STRING || !args[0].v.as_string) { out->type = KDB_TYPE_NULL; break; }
+            const char *s = args[0].v.as_string;
+            size_t start = 0, end = strlen(s);
+            while (start < end && isspace((unsigned char)s[start])) start++;
+            while (end > start && isspace((unsigned char)s[end - 1])) end--;
+            char *trimmed = malloc(end - start + 1);
+            if (!trimmed) { result_ok = 0; break; }
+            memcpy(trimmed, s + start, end - start);
+            trimmed[end - start] = '\0';
+            out->type = KDB_TYPE_STRING;
+            out->v.as_string = trimmed;
+            break;
+        }
+
+        case SQL_FN_SUBSTR: {
+            double start_d, len_d;
+            if (args[0].type != KDB_TYPE_STRING || !args[0].v.as_string || !sql__field_to_double(&args[1], &start_d)) {
+                out->type = KDB_TYPE_NULL;
+                break;
+            }
+            size_t slen = strlen(args[0].v.as_string);
+            long start0 = (long)start_d - 1; /* SUBSTR is 1-based */
+            if (start0 < 0) start0 = 0;
+            size_t start = (size_t)start0 > slen ? slen : (size_t)start0;
+            size_t take = slen - start;
+            if (item->n_func_args >= 3) {
+                if (!sql__field_to_double(&args[2], &len_d) || len_d < 0) { out->type = KDB_TYPE_NULL; break; }
+                size_t want = (size_t)len_d;
+                if (want < take) take = want;
+            }
+            char *sub = malloc(take + 1);
+            if (!sub) { result_ok = 0; break; }
+            memcpy(sub, args[0].v.as_string + start, take);
+            sub[take] = '\0';
+            out->type = KDB_TYPE_STRING;
+            out->v.as_string = sub;
+            break;
+        }
+
+        case SQL_FN_CONCAT: {
+            /* any NULL/non-stringable argument makes the whole result
+             * NULL, same as real SQL's || / CONCAT with a NULL operand. */
+            char pieces[KDB_SQL_MAX_FUNC_ARGS][256];
+            size_t total = 1;
+            int any_null = 0;
+            for (int i = 0; i < item->n_func_args; i++) {
+                if (args[i].type == KDB_TYPE_NULL || !sql__field_to_filter_text(&args[i], pieces[i], sizeof(pieces[i]))) {
+                    any_null = 1;
+                    break;
+                }
+                total += strlen(pieces[i]);
+            }
+            if (any_null) { out->type = KDB_TYPE_NULL; break; }
+            char *joined = malloc(total);
+            if (!joined) { result_ok = 0; break; }
+            joined[0] = '\0';
+            for (int i = 0; i < item->n_func_args; i++) strcat(joined, pieces[i]);
+            out->type = KDB_TYPE_STRING;
+            out->v.as_string = joined;
+            break;
+        }
+
+        case SQL_FN_ROUND: {
+            double v, nd = 0.0;
+            if (!sql__field_to_double(&args[0], &v)) { out->type = KDB_TYPE_NULL; break; }
+            if (item->n_func_args >= 2 && !sql__field_to_double(&args[1], &nd)) { out->type = KDB_TYPE_NULL; break; }
+            double scale = pow(10.0, (int)nd);
+            out->type = KDB_TYPE_FLOAT;
+            out->v.as_float = round(v * scale) / scale;
+            break;
+        }
+
+        case SQL_FN_ABS:
+            if (args[0].type == KDB_TYPE_INT) {
+                out->type = KDB_TYPE_INT;
+                out->v.as_int = args[0].v.as_int < 0 ? -args[0].v.as_int : args[0].v.as_int;
+            } else {
+                double v;
+                if (!sql__field_to_double(&args[0], &v)) { out->type = KDB_TYPE_NULL; break; }
+                out->type = KDB_TYPE_FLOAT;
+                out->v.as_float = v < 0 ? -v : v;
+            }
+            break;
+
+        case SQL_FN_CEIL:
+        case SQL_FN_FLOOR: {
+            double v;
+            if (!sql__field_to_double(&args[0], &v)) { out->type = KDB_TYPE_NULL; break; }
+            out->type = KDB_TYPE_INT;
+            out->v.as_int = (int64_t)(item->func_fn == SQL_FN_CEIL ? ceil(v) : floor(v));
+            break;
+        }
+
+        case SQL_FN_MOD:
+            if (args[0].type == KDB_TYPE_INT && args[1].type == KDB_TYPE_INT) {
+                if (args[1].v.as_int == 0) { out->type = KDB_TYPE_NULL; break; }
+                out->type = KDB_TYPE_INT;
+                out->v.as_int = args[0].v.as_int % args[1].v.as_int;
+            } else {
+                double a, b;
+                if (!sql__field_to_double(&args[0], &a) || !sql__field_to_double(&args[1], &b) || b == 0.0) {
+                    out->type = KDB_TYPE_NULL;
+                    break;
+                }
+                out->type = KDB_TYPE_FLOAT;
+                out->v.as_float = fmod(a, b);
+            }
+            break;
+
+        case SQL_FN_COALESCE: {
+            int found = 0;
+            for (int i = 0; i < item->n_func_args && !found; i++) {
+                if (args[i].type == KDB_TYPE_NULL) continue;
+                out->type = args[i].type;
+                if (!sql__copy_field_value(out, &args[i])) result_ok = 0;
+                found = 1;
+            }
+            if (!found) out->type = KDB_TYPE_NULL;
+            break;
+        }
+
+        case SQL_FN_NULLIF:
+            if (sql__field_equal(&args[0], &args[1])) {
+                out->type = KDB_TYPE_NULL;
+            } else {
+                out->type = args[0].type;
+                if (!sql__copy_field_value(out, &args[0])) result_ok = 0;
+            }
+            break;
+
+        case SQL_FN_CAST:
+            result_ok = sql__cast_field(&args[0], item->cast_target, out);
+            break;
+
+        default:
+            out->type = KDB_TYPE_NULL;
+            break;
+    }
+
+    for (int i = 0; i < item->n_func_args; i++) sql__free_field(&args[i]);
+    return result_ok;
+}
+
 #define KDB_SQL_MAX_GROUPS     512
 #define KDB_SQL_MAX_GROUP_COLS 8
 
@@ -2294,6 +2712,28 @@ static KdbStatus sql__project_rows(KdbRows *rows, SqlSelectItem *items, uint32_t
                 }
                 dst->type = tmp.type;
                 dst->v    = tmp.v; /* ownership of any strdup'd string transfers here */
+                kept++;
+                continue;
+            }
+
+            if (items[i].is_func) {
+                KdbField tmp;
+                memset(&tmp, 0, sizeof(tmp));
+                if (!sql__eval_func_item(&items[i], row, &tmp)) {
+                    for (uint32_t k = 0; k < kept; k++) sql__free_field(&new_fields[k]);
+                    free(new_fields);
+                    return KDB_ERR_OOM;
+                }
+                KdbField *dst = &new_fields[kept];
+                dst->name = strdup(items[i].alias);
+                if (!dst->name) {
+                    sql__free_field(&tmp);
+                    for (uint32_t k = 0; k < kept; k++) sql__free_field(&new_fields[k]);
+                    free(new_fields);
+                    return KDB_ERR_OOM;
+                }
+                dst->type = tmp.type;
+                dst->v    = tmp.v;
                 kept++;
                 continue;
             }
@@ -2865,6 +3305,7 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     int has_aggregate = 0;
     int has_case = 0;
     int has_window = 0;
+    int has_func = 0;
 
     if (p->cur.type == SQLTOK_STAR) {
         project_all = 1;
@@ -2919,9 +3360,36 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
                         has_aggregate = 1;
                     }
                 } else {
-                    item.fn = SQL_AGG_NONE;
-                    snprintf(item.arg_col, sizeof(item.arg_col), "%s", first_ident);
-                    snprintf(item.alias, sizeof(item.alias), "%s", first_ident);
+                    SqlScalarFn sfn;
+                    if (sql__scalar_fn_from_ident(first_ident, &sfn) && p->cur.type == SQLTOK_LPAREN) {
+                        if (!sql__parse_func_call(p, sfn, first_ident, &item)) return kdb_last_status();
+                        has_func = 1;
+
+                        char alias_args[KDB_SQL_IDENT_BUF];
+                        alias_args[0] = '\0';
+                        for (int ai = 0; ai < item.n_func_args; ai++) {
+                            char piece[128];
+                            const SqlFuncArg *a = &item.func_args[ai];
+                            if (a->is_col) snprintf(piece, sizeof(piece), "%.100s", a->col);
+                            else switch (a->lit_type) {
+                                case KDB_TYPE_STRING: snprintf(piece, sizeof(piece), "'%.100s'", a->lit_string); break;
+                                case KDB_TYPE_INT:    snprintf(piece, sizeof(piece), "%lld", (long long)a->lit_int); break;
+                                case KDB_TYPE_FLOAT:  snprintf(piece, sizeof(piece), "%g", a->lit_float); break;
+                                case KDB_TYPE_BOOL:   snprintf(piece, sizeof(piece), "%s", a->lit_bool ? "true" : "false"); break;
+                                default:               snprintf(piece, sizeof(piece), "null"); break;
+                            }
+                            if (ai > 0) strncat(alias_args, ",", sizeof(alias_args) - strlen(alias_args) - 1);
+                            strncat(alias_args, piece, sizeof(alias_args) - strlen(alias_args) - 1);
+                        }
+                        if (sfn == SQL_FN_CAST)
+                            snprintf(item.alias, sizeof(item.alias), "CAST(%.100s AS %.20s)", alias_args, kdb_type_name(item.cast_target));
+                        else
+                            snprintf(item.alias, sizeof(item.alias), "%.60s(%.180s)", first_ident, alias_args);
+                    } else {
+                        item.fn = SQL_AGG_NONE;
+                        snprintf(item.arg_col, sizeof(item.arg_col), "%s", first_ident);
+                        snprintf(item.alias, sizeof(item.alias), "%s", first_ident);
+                    }
                 }
             }
 
@@ -3066,6 +3534,11 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     if (has_window && (has_aggregate || has_group_by)) {
         sql__free_cond_node(where_tree);
         return sql__err("a window function (OVER (...)) can't be combined with GROUP BY or a plain aggregate in the same SELECT");
+    }
+
+    if (has_func && (has_aggregate || has_group_by)) {
+        sql__free_cond_node(where_tree);
+        return sql__err("a scalar function doesn't support GROUP BY or aggregate functions yet");
     }
 
     if (project_all && has_group_by) {

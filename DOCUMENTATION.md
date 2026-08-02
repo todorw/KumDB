@@ -487,6 +487,42 @@ t GROUP BY col` with no aggregate at all is a valid way to get distinct
 values. `SUM`/`AVG` always come back as `FLOAT` regardless of the source
 column's type.
 
+**Scalar functions** can also be a `SELECT` item, freely alongside plain
+columns/`CASE`/window functions (but not combined with `GROUP BY` or a
+plain aggregate in the same `SELECT`, same restriction `CASE` and window
+functions have):
+
+```sql
+SELECT UPPER(name) AS n, ROUND(price, 2) AS p, CONCAT(city, ', ', country) AS loc
+    FROM t
+```
+
+| Function | |
+|---|---|
+| `UPPER(x)`, `LOWER(x)` | case-fold a string |
+| `LENGTH(x)` | string length in bytes, as `INT` |
+| `TRIM(x)` | strip leading/trailing whitespace |
+| `SUBSTR(x, start[, len])` / `SUBSTRING(...)` | substring, 1-based `start` like standard SQL |
+| `CONCAT(a, b, ...)` | join as strings (2-4 args) |
+| `ROUND(x[, ndigits])` | always comes back `FLOAT`, `ndigits` defaults to 0 |
+| `ABS(x)` | preserves `INT` vs `FLOAT` |
+| `CEIL(x)` / `CEILING(x)`, `FLOOR(x)` | always `INT` |
+| `MOD(a, b)` | `INT` if both args are `INT`, `FLOAT` otherwise |
+| `COALESCE(a, b, ...)` | first non-`NULL` argument (2-4 args) |
+| `NULLIF(a, b)` | `NULL` if `a` equals `b`, else `a` |
+| `CAST(x AS type)` | `INT`/`FLOAT`/`BOOL`/`TEXT` (same type names as `CREATE TABLE`) |
+| `NOW()` | current time, epoch seconds as `INT` |
+
+Every argument is a plain column reference or a literal — never another
+function call, an aggregate, or a `CASE` (no arbitrary expression
+nesting, same "keep it flat" scope every other multi-part construct in
+this dialect already uses). A type-mismatched argument (`UPPER()` on a
+non-string column, say) produces `NULL` for that row rather than erroring
+the whole query — same latitude a bad comparison in `WHERE` already has.
+`CAST` similarly fails soft: a string that doesn't look like a number
+casts to `0`/`0.0` rather than erroring. `NULL` in, `NULL` out for every
+function except `COALESCE` (that's the point of it) and `NULLIF`.
+
 **Window functions**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, and
 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` all work as window functions with
 `OVER ([PARTITION BY col, ...] [ORDER BY col [ASC|DESC], ...])` — unlike

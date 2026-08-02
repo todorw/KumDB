@@ -1263,6 +1263,164 @@ static void test_ctes(void) {
     teardown(db);
 }
 
+static void test_scalar_functions(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (name TEXT, age INT, price FLOAT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, age, price) VALUES ('  Alice  ', 17, 19.567)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, age, price) VALUES ('bob', 70, -3.2)"));
+
+    KdbRows *rows = NULL;
+
+    /* string functions */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT UPPER(name) AS u, LOWER(name) AS l, LENGTH(name) AS n, TRIM(name) AS t FROM t WHERE name = 'bob'",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *u = NULL, *l = NULL, *tr = NULL;
+        int64_t n = 0;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "u", &u));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "l", &l));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "n", &n));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "t", &tr));
+        ASSERT_STR(u, "BOB"); ASSERT_STR(l, "bob"); ASSERT_EQ(n, 3); ASSERT_STR(tr, "bob");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT TRIM(name) AS t FROM t WHERE age = 17", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *t = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "t", &t));
+        ASSERT_STR(t, "Alice"); /* leading/trailing spaces stripped */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT SUBSTR(name, 1, 2) AS s1, SUBSTR(name, 2) AS s2 FROM t WHERE name = 'bob'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *s1 = NULL, *s2 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "s1", &s1));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "s2", &s2));
+        ASSERT_STR(s1, "bo"); ASSERT_STR(s2, "ob"); /* 1-based start */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT CONCAT(name, '-', age) AS c FROM t WHERE name = 'bob'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *c = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "c", &c));
+        ASSERT_STR(c, "bob-70");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* numeric functions */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT ROUND(price, 2) AS r, ABS(price) AS a, CEIL(price) AS c, FLOOR(price) AS f FROM t WHERE name = 'bob'",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        double r = 0, a = 0;
+        int64_t c = 0, f = 0;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "r", &r));
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "a", &a));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "c", &c));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "f", &f));
+        ASSERT(r > -3.21 && r < -3.19);
+        ASSERT(a > 3.19 && a < 3.21);
+        ASSERT_EQ(c, -3);  /* CEIL rounds toward +inf */
+        ASSERT_EQ(f, -4);  /* FLOOR rounds toward -inf */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT MOD(age, 7) AS m FROM t WHERE name = 'bob'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        int64_t m = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "m", &m));
+        ASSERT_EQ(m, 0); /* 70 % 7 */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* null-handling functions */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT NULLIF(age, 70) AS n FROM t ORDER BY age ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        int64_t n0 = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "n", &n0));
+        ASSERT_EQ(n0, 17); /* not equal to 70 -> passes through */
+        const KdbField *n1 = kdb_row_get(&rows->rows[1], "n");
+        ASSERT(n1 && n1->type == KDB_TYPE_NULL); /* equal to 70 -> NULL */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT COALESCE(name, 'fallback') AS c FROM t WHERE name = 'bob'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *c = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "c", &c));
+        ASSERT_STR(c, "bob");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* CAST */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT CAST(price AS INT) AS i, CAST(age AS TEXT) AS s FROM t WHERE name = 'bob'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        int64_t i = 0;
+        const char *s = NULL;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "i", &i));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "s", &s));
+        ASSERT_EQ(i, -3); /* truncated toward zero */
+        ASSERT_STR(s, "70");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* NOW() -- just confirm it returns a plausible INT epoch, not the
+     * exact value (that would make the test time-dependent) */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT NOW() AS n FROM t WHERE name = 'bob'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        int64_t n = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "n", &n));
+        ASSERT(n > 1700000000); /* sometime after 2023 */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* a type-mismatched argument produces NULL, not an error */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT UPPER(age) AS u FROM t WHERE name = 'bob'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const KdbField *u = kdb_row_get(&rows->rows[0], "u");
+        ASSERT(u && u->type == KDB_TYPE_NULL);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* functions after a JOIN, on qualified columns */
+    ASSERT_OK(sql(db, "CREATE TABLE addr (person TEXT, city TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO addr (person, city) VALUES ('bob', 'nyc')"));
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT UPPER(a.city) AS c FROM t AS x JOIN addr AS a ON x.name = a.person", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *c = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "c", &c));
+        ASSERT_STR(c, "NYC");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* wrong argument count is rejected, not silently ignored */
+    ASSERT_ERR(sql(db, "SELECT UPPER(name, age) FROM t"));
+    ASSERT_ERR(sql(db, "SELECT MOD(age) FROM t"));
+
+    /* a scalar function can't combine with GROUP BY/aggregates */
+    ASSERT_ERR(sql(db, "SELECT UPPER(name), COUNT(*) FROM t GROUP BY name"));
+
+    teardown(db);
+}
+
 static void test_window_functions(void) {
     KumDB *db;
     setup(&db);
@@ -1449,6 +1607,7 @@ int main(void) {
     test_drop_table();
     test_views();
     test_ctes();
+    test_scalar_functions();
     test_window_functions();
     test_comments();
     test_syntax_errors();
