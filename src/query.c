@@ -55,7 +55,16 @@ KdbStatus kdb_query_add_filter(KdbQuery   *q,
 
 
     if (raw_value) {
-        KdbType hint = kdb_type_infer(raw_value);
+        /* KDB_OP_IN's value is always a comma-delimited list of tokens to
+         * be parsed at match time (see the KDB_OP_IN case in
+         * kdb_value_matches, types.c), never a single scalar -- so it must
+         * stay KDB_TYPE_STRING even when the whole raw text happens to
+         * look like one bare number/bool (a one-element IN list, e.g.
+         * "age__in=20"). Letting kdb_type_infer have it in that case would
+         * store an INT/BOOL value instead of the list text, and the IN
+         * matcher's own type guard would then reject it outright --
+         * silently matching nothing regardless of the real comparison. */
+        KdbType hint = (f->op == KDB_OP_IN) ? KDB_TYPE_STRING : kdb_type_infer(raw_value);
         st = kdb_value_from_string(raw_value, hint, &f->value);
         if (st != KDB_OK) return st;
     } else {

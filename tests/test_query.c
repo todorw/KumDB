@@ -187,6 +187,22 @@ static void test_in_filter(void) {
     ASSERT(rows != NULL);
     ASSERT_EQ(rows->count, 2u);
     kdb_rows_free(rows);
+
+    /* a one-element IN list whose sole value looks numeric used to get
+     * type-inferred into an INT instead of staying the list-text the IN
+     * matcher expects, silently matching nothing regardless of a real
+     * match -- see kdb_query_add_filter's KDB_OP_IN special case. */
+    const char *f3[] = { "score__in=30", NULL };
+    rows = kdb_find(db, TABLE, f3);
+    ASSERT(rows != NULL);
+    ASSERT_EQ(rows->count, 1u);
+    kdb_rows_free(rows);
+
+    const char *f4[] = { "name__in=beta", NULL };
+    rows = kdb_find(db, TABLE, f4);
+    ASSERT(rows != NULL);
+    ASSERT_EQ(rows->count, 1u);
+    kdb_rows_free(rows);
 }
 
 static void test_find_all(void) {

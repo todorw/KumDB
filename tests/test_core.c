@@ -569,6 +569,24 @@ static void test_id_and_timestamp_filters(void) {
     const char *notnull[] = { "created_at__isnotnull", NULL };
     ASSERT_EQ(kdb_count(db, TABLE, notnull), 5);
 
+    /* a one-element id__in list used to silently match nothing -- the
+     * whole raw value ("3") got type-inferred into an INT instead of
+     * staying list-text, and the IN matcher requires a STRING value to
+     * split on commas (see kdb_query_add_filter's KDB_OP_IN special case,
+     * query.c). Exercised through kdb_delete too since that's the code
+     * path SQL's WHERE-with-parens/EXISTS UPDATE/DELETE fallback depends
+     * on (sql__resolve_where_to_id_filter, sql.c). */
+    const char *id_in_one[] = { "id__in=3", NULL };
+    ASSERT_EQ(kdb_count(db, TABLE, id_in_one), 1);
+
+    const char *id_in_many[] = { "id__in=2,3,4", NULL };
+    ASSERT_EQ(kdb_count(db, TABLE, id_in_many), 3);
+
+    size_t deleted = 0;
+    ASSERT_OK(kdb_delete(db, TABLE, id_in_one, &deleted));
+    ASSERT_EQ(deleted, 1u);
+    ASSERT_EQ(kdb_count(db, TABLE, NULL), 4);
+
     teardown(db);
 }
 
