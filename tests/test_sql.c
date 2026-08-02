@@ -86,6 +86,18 @@ static void test_projection(void) {
     }
     if (rows) kdb_rows_free(rows);
 
+    /* AS on a plain (non-aggregate) column renames the output field */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT a AS first FROM t", &rows, NULL));
+    if (rows && rows->count == 1) {
+        ASSERT_EQ(rows->rows[0].field_count, 1u);
+        ASSERT(kdb_row_get(&rows->rows[0], "first") != NULL);
+        ASSERT(kdb_row_get(&rows->rows[0], "a") == NULL);
+        int64_t v = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "first", &v));
+        ASSERT_EQ(v, 1);
+    }
+    if (rows) kdb_rows_free(rows);
+
     teardown(db);
 }
 
@@ -585,6 +597,62 @@ static void test_join_chain(void) {
     teardown(db);
 }
 
+static void test_case_when(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE people (name TEXT, age INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO people (name, age) VALUES ('alice', 10)"));
+    ASSERT_OK(sql(db, "INSERT INTO people (name, age) VALUES ('bob', 25)"));
+    ASSERT_OK(sql(db, "INSERT INTO people (name, age) VALUES ('carol', 70)"));
+
+    KdbRows *rows = NULL;
+
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name, CASE WHEN age < 18 THEN 'minor' WHEN age < 65 THEN 'adult' ELSE 'senior' END AS category "
+        "FROM people ORDER BY name ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        const char *c0 = NULL, *c1 = NULL, *c2 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "category", &c0)); /* alice */
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "category", &c1)); /* bob */
+        ASSERT_OK(kdb_row_get_string(&rows->rows[2], "category", &c2)); /* carol */
+        ASSERT_STR(c0, "minor");
+        ASSERT_STR(c1, "adult");
+        ASSERT_STR(c2, "senior");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* no ELSE, no branch matches -> NULL, row still appears */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name, CASE WHEN age > 100 THEN 'ancient' END AS category FROM people WHERE name = 'alice'",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const KdbField *cf = kdb_row_get(&rows->rows[0], "category");
+        ASSERT(cf && cf->type == KDB_TYPE_NULL);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* CASE works fine after a JOIN too, referencing a qualified column */
+    ASSERT_OK(sql(db, "CREATE TABLE depts (person TEXT, dept TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO depts (person, dept) VALUES ('alice', 'eng')"));
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT p.name, CASE WHEN p.age < 18 THEN 'minor' ELSE 'adult' END AS cat "
+        "FROM people AS p JOIN depts AS d ON p.name = d.person", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *cat = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "cat", &cat));
+        ASSERT_STR(cat, "minor");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* CASE combined with GROUP BY/aggregates is rejected */
+    ASSERT_ERR(sql(db, "SELECT CASE WHEN age < 18 THEN 'x' END, COUNT(*) FROM people GROUP BY age"));
+
+    teardown(db);
+}
+
 static void test_distinct(void) {
     KumDB *db;
     setup(&db);
@@ -791,6 +859,7 @@ int main(void) {
     test_subqueries();
     test_join();
     test_join_chain();
+    test_case_when();
     test_distinct();
     test_alter_table();
     test_nested_values_through_sql();

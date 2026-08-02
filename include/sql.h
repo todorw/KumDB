@@ -32,9 +32,10 @@ extern "C" {
  * AND binds tighter than OR, standard SQL precedence, no parens/nesting:
  * "a=1 AND b=2 OR c=3" means "(a=1 AND b=2) OR (c=3)".
  *
- * A SELECT item is a plain column, or an aggregate call --
- * COUNT(*)/COUNT(col)/SUM(col)/AVG(col)/MIN(col)/MAX(col) -- optionally
- * renamed with "AS alias" (default alias is e.g. "SUM(amount)"). Without
+ * A SELECT item is a plain column, an aggregate call --
+ * COUNT(*)/COUNT(col)/SUM(col)/AVG(col)/MIN(col)/MAX(col) -- or a CASE
+ * expression (below), optionally renamed with "AS alias" (default alias
+ * is e.g. "SUM(amount)", or "case" for an unaliased CASE). Without
  * GROUP BY, one or more aggregate items collapse the whole result into a
  * single summary row. GROUP BY takes one or more comma-separated columns;
  * you get one row per distinct combination of values across all of them.
@@ -59,6 +60,14 @@ extern "C" {
  * common join keys, e.g. "ON orders.user_id = users.id"). LEFT JOIN pads
  * an unmatched row with NULL for every column from that step's table. JOIN
  * doesn't support GROUP BY/aggregates yet.
+ *
+ * CASE (as a SELECT item): "CASE WHEN cond THEN val [WHEN cond THEN val
+ * ...] [ELSE val] END". First matching WHEN wins; NULL if nothing matches
+ * and there's no ELSE. Each WHEN condition is a single WHERE-style
+ * condition (same operators, no AND/OR combining multiple within one
+ * WHEN), up to 4 branches. THEN/ELSE values are literals, resolved once at
+ * parse time -- not column references. Works fine after a JOIN (conditions
+ * can reference qualified columns), not combined with GROUP BY/aggregates.
  *
  * DISTINCT dedupes the result by the exact selected columns, after
  * projection. UNION/UNION ALL chain multiple SELECTs (same column count

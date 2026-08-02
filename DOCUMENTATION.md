@@ -394,9 +394,10 @@ table is always fetched in full — there's no filter pushed into the join
 itself, `WHERE` runs afterward over the combined rows. Fine for the row
 counts this engine targets, not something to reach for on huge tables.
 
-**`SELECT` items** can be a plain column, `*`, or an aggregate call —
+**`SELECT` items** can be a plain column, `*`, an aggregate call —
 `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` —
-optionally renamed with `AS alias` (default alias is e.g. `SUM(amount)`).
+or a `CASE` expression (below), optionally renamed with `AS alias` (default
+alias is e.g. `SUM(amount)`, or `case` for an unaliased `CASE`).
 Without `GROUP BY`, one or more aggregate items collapse the result into a
 single summary row. `GROUP BY` takes one or more comma-separated columns —
 `GROUP BY region` or `GROUP BY region, product` — and you get one row per
@@ -405,6 +406,22 @@ item must be an aggregate call — same rule real SQL uses. `SELECT col FROM
 t GROUP BY col` with no aggregate at all is a valid way to get distinct
 values. `SUM`/`AVG` always come back as `FLOAT` regardless of the source
 column's type. No window functions.
+
+**`CASE`** as a `SELECT` item: `CASE WHEN cond THEN val [WHEN cond THEN
+val ...] [ELSE val] END`. First matching `WHEN` wins; with no `ELSE` and
+no match, the value is `NULL`. Each `WHEN` condition is a single
+`WHERE`-style condition (same operators: `=`, `BETWEEN`, `IN`, `LIKE`,
+`IS NULL`, etc) — no `AND`/`OR` combining multiple conditions within one
+`WHEN`, and no more than 4 `WHEN` branches. `THEN`/`ELSE` values are
+literals (number, string, `true`/`false`, `null`) evaluated once at parse
+time, not column references. Works fine after a `JOIN` (conditions can
+reference qualified columns like any other `WHERE`-style condition), but
+not combined with `GROUP BY` or aggregate functions:
+
+```sql
+SELECT name, CASE WHEN age < 18 THEN 'minor' WHEN age < 65 THEN 'adult' ELSE 'senior' END AS category
+    FROM people
+```
 
 **`HAVING`** filters the aggregated/grouped output (same condition syntax
 as `WHERE`, evaluated against the SELECT list's aliases -- `HAVING total >

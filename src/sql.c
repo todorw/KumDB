@@ -868,10 +868,36 @@ static void sql__free_row_fields(KdbRow *row) {
 
 typedef enum { SQL_AGG_NONE, SQL_AGG_COUNT, SQL_AGG_SUM, SQL_AGG_AVG, SQL_AGG_MIN, SQL_AGG_MAX } SqlAggFn;
 
+#define KDB_SQL_MAX_CASE_BRANCHES 4
+#define KDB_SQL_CASE_VAL_BUF      512
+
+/* A CASE branch's value is a literal, resolved once at parse time -- not a
+ * heap pointer, so a SqlSelectItem carrying one stays plain-old-data and
+ * every early return in sql__exec_select_core (there are a lot of them)
+ * stays automatically safe with no new cleanup path to audit. */
 typedef struct {
-    SqlAggFn fn;                          /* SQL_AGG_NONE = plain column, not an aggregate */
-    char     arg_col[KDB_SQL_IDENT_BUF];  /* column name, or "*" for COUNT(*) */
+    char         cond_filter[KDB_SQL_IDENT_BUF]; /* WHEN condition, filter-string form (reuses sql__parse_condition) */
+    KdbFieldType then_type;
+    int64_t      then_int;
+    double       then_float;
+    int          then_bool;
+    char         then_string[KDB_SQL_CASE_VAL_BUF];
+} SqlCaseBranch;
+
+typedef struct {
+    SqlAggFn fn;                          /* SQL_AGG_NONE = plain column or CASE, not an aggregate */
+    char     arg_col[KDB_SQL_IDENT_BUF];  /* column name, or "*" for COUNT(*); unused for CASE */
     char     alias[KDB_SQL_IDENT_BUF];    /* output field name */
+
+    int           is_case;
+    SqlCaseBranch case_branches[KDB_SQL_MAX_CASE_BRANCHES];
+    int           n_case_branches;
+    int           has_else;
+    KdbFieldType  else_type;
+    int64_t       else_int;
+    double        else_float;
+    int           else_bool;
+    char          else_string[KDB_SQL_CASE_VAL_BUF];
 } SqlSelectItem;
 
 static int sql__agg_fn_from_ident(const char *s, SqlAggFn *out) {
@@ -881,6 +907,104 @@ static int sql__agg_fn_from_ident(const char *s, SqlAggFn *out) {
     if (strcasecmp(s, "MIN")   == 0) { *out = SQL_AGG_MIN;   return 1; }
     if (strcasecmp(s, "MAX")   == 0) { *out = SQL_AGG_MAX;   return 1; }
     return 0;
+}
+
+/* Resolves a literal token (number/string/true/false/null) into a typed
+ * value stored inline, same literal shapes sql__value_to_field accepts.
+ * Returns 0 for anything that isn't a literal (column refs aren't valid
+ * CASE THEN/ELSE values -- keeps evaluation a pure per-row computation,
+ * no second column lookup to resolve). */
+static int sql__case_value_from_token(const SqlToken *t, KdbFieldType *type_out,
+                                      int64_t *int_out, double *float_out, int *bool_out,
+                                      char *str_out, size_t str_out_size) {
+    switch (t->type) {
+        case SQLTOK_NUMBER:
+            if (strchr(t->text, '.')) { *type_out = KDB_TYPE_FLOAT; *float_out = atof(t->text); }
+            else                      { *type_out = KDB_TYPE_INT;   *int_out = atoll(t->text); }
+            return 1;
+        case SQLTOK_STRING:
+            *type_out = KDB_TYPE_STRING;
+            /* CASE THEN/ELSE string values are capped well under a raw
+             * token's max length (KDB_SQL_CASE_VAL_BUF vs KDB_SQL_TOK_MAX)
+             * -- same silent-truncation convention this file already uses
+             * for table/column names, not expected to matter for a CASE
+             * label in practice. GCC can't prove that's safe here since
+             * str_out_size is a runtime parameter, not a sizeof() at the
+             * call site -- same well-known -Wformat-truncation limitation
+             * as kdb__tx_backup_path in kumdb.c. */
+            {
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
+                snprintf(str_out, str_out_size, "%s", t->text);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+            }
+            return 1;
+        case SQLTOK_IDENT:
+            if (strcasecmp(t->text, "true")  == 0) { *type_out = KDB_TYPE_BOOL; *bool_out = 1; return 1; }
+            if (strcasecmp(t->text, "false") == 0) { *type_out = KDB_TYPE_BOOL; *bool_out = 0; return 1; }
+            if (strcasecmp(t->text, "null")  == 0) { *type_out = KDB_TYPE_NULL; return 1; }
+            return 0;
+        default:
+            return 0;
+    }
+}
+
+/* CASE WHEN cond THEN val [WHEN cond THEN val ...] [ELSE val] END. Each
+ * WHEN condition is a single WHERE-style condition (reuses
+ * sql__parse_condition -- same operators: =, BETWEEN, IN, LIKE, IS NULL,
+ * etc), no AND/OR within one WHEN. p is positioned at "CASE". */
+static int sql__parse_case_item(SqlParser *p, KumDB *db, SqlSelectItem *item) {
+    sql__advance(p); /* CASE */
+    item->is_case = 1;
+    item->fn = SQL_AGG_NONE;
+
+    if (!sql__kw_is(&p->cur, "WHEN")) { sql__err("expected WHEN after CASE"); return 0; }
+
+    while (sql__kw_is(&p->cur, "WHEN")) {
+        sql__advance(p);
+        if (item->n_case_branches >= KDB_SQL_MAX_CASE_BRANCHES) {
+            sql__err("too many WHEN branches in CASE (max %d)", KDB_SQL_MAX_CASE_BRANCHES);
+            return 0;
+        }
+        SqlCaseBranch *br = &item->case_branches[item->n_case_branches];
+
+        char *cond = sql__parse_condition(p, db);
+        if (!cond) return 0;
+        snprintf(br->cond_filter, sizeof(br->cond_filter), "%s", cond);
+        free(cond);
+
+        if (!sql__kw_is(&p->cur, "THEN")) { sql__err("expected THEN after a CASE WHEN condition"); return 0; }
+        sql__advance(p);
+
+        if (!sql__case_value_from_token(&p->cur, &br->then_type, &br->then_int, &br->then_float,
+                                        &br->then_bool, br->then_string, sizeof(br->then_string))) {
+            sql__err("expected a literal value after THEN");
+            return 0;
+        }
+        sql__advance(p);
+        item->n_case_branches++;
+    }
+
+    if (sql__kw_is(&p->cur, "ELSE")) {
+        sql__advance(p);
+        item->has_else = 1;
+        if (!sql__case_value_from_token(&p->cur, &item->else_type, &item->else_int, &item->else_float,
+                                        &item->else_bool, item->else_string, sizeof(item->else_string))) {
+            sql__err("expected a literal value after ELSE");
+            return 0;
+        }
+        sql__advance(p);
+    }
+
+    if (!sql__kw_is(&p->cur, "END")) { sql__err("expected END closing CASE"); return 0; }
+    sql__advance(p);
+
+    snprintf(item->alias, sizeof(item->alias), "case");
+    return 1;
 }
 
 /* INT/FLOAT/BOOL are all numeric for aggregate purposes, same "bool is 0/1"
@@ -1102,6 +1226,45 @@ static void sql__filter_rows(KdbRows *rows, char *const *filters, int nfilt) {
         }
     }
     rows->count = kept;
+}
+
+/* Evaluates one already-parsed CASE item against a specific row -- first
+ * matching WHEN wins (same short-circuit order as real SQL), ELSE (or
+ * NULL if there's no ELSE) otherwise. Writes straight into *out, which the
+ * caller owns (out->name is NOT set here, same convention sql__project_rows
+ * uses for every other item). */
+static int sql__eval_case_item(const SqlSelectItem *item, const KdbRow *row, KdbField *out) {
+    for (int i = 0; i < item->n_case_branches; i++) {
+        const SqlCaseBranch *br = &item->case_branches[i];
+        SqlRowCond cond;
+        if (!sql__parse_row_cond(br->cond_filter, &cond)) continue;
+        if (!sql__row_cond_matches(row, &cond)) continue;
+
+        out->type = br->then_type;
+        switch (br->then_type) {
+            case KDB_TYPE_INT:    out->v.as_int    = br->then_int;    break;
+            case KDB_TYPE_FLOAT:  out->v.as_float  = br->then_float;  break;
+            case KDB_TYPE_BOOL:   out->v.as_bool   = br->then_bool;   break;
+            case KDB_TYPE_STRING: out->v.as_string = strdup(br->then_string); return out->v.as_string != NULL;
+            default: break; /* NULL */
+        }
+        return 1;
+    }
+
+    if (item->has_else) {
+        out->type = item->else_type;
+        switch (item->else_type) {
+            case KDB_TYPE_INT:    out->v.as_int    = item->else_int;    break;
+            case KDB_TYPE_FLOAT:  out->v.as_float  = item->else_float;  break;
+            case KDB_TYPE_BOOL:   out->v.as_bool   = item->else_bool;   break;
+            case KDB_TYPE_STRING: out->v.as_string = strdup(item->else_string); return out->v.as_string != NULL;
+            default: break; /* NULL */
+        }
+        return 1;
+    }
+
+    out->type = KDB_TYPE_NULL;
+    return 1;
 }
 
 #define KDB_SQL_MAX_GROUPS     512
@@ -1353,19 +1516,48 @@ static void sql__dedupe_rows(KdbRows *rows) {
     rows->count = kept;
 }
 
-static KdbStatus sql__project_rows(KdbRows *rows, char proj_cols[][KDB_SQL_IDENT_BUF], uint32_t nproj) {
+/* Projects each row down to the SELECT list -- a plain column looked up
+ * by items[i].arg_col, or a CASE item evaluated fresh per row. Either way
+ * the output field is named items[i].alias (defaults to arg_col when
+ * there's no explicit AS, set at parse time). A plain column with no
+ * match on a given row is silently dropped from that row's output, same
+ * as always -- CASE always produces a value (NULL at worst), so it never
+ * drops. */
+static KdbStatus sql__project_rows(KdbRows *rows, SqlSelectItem *items, uint32_t nitems) {
     for (size_t r = 0; r < rows->count; r++) {
         KdbRow *row = &rows->rows[r];
-        KdbField *new_fields = (KdbField *)calloc(nproj > 0 ? nproj : 1, sizeof(KdbField));
+        KdbField *new_fields = (KdbField *)calloc(nitems > 0 ? nitems : 1, sizeof(KdbField));
         if (!new_fields) return KDB_ERR_OOM;
 
         uint32_t kept = 0;
-        for (uint32_t i = 0; i < nproj; i++) {
-            const KdbField *src = kdb_row_get(row, proj_cols[i]);
+        for (uint32_t i = 0; i < nitems; i++) {
+            if (items[i].is_case) {
+                KdbField tmp;
+                memset(&tmp, 0, sizeof(tmp));
+                if (!sql__eval_case_item(&items[i], row, &tmp)) {
+                    for (uint32_t k = 0; k < kept; k++) sql__free_field(&new_fields[k]);
+                    free(new_fields);
+                    return KDB_ERR_OOM;
+                }
+                KdbField *dst = &new_fields[kept];
+                dst->name = strdup(items[i].alias);
+                if (!dst->name) {
+                    sql__free_field(&tmp);
+                    for (uint32_t k = 0; k < kept; k++) sql__free_field(&new_fields[k]);
+                    free(new_fields);
+                    return KDB_ERR_OOM;
+                }
+                dst->type = tmp.type;
+                dst->v    = tmp.v; /* ownership of any strdup'd string transfers here */
+                kept++;
+                continue;
+            }
+
+            const KdbField *src = kdb_row_get(row, items[i].arg_col);
             if (!src) continue;
 
             KdbField *dst = &new_fields[kept];
-            dst->name = strdup(proj_cols[i]);
+            dst->name = strdup(items[i].alias);
             dst->type = src->type;
             if (!dst->name || !sql__copy_field_value(dst, src)) {
                 for (uint32_t k = 0; k <= kept; k++) sql__free_field(&new_fields[k]);
@@ -1674,45 +1866,51 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     SqlSelectItem items[KDB_SQL_MAX_COLUMNS];
     uint32_t nitems = 0;
     int has_aggregate = 0;
+    int has_case = 0;
 
     if (p->cur.type == SQLTOK_STAR) {
         project_all = 1;
         sql__advance(p);
     } else {
         for (;;) {
-            const char *cname;
-            if (!sql__ident_text(&p->cur, &cname))
-                return sql__err("expected a column name, aggregate function, or '*' after SELECT");
-            char first_ident[KDB_SQL_IDENT_BUF];
-            snprintf(first_ident, sizeof(first_ident), "%.255s", cname);
-            sql__advance(p);
-
             SqlSelectItem item;
             memset(&item, 0, sizeof(item));
 
-            SqlAggFn fn;
-            if (sql__agg_fn_from_ident(first_ident, &fn) && p->cur.type == SQLTOK_LPAREN) {
-                sql__advance(p);
-                if (p->cur.type == SQLTOK_STAR) {
-                    if (fn != SQL_AGG_COUNT) return sql__err("only COUNT(*) is supported, not %s(*)", first_ident);
-                    snprintf(item.arg_col, sizeof(item.arg_col), "*");
-                    sql__advance(p);
-                } else {
-                    const char *acol;
-                    if (!sql__ident_text(&p->cur, &acol))
-                        return sql__err("expected a column name or '*' inside %s(...)", first_ident);
-                    snprintf(item.arg_col, sizeof(item.arg_col), "%.255s", acol);
-                    sql__advance(p);
-                }
-                if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing %s(...)", first_ident);
-                sql__advance(p);
-                item.fn = fn;
-                has_aggregate = 1;
-                snprintf(item.alias, sizeof(item.alias), "%.100s(%.100s)", first_ident, item.arg_col);
+            if (sql__kw_is(&p->cur, "CASE")) {
+                if (!sql__parse_case_item(p, db, &item)) return kdb_last_status();
+                has_case = 1;
             } else {
-                item.fn = SQL_AGG_NONE;
-                snprintf(item.arg_col, sizeof(item.arg_col), "%s", first_ident);
-                snprintf(item.alias, sizeof(item.alias), "%s", first_ident);
+                const char *cname;
+                if (!sql__ident_text(&p->cur, &cname))
+                    return sql__err("expected a column name, aggregate function, CASE, or '*' after SELECT");
+                char first_ident[KDB_SQL_IDENT_BUF];
+                snprintf(first_ident, sizeof(first_ident), "%.255s", cname);
+                sql__advance(p);
+
+                SqlAggFn fn;
+                if (sql__agg_fn_from_ident(first_ident, &fn) && p->cur.type == SQLTOK_LPAREN) {
+                    sql__advance(p);
+                    if (p->cur.type == SQLTOK_STAR) {
+                        if (fn != SQL_AGG_COUNT) return sql__err("only COUNT(*) is supported, not %s(*)", first_ident);
+                        snprintf(item.arg_col, sizeof(item.arg_col), "*");
+                        sql__advance(p);
+                    } else {
+                        const char *acol;
+                        if (!sql__ident_text(&p->cur, &acol))
+                            return sql__err("expected a column name or '*' inside %s(...)", first_ident);
+                        snprintf(item.arg_col, sizeof(item.arg_col), "%.255s", acol);
+                        sql__advance(p);
+                    }
+                    if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing %s(...)", first_ident);
+                    sql__advance(p);
+                    item.fn = fn;
+                    has_aggregate = 1;
+                    snprintf(item.alias, sizeof(item.alias), "%.100s(%.100s)", first_ident, item.arg_col);
+                } else {
+                    item.fn = SQL_AGG_NONE;
+                    snprintf(item.arg_col, sizeof(item.arg_col), "%s", first_ident);
+                    snprintf(item.alias, sizeof(item.alias), "%s", first_ident);
+                }
             }
 
             if (sql__kw_is(&p->cur, "AS")) {
@@ -1831,6 +2029,11 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
         return sql__err("JOIN doesn't support GROUP BY or aggregate functions yet");
     }
 
+    if (has_case && (has_aggregate || has_group_by)) {
+        sql__free_filters(filters, nfilt);
+        return sql__err("CASE doesn't support GROUP BY or aggregate functions yet");
+    }
+
     if (project_all && has_group_by) {
         sql__free_filters(filters, nfilt);
         return sql__err("can't use '*' with GROUP BY -- list the columns/aggregates you want");
@@ -1896,10 +2099,7 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     }
 
     if (!project_all) {
-        char proj_cols[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
-        for (uint32_t i = 0; i < nitems; i++)
-            snprintf(proj_cols[i], sizeof(proj_cols[0]), "%s", items[i].arg_col);
-        KdbStatus pst = sql__project_rows(rows, proj_cols, nitems);
+        KdbStatus pst = sql__project_rows(rows, items, nitems);
         if (pst != KDB_OK) { kdb_rows_free(rows); return pst; }
     }
 
