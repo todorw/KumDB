@@ -1280,6 +1280,130 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
     return sql__err("expected ADD [COLUMN] or DROP [COLUMN] after ALTER TABLE %s", table_name);
 }
 
+/* INSERT ... VALUES (...) ON CONFLICT (key_col, ...) DO NOTHING | DO UPDATE
+ * SET col = val, ... -- p is positioned at "ON", col_names/value_toks are
+ * the already-parsed (and not yet inserted) single VALUES tuple, ncols
+ * their shared length. table_name/db/affected_out are passed straight
+ * through from the caller.
+ *
+ * This engine has no real uniqueness enforcement (CREATE TABLE's UNIQUE/
+ * PRIMARY KEY only ever set the indexed flag -- see
+ * sql__parse_column_modifiers), so there's no constraint violation to
+ * react to the way real SQL's ON CONFLICT does. Instead, "conflict" here
+ * means "at least one row already matches every ON CONFLICT column's
+ * value", checked explicitly up front via kdb_count before touching
+ * storage either way. Since uniqueness genuinely isn't enforced, more
+ * than one row can match; DO UPDATE then updates all of them, same as
+ * any other filtered UPDATE would -- not the single-row guarantee real
+ * SQL's version has, and documented as such rather than pretending
+ * otherwise. */
+static KdbStatus sql__exec_insert_on_conflict(SqlParser *p, KumDB *db, const char *table_name,
+                                               char col_names[][KDB_SQL_IDENT_BUF], const SqlToken *value_toks,
+                                               uint32_t ncols, size_t *affected_out) {
+    sql__advance(p); /* ON */
+    if (!sql__kw_is(&p->cur, "CONFLICT")) return sql__err("expected CONFLICT after ON");
+    sql__advance(p);
+    if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after ON CONFLICT");
+    sql__advance(p);
+
+    char key_cols[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
+    uint32_t nkeys = 0;
+    for (;;) {
+        const char *kc;
+        if (!sql__ident_text(&p->cur, &kc)) return sql__err("expected a column name in ON CONFLICT (...)");
+        if (nkeys >= KDB_SQL_MAX_COLUMNS) return sql__err("too many ON CONFLICT columns (max %d)", KDB_SQL_MAX_COLUMNS);
+        snprintf(key_cols[nkeys++], sizeof(key_cols[0]), "%.255s", kc);
+        sql__advance(p);
+        if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+        break;
+    }
+    if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing the ON CONFLICT column list");
+    sql__advance(p);
+
+    char filter_bufs[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF * 2];
+    const char *filters[KDB_SQL_MAX_COLUMNS + 1];
+    for (uint32_t k = 0; k < nkeys; k++) {
+        int idx = -1;
+        for (uint32_t i = 0; i < ncols; i++) {
+            if (strcmp(col_names[i], key_cols[k]) == 0) { idx = (int)i; break; }
+        }
+        if (idx < 0) return sql__err("ON CONFLICT column '%s' isn't in the INSERT column list", key_cols[k]);
+        char *valtext = sql__value_text(&value_toks[idx]);
+        if (!valtext) return sql__err("unsupported value for ON CONFLICT column '%s'", key_cols[k]);
+        snprintf(filter_bufs[k], sizeof(filter_bufs[0]), "%.255s=%.255s", key_cols[k], valtext);
+        free(valtext);
+        filters[k] = filter_bufs[k];
+    }
+    filters[nkeys] = NULL;
+
+    int64_t existing = kdb_count(db, table_name, nkeys > 0 ? filters : NULL);
+    if (existing < 0) return kdb_last_status();
+
+    if (!sql__kw_is(&p->cur, "DO")) return sql__err("expected DO after ON CONFLICT (...)");
+    sql__advance(p);
+
+    if (sql__kw_is(&p->cur, "NOTHING")) {
+        sql__advance(p);
+        if (existing > 0) { if (affected_out) *affected_out = 0; return KDB_OK; }
+
+        KdbField fields[KDB_SQL_MAX_COLUMNS + 1];
+        for (uint32_t i = 0; i < ncols; i++) {
+            if (!sql__value_to_field(col_names[i], &value_toks[i], &fields[i]))
+                return sql__err("unsupported value for column '%s'", col_names[i]);
+        }
+        fields[ncols] = kdb_field_end();
+        KdbStatus st = kdb_add(db, table_name, fields);
+        if (st == KDB_OK && affected_out) *affected_out = 1;
+        return st;
+    }
+
+    if (!sql__kw_is(&p->cur, "UPDATE")) return sql__err("expected NOTHING or UPDATE after ON CONFLICT (...) DO");
+    sql__advance(p);
+    if (!sql__kw_is(&p->cur, "SET")) return sql__err("expected SET after ON CONFLICT (...) DO UPDATE");
+    sql__advance(p);
+
+    char set_names[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
+    SqlToken set_vals[KDB_SQL_MAX_COLUMNS];
+    uint32_t nset = 0;
+    for (;;) {
+        const char *cname;
+        if (!sql__ident_text(&p->cur, &cname)) return sql__err("expected a column name after SET");
+        if (nset >= KDB_SQL_MAX_COLUMNS) return sql__err("too many SET assignments (max %d)", KDB_SQL_MAX_COLUMNS);
+        snprintf(set_names[nset], sizeof(set_names[0]), "%.255s", cname);
+        sql__advance(p);
+        if (p->cur.type != SQLTOK_EQ) return sql__err("expected '=' after column '%s' in SET", set_names[nset]);
+        sql__advance(p);
+        set_vals[nset] = p->cur;
+        sql__advance(p);
+        nset++;
+        if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+        break;
+    }
+
+    if (existing > 0) {
+        KdbField patch[KDB_SQL_MAX_COLUMNS + 1];
+        for (uint32_t i = 0; i < nset; i++) {
+            if (!sql__value_to_field(set_names[i], &set_vals[i], &patch[i]))
+                return sql__err("unsupported value for column '%s' in SET", set_names[i]);
+        }
+        patch[nset] = kdb_field_end();
+        size_t updated = 0;
+        KdbStatus st = kdb_update(db, table_name, nkeys > 0 ? filters : NULL, patch, &updated);
+        if (st == KDB_OK && affected_out) *affected_out = updated;
+        return st;
+    }
+
+    KdbField fields[KDB_SQL_MAX_COLUMNS + 1];
+    for (uint32_t i = 0; i < ncols; i++) {
+        if (!sql__value_to_field(col_names[i], &value_toks[i], &fields[i]))
+            return sql__err("unsupported value for column '%s'", col_names[i]);
+    }
+    fields[ncols] = kdb_field_end();
+    KdbStatus st = kdb_add(db, table_name, fields);
+    if (st == KDB_OK && affected_out) *affected_out = 1;
+    return st;
+}
+
 static KdbStatus sql__exec_insert(SqlParser *p, KumDB *db, size_t *affected_out) {
     sql__advance(p); /* INSERT */
     if (!sql__kw_is(&p->cur, "INTO")) return sql__err("expected INTO after INSERT");
@@ -1365,8 +1489,13 @@ static KdbStatus sql__exec_insert(SqlParser *p, KumDB *db, size_t *affected_out)
      * there's no separate cap on how many rows one statement can carry
      * (only the per-row column cap already existed). Same no-automatic-
      * rollback behavior as INSERT ... SELECT above if a row partway
-     * through fails. */
+     * through fails. An ON CONFLICT clause is only supported when there's
+     * exactly one tuple (the overwhelmingly common upsert shape); it needs
+     * to inspect that tuple's values before deciding whether to insert or
+     * update at all, so the first tuple's insert is deliberately withheld
+     * until it's clear ON CONFLICT isn't coming right after it. */
     size_t affected = 0;
+    int first_tuple = 1;
     for (;;) {
         if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after VALUES");
         sql__advance(p);
@@ -1386,6 +1515,9 @@ static KdbStatus sql__exec_insert(SqlParser *p, KumDB *db, size_t *affected_out)
         if (ncols != nvals)
             return sql__err("column count (%u) doesn't match value count (%u) for '%s'", ncols, nvals, table_name);
 
+        if (first_tuple && sql__kw_is(&p->cur, "ON"))
+            return sql__exec_insert_on_conflict(p, db, table_name, col_names, value_toks, ncols, affected_out);
+
         KdbField fields[KDB_SQL_MAX_COLUMNS + 1];
         for (uint32_t i = 0; i < ncols; i++) {
             if (!sql__value_to_field(col_names[i], &value_toks[i], &fields[i]))
@@ -1396,10 +1528,14 @@ static KdbStatus sql__exec_insert(SqlParser *p, KumDB *db, size_t *affected_out)
         KdbStatus st = kdb_add(db, table_name, fields);
         if (st != KDB_OK) { if (affected_out) *affected_out = affected; return st; }
         affected++;
+        first_tuple = 0;
 
         if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
         break;
     }
+
+    if (sql__kw_is(&p->cur, "ON"))
+        return sql__err("ON CONFLICT is only supported with a single-row VALUES list, not a multi-row INSERT");
 
     if (affected_out) *affected_out = affected;
     return KDB_OK;

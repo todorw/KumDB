@@ -142,6 +142,105 @@ static void test_multi_row_insert_and_insert_select(void) {
     teardown(db);
 }
 
+static void test_upsert(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE users (email TEXT, name TEXT, visits INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO users (email, name, visits) VALUES ('a@x.com', 'Alice', 1)"));
+
+    KdbRows *rows = NULL;
+    size_t affected = 0;
+
+    /* ON CONFLICT DO UPDATE against an existing row */
+    ASSERT_OK(kdb_exec_sql(db,
+        "INSERT INTO users (email, name, visits) VALUES ('a@x.com', 'Alice2', 2) "
+        "ON CONFLICT (email) DO UPDATE SET name = 'Alice2', visits = 2",
+        NULL, &affected));
+    ASSERT_EQ(affected, 1u);
+    ASSERT_EQ(kdb_count(db, "users", NULL), 1); /* still one row -- updated, not inserted */
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name, visits FROM users WHERE email = 'a@x.com'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *name = NULL;
+        int64_t visits = 0;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &name));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "visits", &visits));
+        ASSERT_STR(name, "Alice2");
+        ASSERT_EQ(visits, 2);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* ON CONFLICT DO UPDATE with no existing match falls back to insert */
+    affected = 0;
+    ASSERT_OK(kdb_exec_sql(db,
+        "INSERT INTO users (email, name, visits) VALUES ('b@x.com', 'Bob', 1) "
+        "ON CONFLICT (email) DO UPDATE SET name = 'Bob', visits = 1",
+        NULL, &affected));
+    ASSERT_EQ(affected, 1u);
+    ASSERT_EQ(kdb_count(db, "users", NULL), 2);
+
+    /* ON CONFLICT DO NOTHING against an existing row is a true no-op */
+    affected = 999;
+    ASSERT_OK(kdb_exec_sql(db,
+        "INSERT INTO users (email, name, visits) VALUES ('a@x.com', 'ShouldNotAppear', 99) ON CONFLICT (email) DO NOTHING",
+        NULL, &affected));
+    ASSERT_EQ(affected, 0u);
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM users WHERE email = 'a@x.com'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &name));
+        ASSERT_STR(name, "Alice2"); /* unchanged */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* ON CONFLICT DO NOTHING with no existing match still inserts */
+    affected = 0;
+    ASSERT_OK(kdb_exec_sql(db,
+        "INSERT INTO users (email, name, visits) VALUES ('c@x.com', 'Carol', 1) ON CONFLICT (email) DO NOTHING",
+        NULL, &affected));
+    ASSERT_EQ(affected, 1u);
+    ASSERT_EQ(kdb_count(db, "users", NULL), 3);
+
+    /* multi-column conflict key */
+    ASSERT_OK(sql(db, "CREATE TABLE inv (warehouse TEXT, sku TEXT, qty INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO inv (warehouse, sku, qty) VALUES ('w1', 's1', 5)"));
+    affected = 0;
+    ASSERT_OK(kdb_exec_sql(db,
+        "INSERT INTO inv (warehouse, sku, qty) VALUES ('w1', 's1', 10) "
+        "ON CONFLICT (warehouse, sku) DO UPDATE SET qty = 10",
+        NULL, &affected));
+    ASSERT_EQ(affected, 1u);
+    ASSERT_EQ(kdb_count(db, "inv", NULL), 1);
+
+    /* same warehouse, different sku -- doesn't conflict, a fresh insert */
+    affected = 0;
+    ASSERT_OK(kdb_exec_sql(db,
+        "INSERT INTO inv (warehouse, sku, qty) VALUES ('w1', 's2', 3) "
+        "ON CONFLICT (warehouse, sku) DO UPDATE SET qty = 3",
+        NULL, &affected));
+    ASSERT_EQ(affected, 1u);
+    ASSERT_EQ(kdb_count(db, "inv", NULL), 2);
+
+    /* ON CONFLICT with a multi-row VALUES list is rejected */
+    ASSERT_ERR(sql(db,
+        "INSERT INTO users (email, name, visits) VALUES ('d@x.com','D',1),('e@x.com','E',1) ON CONFLICT (email) DO NOTHING"));
+
+    /* an ON CONFLICT column that isn't in the INSERT column list errors */
+    ASSERT_ERR(sql(db,
+        "INSERT INTO users (email, name, visits) VALUES ('f@x.com','F',1) ON CONFLICT (nonexistent_col) DO NOTHING"));
+
+    /* plain multi-row INSERT (no ON CONFLICT) still works unchanged */
+    affected = 0;
+    ASSERT_OK(kdb_exec_sql(db,
+        "INSERT INTO users (email, name, visits) VALUES ('g@x.com','G',1), ('h@x.com','H',1)",
+        NULL, &affected));
+    ASSERT_EQ(affected, 2u);
+
+    teardown(db);
+}
+
 static void test_projection(void) {
     KumDB *db;
     setup(&db);
@@ -2221,6 +2320,7 @@ int main(void) {
 
     test_create_insert_select();
     test_multi_row_insert_and_insert_select();
+    test_upsert();
     test_projection();
     test_limit_offset();
     test_multi_column_order_by();

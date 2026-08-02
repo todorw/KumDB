@@ -24,6 +24,7 @@ extern "C" {
  *   DROP VIEW v
  *   INSERT INTO t (col, ...) VALUES (val, ...) [, (val, ...)]*
  *   INSERT INTO t (col, ...) SELECT ...
+ *   INSERT INTO t (col, ...) VALUES (val, ...) ON CONFLICT (col, ...) DO NOTHING | DO UPDATE SET col = val, ...
  *   [WITH name AS (SELECT ...) [, name2 AS (SELECT ...)]*]
  *   SELECT [DISTINCT] * | item, ... FROM t [[AS] alias]
  *                               [[INNER|LEFT [OUTER]|RIGHT [OUTER]|FULL [OUTER]|CROSS] JOIN t2 [[AS] alias2] [ON a.col OP (b.col|literal) [AND ...]]]*
@@ -42,9 +43,23 @@ extern "C" {
  * order. INSERT INTO t (cols) SELECT ... inserts one row per SELECT
  * result row instead, matching to (cols) by position (not name) -- column
  * counts must match, checked before anything is inserted. Either form: a
- * row partway through that fails to insert (a uniqueness violation, say)
- * leaves whatever already succeeded committed rather than rolling back --
- * no implicit per-statement transaction wrapping here.
+ * row partway through that fails to insert leaves whatever already
+ * succeeded committed rather than rolling back -- no implicit
+ * per-statement transaction wrapping here.
+ *
+ * ON CONFLICT (cols) DO NOTHING / DO UPDATE SET col = val, ... turns a
+ * single-row VALUES insert into an upsert (rejected after a multi-row
+ * VALUES list). KumDB has no real uniqueness enforcement to react to the
+ * way real SQL's ON CONFLICT does (CREATE TABLE's UNIQUE/PRIMARY KEY only
+ * ever mark a column indexed), so "conflict" here means checking, before
+ * inserting anything, whether a row already matches every named column's
+ * value -- DO NOTHING leaves things as they are if so (0 affected); DO
+ * UPDATE SET updates it, or all of them if more than one matches (since
+ * uniqueness isn't enforced, that's possible, and every match gets the
+ * same SET, same as any other filtered UPDATE). No match either way falls
+ * back to a plain insert. Every ON CONFLICT column must be one of the
+ * INSERT's own target columns; DO UPDATE SET's values are literals, same
+ * as a plain UPDATE's SET (no referencing the row about to be inserted).
  *
  * ORDER BY (top-level, not OVER's own) takes one or more comma-separated
  * columns, each with its own optional ASC/DESC, ties broken left to right

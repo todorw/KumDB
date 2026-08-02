@@ -320,6 +320,7 @@ DROP VIEW v
 
 INSERT INTO t (col, ...) VALUES (val, ...) [, (val, ...)]*
 INSERT INTO t (col, ...) SELECT ...
+INSERT INTO t (col, ...) VALUES (val, ...) ON CONFLICT (col, ...) DO NOTHING | DO UPDATE SET col = val, ...
 
 [WITH name AS (SELECT ...) [, name2 AS (SELECT ...)]*]
 SELECT [DISTINCT] * | item, ... FROM t | (SELECT ...) [[AS] alias]
@@ -345,14 +346,43 @@ statement" error the missing content after it would've caused anyway.
 VALUES (...)`, never a bare `INSERT INTO t VALUES (...)`. `VALUES` accepts
 more than one comma-separated tuple in one statement — `VALUES (1, 'a'),
 (2, 'b'), (3, 'c')` — each inserted as its own row, in order; if one
-partway through fails (a uniqueness violation, say), whatever came before
-it stays inserted rather than rolling back the whole statement, since
-there's no implicit per-statement transaction wrapping here (wrap it in
-an explicit transaction yourself if that matters). `INSERT INTO t (a, b)
-SELECT ...` inserts one row per row the `SELECT` returns instead, matching
-its projected columns to `(a, b)` by position, not by name — the column
-counts must match, checked before anything is inserted. Same no-rollback
-behavior if a row partway through the `SELECT`'s results fails to insert.
+partway through fails, whatever came before it stays inserted rather than
+rolling back the whole statement, since there's no implicit per-statement
+transaction wrapping here (wrap it in an explicit transaction yourself if
+that matters). `INSERT INTO t (a, b) SELECT ...` inserts one row per row
+the `SELECT` returns instead, matching its projected columns to `(a, b)`
+by position, not by name — the column counts must match, checked before
+anything is inserted. Same no-rollback behavior if a row partway through
+the `SELECT`'s results fails to insert.
+
+**`ON CONFLICT (col, ...) DO NOTHING`/`DO UPDATE SET ...`** turns a
+single-row `VALUES` insert into an upsert — only single-row, an `ON
+CONFLICT` after a multi-row `VALUES` list is rejected. KumDB has no real
+uniqueness enforcement to react to the way real SQL's `ON CONFLICT`
+does — `CREATE TABLE`'s `UNIQUE`/`PRIMARY KEY` only ever mark a column
+indexed (see the `CREATE TABLE` section), never reject a duplicate value
+— so "conflict" here means something more direct: before inserting
+anything, it checks whether a row already matches every named column's
+value. If one does, `DO NOTHING` leaves things exactly as they are (0
+rows affected) and `DO UPDATE SET ...` updates it (or all of them —
+since uniqueness genuinely isn't enforced, more than one row can match,
+and every match gets the same `SET`, same as any other filtered
+`UPDATE`). If none matches, both forms fall back to a plain insert:
+
+```sql
+INSERT INTO users (email, name, visits) VALUES ('a@x.com', 'Alice', 1)
+    ON CONFLICT (email) DO UPDATE SET name = 'Alice', visits = 1
+
+INSERT INTO users (email, name) VALUES ('b@x.com', 'Bob')
+    ON CONFLICT (email) DO NOTHING
+```
+
+Every `ON CONFLICT` column must actually be one of the `INSERT`'s own
+target columns (its value comes from that same `VALUES` tuple) — more
+than one column is fine, checked together as a conjunction, same
+"multi-column key" idea a real composite unique index would give you.
+`DO UPDATE SET`'s values are literals, same as a plain `UPDATE`'s `SET`
+(no referencing the row that was about to be inserted).
 
 ```sql
 INSERT INTO sales (region, amount) VALUES ('east', 100.0), ('west', 50.0)
