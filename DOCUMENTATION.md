@@ -475,17 +475,21 @@ column's type. No window functions.
 
 **`CASE`** as a `SELECT` item: `CASE WHEN cond THEN val [WHEN cond THEN
 val ...] [ELSE val] END`. First matching `WHEN` wins; with no `ELSE` and
-no match, the value is `NULL`. Each `WHEN` condition is a single
-`WHERE`-style condition (same operators: `=`, `BETWEEN`, `IN`, `LIKE`,
-`IS NULL`, etc) — no `AND`/`OR` combining multiple conditions within one
-`WHEN`, and no more than 4 `WHEN` branches. `THEN`/`ELSE` values are
-literals (number, string, `true`/`false`, `null`) evaluated once at parse
-time, not column references. Works fine after a `JOIN` (conditions can
-reference qualified columns like any other `WHERE`-style condition), but
-not combined with `GROUP BY` or aggregate functions:
+no match, the value is `NULL`. Each `WHEN` condition is one or more
+`WHERE`-style conditions (same operators: `=`, `BETWEEN`, `IN`, `LIKE`,
+`IS NULL`, etc) combined with `AND`/`OR` — same precedence as `WHERE`
+(`AND` binds tighter), but no parens within one `WHEN` and no more than 3
+conditions per `WHEN`; no more than 4 `WHEN` branches either. `THEN`/`ELSE`
+values are literals (number, string, `true`/`false`, `null`) evaluated
+once at parse time, not column references. Works fine after a `JOIN`
+(conditions can reference qualified columns like any other `WHERE`-style
+condition), but not combined with `GROUP BY` or aggregate functions:
 
 ```sql
 SELECT name, CASE WHEN age < 18 THEN 'minor' WHEN age < 65 THEN 'adult' ELSE 'senior' END AS category
+    FROM people
+
+SELECT name, CASE WHEN age >= 18 AND age < 65 THEN 'adult' ELSE 'other' END AS category
     FROM people
 ```
 

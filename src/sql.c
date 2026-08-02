@@ -1301,15 +1301,23 @@ static void sql__free_row_fields(KdbRow *row) {
 
 typedef enum { SQL_AGG_NONE, SQL_AGG_COUNT, SQL_AGG_SUM, SQL_AGG_AVG, SQL_AGG_MIN, SQL_AGG_MAX } SqlAggFn;
 
-#define KDB_SQL_MAX_CASE_BRANCHES 4
-#define KDB_SQL_CASE_VAL_BUF      512
+#define KDB_SQL_MAX_CASE_BRANCHES  4
+#define KDB_SQL_CASE_VAL_BUF       512
+#define KDB_SQL_MAX_CASE_SUBCONDS  3
 
-/* A CASE branch's value is a literal, resolved once at parse time -- not a
- * heap pointer, so a SqlSelectItem carrying one stays plain-old-data and
- * every early return in sql__exec_select_core (there are a lot of them)
- * stays automatically safe with no new cleanup path to audit. */
+/* A CASE branch's value is a literal, resolved once at parse time, and its
+ * WHEN condition -- despite now allowing AND/OR -- is still a small fixed
+ * array of filter strings (same "OR:"-prefixed OR'd-AND-groups convention
+ * WHERE used before the condition-tree rewrite), not a heap-allocated
+ * tree: neither is a heap pointer, so a SqlSelectItem carrying one stays
+ * plain-old-data and every early return in sql__exec_select_core (there
+ * are a lot of them) stays automatically safe with no new cleanup path to
+ * audit. No parens within one WHEN -- that would need the tree, which
+ * would need the heap; AND/OR-of-plain-conditions covers the documented
+ * gap without paying that cost. */
 typedef struct {
-    char         cond_filter[KDB_SQL_IDENT_BUF]; /* WHEN condition, filter-string form (reuses sql__parse_condition) */
+    char         cond_filters[KDB_SQL_MAX_CASE_SUBCONDS][KDB_SQL_IDENT_BUF]; /* WHEN condition(s), filter-string form */
+    int          n_cond_filters;
     KdbFieldType then_type;
     int64_t      then_int;
     double       then_float;
@@ -1387,9 +1395,13 @@ static int sql__case_value_from_token(const SqlToken *t, KdbFieldType *type_out,
 }
 
 /* CASE WHEN cond THEN val [WHEN cond THEN val ...] [ELSE val] END. Each
- * WHEN condition is a single WHERE-style condition (reuses
- * sql__parse_condition -- same operators: =, BETWEEN, IN, LIKE, IS NULL,
- * etc), no AND/OR within one WHEN. p is positioned at "CASE". */
+ * WHEN condition is one or more WHERE-style conditions (reuses
+ * sql__parse_condition for each -- same operators: =, BETWEEN, IN, LIKE,
+ * IS NULL, etc) combined with AND/OR, same precedence and "OR:"-prefixed
+ * OR'd-AND-groups convention as WHERE used before its condition-tree
+ * rewrite -- no parens within one WHEN, and no more than
+ * KDB_SQL_MAX_CASE_SUBCONDS of them (see SqlCaseBranch). p is positioned
+ * at "CASE". */
 static int sql__parse_case_item(SqlParser *p, KumDB *db, SqlSelectItem *item) {
     sql__advance(p); /* CASE */
     item->is_case = 1;
@@ -1405,10 +1417,24 @@ static int sql__parse_case_item(SqlParser *p, KumDB *db, SqlSelectItem *item) {
         }
         SqlCaseBranch *br = &item->case_branches[item->n_case_branches];
 
-        char *cond = sql__parse_condition(p, db);
-        if (!cond) return 0;
-        snprintf(br->cond_filter, sizeof(br->cond_filter), "%s", cond);
-        free(cond);
+        int start_new_group = 0;
+        for (;;) {
+            if (br->n_cond_filters >= KDB_SQL_MAX_CASE_SUBCONDS) {
+                sql__err("too many conditions in one CASE WHEN (max %d)", KDB_SQL_MAX_CASE_SUBCONDS);
+                return 0;
+            }
+            char *cond = sql__parse_condition(p, db);
+            if (!cond) return 0;
+            if (start_new_group) snprintf(br->cond_filters[br->n_cond_filters], sizeof(br->cond_filters[0]), "OR:%s", cond);
+            else                 snprintf(br->cond_filters[br->n_cond_filters], sizeof(br->cond_filters[0]), "%s", cond);
+            free(cond);
+            br->n_cond_filters++;
+            start_new_group = 0;
+
+            if (sql__kw_is(&p->cur, "OR"))  { sql__advance(p); start_new_group = 1; continue; }
+            if (sql__kw_is(&p->cur, "AND")) { sql__advance(p); continue; }
+            break;
+        }
 
         if (!sql__kw_is(&p->cur, "THEN")) { sql__err("expected THEN after a CASE WHEN condition"); return 0; }
         sql__advance(p);
@@ -1809,6 +1835,25 @@ static void sql__filter_rows_tree(KumDB *db, const char *outer_alias, KdbRows *r
     rows->count = kept;
 }
 
+/* Same AND-within-group / OR-across-groups semantics the pre-condition-
+ * tree WHERE parser's "OR:" convention encoded (see sql__parse_case_item):
+ * a row matches a WHEN if ANY group's conditions are ALL true. */
+static int sql__case_branch_matches(const KdbRow *row, const SqlCaseBranch *br) {
+    int group_ok = 1;
+    int result = 0;
+    for (int i = 0; i < br->n_cond_filters; i++) {
+        SqlRowCond c;
+        if (!sql__parse_row_cond(br->cond_filters[i], &c)) return 0;
+        if (c.is_or_start && i > 0) {
+            if (group_ok) result = 1;
+            group_ok = 1;
+        }
+        if (!sql__row_cond_matches(row, &c)) group_ok = 0;
+    }
+    if (group_ok) result = 1;
+    return result;
+}
+
 /* Evaluates one already-parsed CASE item against a specific row -- first
  * matching WHEN wins (same short-circuit order as real SQL), ELSE (or
  * NULL if there's no ELSE) otherwise. Writes straight into *out, which the
@@ -1817,9 +1862,7 @@ static void sql__filter_rows_tree(KumDB *db, const char *outer_alias, KdbRows *r
 static int sql__eval_case_item(const SqlSelectItem *item, const KdbRow *row, KdbField *out) {
     for (int i = 0; i < item->n_case_branches; i++) {
         const SqlCaseBranch *br = &item->case_branches[i];
-        SqlRowCond cond;
-        if (!sql__parse_row_cond(br->cond_filter, &cond)) continue;
-        if (!sql__row_cond_matches(row, &cond)) continue;
+        if (!sql__case_branch_matches(row, br)) continue;
 
         out->type = br->then_type;
         switch (br->then_type) {

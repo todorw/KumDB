@@ -78,11 +78,12 @@ extern "C" {
  *
  * CASE (as a SELECT item): "CASE WHEN cond THEN val [WHEN cond THEN val
  * ...] [ELSE val] END". First matching WHEN wins; NULL if nothing matches
- * and there's no ELSE. Each WHEN condition is a single WHERE-style
- * condition (same operators, no AND/OR combining multiple within one
- * WHEN), up to 4 branches. THEN/ELSE values are literals, resolved once at
- * parse time -- not column references. Works fine after a JOIN (conditions
- * can reference qualified columns), not combined with GROUP BY/aggregates.
+ * and there's no ELSE. Each WHEN condition is one or more WHERE-style
+ * conditions (same operators) combined with AND/OR, same precedence as
+ * WHERE -- no parens within one WHEN, max 3 conditions per WHEN, max 4
+ * WHEN branches. THEN/ELSE values are literals, resolved once at parse
+ * time -- not column references. Works fine after a JOIN (conditions can
+ * reference qualified columns), not combined with GROUP BY/aggregates.
  *
  * DISTINCT dedupes the result by the exact selected columns, after
  * projection. UNION/UNION ALL chain multiple SELECTs (same column count

@@ -850,6 +850,57 @@ static void test_case_when(void) {
     }
     if (rows) { kdb_rows_free(rows); rows = NULL; }
 
+    /* AND within one WHEN */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name, CASE WHEN age >= 18 AND age < 65 THEN 'adult' ELSE 'other' END AS category "
+        "FROM people ORDER BY name ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        const char *c0 = NULL, *c1 = NULL, *c2 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "category", &c0)); /* alice, 10 */
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "category", &c1)); /* bob, 25 */
+        ASSERT_OK(kdb_row_get_string(&rows->rows[2], "category", &c2)); /* carol, 70 */
+        ASSERT_STR(c0, "other");
+        ASSERT_STR(c1, "adult");
+        ASSERT_STR(c2, "other");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* OR within one WHEN */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name, CASE WHEN age < 18 OR age >= 65 THEN 'edge' ELSE 'middle' END AS category "
+        "FROM people ORDER BY name ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        const char *c0 = NULL, *c1 = NULL, *c2 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "category", &c0)); /* alice, 10 */
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "category", &c1)); /* bob, 25 */
+        ASSERT_OK(kdb_row_get_string(&rows->rows[2], "category", &c2)); /* carol, 70 */
+        ASSERT_STR(c0, "edge");
+        ASSERT_STR(c1, "middle");
+        ASSERT_STR(c2, "edge");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* mixing AND/OR in one WHEN -- AND binds tighter, same as WHERE */
+    ASSERT_OK(sql(db, "INSERT INTO depts (person, dept) VALUES ('bob', 'sales')"));
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT p.name, CASE WHEN d.dept = 'eng' AND p.age > 60 OR d.dept = 'sales' THEN 'match' ELSE 'no' END AS c "
+        "FROM people AS p JOIN depts AS d ON p.name = d.person ORDER BY p.name ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const char *c0 = NULL, *c1 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "c", &c0)); /* alice/eng, age 10 -> no */
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "c", &c1)); /* bob/sales -> match */
+        ASSERT_STR(c0, "no");
+        ASSERT_STR(c1, "match");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* too many sub-conditions in one WHEN is rejected, not silently truncated */
+    ASSERT_ERR(sql(db, "SELECT CASE WHEN age > 1 AND age > 2 AND age > 3 AND age > 4 THEN 'x' END FROM people"));
+
     /* CASE combined with GROUP BY/aggregates is rejected */
     ASSERT_ERR(sql(db, "SELECT CASE WHEN age < 18 THEN 'x' END, COUNT(*) FROM people GROUP BY age"));
 
