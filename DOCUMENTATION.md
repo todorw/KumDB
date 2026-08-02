@@ -313,7 +313,7 @@ INSERT INTO t (col, ...) VALUES (val, ...)
 SELECT [DISTINCT] * | item, ... FROM t [[AS] alias]
     [[INNER|LEFT [OUTER]] JOIN t2 [[AS] alias2] ON a.col = b.col [AND ...]]*
     [WHERE cond [AND|OR cond ...]]
-    [GROUP BY col]
+    [GROUP BY col, ...]
     [HAVING cond [AND|OR cond ...]]
     [UNION [ALL] SELECT ...]*
     [ORDER BY col [ASC|DESC]]
@@ -398,12 +398,13 @@ counts this engine targets, not something to reach for on huge tables.
 `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` —
 optionally renamed with `AS alias` (default alias is e.g. `SUM(amount)`).
 Without `GROUP BY`, one or more aggregate items collapse the result into a
-single summary row. With `GROUP BY col`, you get one row per distinct value
-of `col`; every other selected item must be an aggregate call — same rule
-real SQL uses. `SELECT col FROM t GROUP BY col` with no aggregate at all is
-a valid way to get distinct values. `SUM`/`AVG` always come back as `FLOAT`
-regardless of the source column's type. No grouping by more than one
-column, no window functions.
+single summary row. `GROUP BY` takes one or more comma-separated columns —
+`GROUP BY region` or `GROUP BY region, product` — and you get one row per
+distinct combination of values across all of them; every other selected
+item must be an aggregate call — same rule real SQL uses. `SELECT col FROM
+t GROUP BY col` with no aggregate at all is a valid way to get distinct
+values. `SUM`/`AVG` always come back as `FLOAT` regardless of the source
+column's type. No window functions.
 
 **`HAVING`** filters the aggregated/grouped output (same condition syntax
 as `WHERE`, evaluated against the SELECT list's aliases -- `HAVING total >

@@ -1104,10 +1104,14 @@ static void sql__filter_rows(KdbRows *rows, char *const *filters, int nfilt) {
     rows->count = kept;
 }
 
-#define KDB_SQL_MAX_GROUPS 512
+#define KDB_SQL_MAX_GROUPS     512
+#define KDB_SQL_MAX_GROUP_COLS 8
 
 typedef struct {
-    const KdbField *key_ref;   /* group-by column's value, pointing into the source rows; NULL = missing/null bucket */
+    /* one group-by column's value per slot, pointing into the source
+     * rows; NULL = that column was missing/null on this group's rows.
+     * Only the first ngroup_cols slots are used. */
+    const KdbField *key_refs[KDB_SQL_MAX_GROUP_COLS];
     size_t          row_count;
     double          sum[KDB_SQL_MAX_COLUMNS];
     size_t          count_nonnull[KDB_SQL_MAX_COLUMNS];
@@ -1116,11 +1120,11 @@ typedef struct {
 } SqlGroupAcc;
 
 /* One row per group (or one summary row if there's no GROUP BY), one field
- * per SELECT item. 'all' must stay alive for the whole call -- group key
+ * per SELECT item. 'all' must stay alive for the whole call -- group keys
  * and MIN/MAX tracking hold pointers into its row data until the final
  * copy at the end. */
 static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uint32_t nitems,
-                                         int has_group_by, const char *group_col,
+                                         char group_cols[][KDB_SQL_IDENT_BUF], int ngroup_cols,
                                          KdbRows **out) {
     SqlGroupAcc *groups = (SqlGroupAcc *)calloc(KDB_SQL_MAX_GROUPS, sizeof(SqlGroupAcc));
     if (!groups) { kdb_err_oom("aggregate groups"); return KDB_ERR_OOM; }
@@ -1128,16 +1132,21 @@ static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uin
 
     for (size_t r = 0; r < all->count; r++) {
         KdbRow *row = &all->rows[r];
-        const KdbField *key_ref = has_group_by ? kdb_row_get(row, group_col) : NULL;
+        const KdbField *key_refs[KDB_SQL_MAX_GROUP_COLS];
+        for (int k = 0; k < ngroup_cols; k++) key_refs[k] = kdb_row_get(row, group_cols[k]);
 
         uint32_t gi;
-        if (!has_group_by) {
+        if (ngroup_cols == 0) {
             gi = 0;
             if (ngroups == 0) ngroups = 1;
         } else {
             int found = 0;
             for (gi = 0; gi < ngroups; gi++) {
-                if (sql__field_equal(groups[gi].key_ref, key_ref)) { found = 1; break; }
+                int all_match = 1;
+                for (int k = 0; k < ngroup_cols; k++) {
+                    if (!sql__field_equal(groups[gi].key_refs[k], key_refs[k])) { all_match = 0; break; }
+                }
+                if (all_match) { found = 1; break; }
             }
             if (!found) {
                 if (ngroups >= KDB_SQL_MAX_GROUPS) {
@@ -1146,7 +1155,7 @@ static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uin
                     return KDB_ERR_SQL_SYNTAX;
                 }
                 gi = ngroups++;
-                groups[gi].key_ref = key_ref;
+                for (int k = 0; k < ngroup_cols; k++) groups[gi].key_refs[k] = key_refs[k];
             }
         }
 
@@ -1184,7 +1193,7 @@ static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uin
         }
     }
 
-    if (!has_group_by && ngroups == 0) ngroups = 1; /* no matching rows: still emit one summary row */
+    if (ngroup_cols == 0 && ngroups == 0) ngroups = 1; /* no matching rows: still emit one summary row */
 
     KdbRows *result = (KdbRows *)calloc(1, sizeof(KdbRows));
     if (!result) { free(groups); kdb_err_oom("aggregate result"); return KDB_ERR_OOM; }
@@ -1213,10 +1222,15 @@ static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uin
 
             int copy_ok = 1;
             switch (items[it].fn) {
-                case SQL_AGG_NONE:
-                    if (g->key_ref) { of->type = g->key_ref->type; copy_ok = sql__copy_field_value(of, g->key_ref); }
-                    else            { of->type = KDB_TYPE_NULL; }
+                case SQL_AGG_NONE: {
+                    const KdbField *key_ref = NULL;
+                    for (int k = 0; k < ngroup_cols; k++) {
+                        if (strcmp(items[it].arg_col, group_cols[k]) == 0) { key_ref = g->key_refs[k]; break; }
+                    }
+                    if (key_ref) { of->type = key_ref->type; copy_ok = sql__copy_field_value(of, key_ref); }
+                    else         { of->type = KDB_TYPE_NULL; }
                     break;
+                }
                 case SQL_AGG_COUNT:
                     of->type = KDB_TYPE_INT;
                     of->v.as_int = (int64_t)(strcmp(items[it].arg_col, "*") == 0 ? g->row_count : g->count_nonnull[it]);
@@ -1794,18 +1808,23 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     int   nfilt = 0;
     if (!sql__parse_where(p, db, filters, &nfilt)) return kdb_last_status();
 
-    char group_col[KDB_SQL_IDENT_BUF] = "";
-    int  has_group_by = 0;
+    char group_cols[KDB_SQL_MAX_GROUP_COLS][KDB_SQL_IDENT_BUF];
+    int  ngroup_cols = 0;
     if (sql__kw_is(&p->cur, "GROUP")) {
         sql__advance(p);
         if (!sql__kw_is(&p->cur, "BY")) { sql__free_filters(filters, nfilt); return sql__err("expected BY after GROUP"); }
         sql__advance(p);
-        const char *gcol;
-        if (!sql__ident_text(&p->cur, &gcol)) { sql__free_filters(filters, nfilt); return sql__err("expected a column name after GROUP BY"); }
-        snprintf(group_col, sizeof(group_col), "%.255s", gcol);
-        has_group_by = 1;
-        sql__advance(p);
+        for (;;) {
+            const char *gcol;
+            if (!sql__ident_text(&p->cur, &gcol)) { sql__free_filters(filters, nfilt); return sql__err("expected a column name after GROUP BY"); }
+            if (ngroup_cols >= KDB_SQL_MAX_GROUP_COLS) { sql__free_filters(filters, nfilt); return sql__err("too many GROUP BY columns (max %d)", KDB_SQL_MAX_GROUP_COLS); }
+            snprintf(group_cols[ngroup_cols++], sizeof(group_cols[0]), "%.255s", gcol);
+            sql__advance(p);
+            if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+            break;
+        }
     }
+    int has_group_by = ngroup_cols > 0;
 
     if (has_join && (has_aggregate || has_group_by)) {
         sql__free_filters(filters, nfilt);
@@ -1818,8 +1837,12 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     }
     if (!project_all && (has_aggregate || has_group_by)) {
         for (uint32_t i = 0; i < nitems; i++) {
-            if (items[i].fn == SQL_AGG_NONE &&
-                (!has_group_by || strcmp(items[i].arg_col, group_col) != 0)) {
+            if (items[i].fn != SQL_AGG_NONE) continue;
+            int in_group_by = 0;
+            for (int k = 0; k < ngroup_cols; k++) {
+                if (strcmp(items[i].arg_col, group_cols[k]) == 0) { in_group_by = 1; break; }
+            }
+            if (!in_group_by) {
                 sql__free_filters(filters, nfilt);
                 return sql__err("column '%s' must appear in GROUP BY or be used inside an aggregate function",
                                 items[i].arg_col);
@@ -1847,7 +1870,7 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
         if (!all) { sql__free_filters(having_filters, nhaving); return kdb_last_status(); }
 
         KdbRows *agg = NULL;
-        KdbStatus ast = sql__compute_aggregates(all, items, nitems, has_group_by, group_col, &agg);
+        KdbStatus ast = sql__compute_aggregates(all, items, nitems, group_cols, ngroup_cols, &agg);
         kdb_rows_free(all);
         if (ast != KDB_OK) { sql__free_filters(having_filters, nhaving); return ast; }
 

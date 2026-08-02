@@ -21,7 +21,7 @@ extern "C" {
  *   SELECT [DISTINCT] * | item, ... FROM t [[AS] alias]
  *                               [[INNER|LEFT [OUTER]] JOIN t2 [[AS] alias2] ON a.col = b.col [AND ...]]*
  *                               [WHERE cond [AND|OR cond ...]]
- *                               [GROUP BY col]
+ *                               [GROUP BY col, ...]
  *                               [HAVING cond [AND|OR cond ...]]
  *                               [UNION [ALL] SELECT ...]*
  *                               [ORDER BY col [ASC|DESC]]
@@ -36,14 +36,14 @@ extern "C" {
  * COUNT(*)/COUNT(col)/SUM(col)/AVG(col)/MIN(col)/MAX(col) -- optionally
  * renamed with "AS alias" (default alias is e.g. "SUM(amount)"). Without
  * GROUP BY, one or more aggregate items collapse the whole result into a
- * single summary row. With GROUP BY col, you get one row per distinct
- * value of col; every other selected item must be an aggregate call (same
- * rule SQL uses -- a plain column that isn't the GROUP BY column is
- * rejected). "SELECT col FROM t GROUP BY col" with no aggregate at all
- * is a valid way to get distinct values. SUM/AVG always come back as
- * FLOAT regardless of the source column's type. HAVING filters the
- * aggregated output (needs GROUP BY or an aggregate item). No grouping by
- * more than one column, no window functions.
+ * single summary row. GROUP BY takes one or more comma-separated columns;
+ * you get one row per distinct combination of values across all of them.
+ * Every other selected item must be an aggregate call (same rule SQL uses
+ * -- a plain column that isn't one of the GROUP BY columns is rejected).
+ * "SELECT col FROM t GROUP BY col" with no aggregate at all is a valid way
+ * to get distinct values. SUM/AVG always come back as FLOAT regardless of
+ * the source column's type. HAVING filters the aggregated output (needs
+ * GROUP BY or an aggregate item). No window functions.
  *
  * JOIN (INNER or LEFT) matches rows via a conjunction of col = col
  * equalities in ON (no OR, no comparing to a literal there -- that's what

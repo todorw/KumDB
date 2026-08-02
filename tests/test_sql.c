@@ -280,6 +280,46 @@ static void test_group_by_and_aggregates(void) {
     teardown(db);
 }
 
+static void test_multi_column_group_by(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE sales (region TEXT, product TEXT, amount FLOAT)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, product, amount) VALUES ('east', 'a', 100.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, product, amount) VALUES ('east', 'a', 50.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, product, amount) VALUES ('east', 'b', 30.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, product, amount) VALUES ('west', 'a', 10.0)"));
+
+    KdbRows *rows = NULL;
+
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT region, product, SUM(amount) AS total FROM sales GROUP BY region, product ORDER BY total DESC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        const char *region = NULL, *product = NULL;
+        double total = 0;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "region", &region));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "product", &product));
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "total", &total));
+        ASSERT_STR(region, "east");
+        ASSERT_STR(product, "a");
+        ASSERT(total > 149.9 && total < 150.1); /* 100 + 50 */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* HAVING on top of a multi-column GROUP BY */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT region, product, SUM(amount) AS total FROM sales GROUP BY region, product HAVING total > 40",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* a selected column that's in neither GROUP BY list nor an aggregate is still rejected */
+    ASSERT_ERR(sql(db, "SELECT region, product, amount FROM sales GROUP BY region, product"));
+
+    teardown(db);
+}
+
 static void test_having(void) {
     KumDB *db;
     setup(&db);
@@ -745,6 +785,7 @@ int main(void) {
     test_where_operators();
     test_or();
     test_group_by_and_aggregates();
+    test_multi_column_group_by();
     test_having();
     test_union();
     test_subqueries();
