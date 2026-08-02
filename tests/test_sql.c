@@ -231,6 +231,63 @@ static void test_or(void) {
     teardown(db);
 }
 
+static void test_parenthesized_where(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE people (name TEXT, age INT, dept TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO people (name, age, dept) VALUES ('alice', 17, 'eng')"));
+    ASSERT_OK(sql(db, "INSERT INTO people (name, age, dept) VALUES ('bob', 70, 'eng')"));
+    ASSERT_OK(sql(db, "INSERT INTO people (name, age, dept) VALUES ('carol', 30, 'sales')"));
+    ASSERT_OK(sql(db, "INSERT INTO people (name, age, dept) VALUES ('dave', 40, 'eng')"));
+
+    KdbRows *rows = NULL;
+
+    /* without parens, AND binds tighter: age<18 OR (age>65 AND dept='sales') -> just alice */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM people WHERE age < 18 OR age > 65 AND dept = 'sales'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* parens override precedence: (age<18 OR age>65) AND dept='sales' -> nobody */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM people WHERE (age < 18 OR age > 65) AND dept = 'sales'", &rows, NULL));
+    ASSERT(rows && rows->count == 0u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* same, but dept='eng' -> alice and bob */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM people WHERE (age < 18 OR age > 65) AND dept = 'eng'", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* nested parens */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT * FROM people WHERE ((age < 18 OR age > 65) AND dept = 'eng') OR name = 'carol'",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* UPDATE/DELETE with parens fall back to a full scan + id match, but
+     * still only touch the rows the tree actually matches. */
+    size_t affected = 0;
+    ASSERT_OK(kdb_exec_sql(db, "UPDATE people SET age = 99 WHERE (age < 18 OR age > 65) AND dept = 'eng'", NULL, &affected));
+    ASSERT_EQ(affected, 2u);
+    ASSERT_EQ(kdb_count(db, "people", NULL), 4);
+
+    affected = 0;
+    ASSERT_OK(kdb_exec_sql(db, "DELETE FROM people WHERE (age = 99 OR age = 30) AND dept != 'sales'", NULL, &affected));
+    ASSERT_EQ(affected, 2u);
+    ASSERT_EQ(kdb_count(db, "people", NULL), 2);
+
+    /* parens that match nothing shouldn't touch any row */
+    affected = 1;
+    ASSERT_OK(kdb_exec_sql(db, "DELETE FROM people WHERE (age = 12345 OR age = 54321)", NULL, &affected));
+    ASSERT_EQ(affected, 0u);
+    ASSERT_EQ(kdb_count(db, "people", NULL), 2);
+
+    /* mismatched parens are a syntax error */
+    ASSERT_ERR(sql(db, "SELECT * FROM people WHERE (age < 18 OR age > 65"));
+
+    teardown(db);
+}
+
 static void test_group_by_and_aggregates(void) {
     KumDB *db;
     setup(&db);
@@ -528,6 +585,14 @@ static void test_join(void) {
         ASSERT(kdb_row_get(&rows->rows[0], "u.id") != NULL);
         ASSERT(kdb_row_get(&rows->rows[0], "o.id") != NULL);
     }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* parenthesized WHERE applies fine after a JOIN too */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT u.name FROM users AS u JOIN orders AS o ON u.id = o.user_id "
+        "WHERE (o.item = 'gadget' OR o.item = 'nope') AND u.name = 'alice'",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
     if (rows) { kdb_rows_free(rows); rows = NULL; }
 
     /* JOIN + GROUP BY/aggregate rejected */
@@ -914,6 +979,7 @@ int main(void) {
     test_update_delete();
     test_where_operators();
     test_or();
+    test_parenthesized_where();
     test_group_by_and_aggregates();
     test_multi_column_group_by();
     test_having();

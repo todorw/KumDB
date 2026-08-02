@@ -31,8 +31,12 @@ extern "C" {
  *   UPDATE t SET col = val, ... [WHERE cond [AND|OR cond ...]]
  *   DELETE FROM t [WHERE cond [AND|OR cond ...]]
  *
- * AND binds tighter than OR, standard SQL precedence, no parens/nesting:
- * "a=1 AND b=2 OR c=3" means "(a=1 AND b=2) OR (c=3)".
+ * AND binds tighter than OR, standard SQL precedence: "a=1 AND b=2 OR c=3"
+ * means "(a=1 AND b=2) OR (c=3)" -- parenthesize to override, nested up to
+ * 16 levels deep: "(a=1 OR b=2) AND c=3". Parens on UPDATE/DELETE's WHERE
+ * cost a full table scan to resolve (the storage engine's own pushdown
+ * only understands flat OR'd AND-groups); parens on a SELECT's WHERE/
+ * HAVING are free (evaluated in memory either way).
  *
  * A SELECT item is a plain column, an aggregate call --
  * COUNT(*)/COUNT(col)/SUM(col)/AVG(col)/MIN(col)/MAX(col) -- or a CASE

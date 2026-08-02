@@ -462,67 +462,180 @@ static char *sql__parse_condition(SqlParser *p, KumDB *db) {
     return buf;
 }
 
-/* AND binds tighter than OR, same as standard SQL -- no parens/nesting.
- * "a=1 AND b=2 OR c=3" means (a=1 AND b=2) OR (c=3). Groups get built by
- * prefixing the first condition of each OR'd group with "OR:", the same
- * convention kdb_find()/kdb_update()/kdb_delete() understand. Shared by
- * WHERE and HAVING -- the keyword itself is consumed by the caller.
- * returns 0 on error (error already set), 1 on success */
-static int sql__parse_cond_list(SqlParser *p, KumDB *db, char *filters_buf[KDB_SQL_MAX_COND], int *count_out) {
-    int n = 0;
-    *count_out = 0;
-    int start_new_group = 0;
-    for (;;) {
-        if (n >= KDB_SQL_MAX_COND) {
-            sql__err("too many conditions (max %d)", KDB_SQL_MAX_COND);
-            sql__free_filters(filters_buf, n);
-            return 0;
-        }
-        char *f = sql__parse_condition(p, db);
-        if (!f) { sql__free_filters(filters_buf, n); return 0; }
+/* A parsed WHERE/HAVING condition, as a tree instead of a flat list --
+ * lets "(a=1 OR b=2) AND c=3" mean what it looks like, instead of standard
+ * SQL's AND-binds-tighter-than-OR flattening being the only option. Leaves
+ * reuse sql__parse_condition()'s filter-string format unchanged (no "OR:"
+ * prefix at this level -- that convention only matters for the flattened
+ * form below, which the storage engine's OR'd-AND-groups model needs). */
+typedef enum { SQL_COND_LEAF, SQL_COND_AND, SQL_COND_OR } SqlCondKind;
 
-        if (start_new_group) {
-            size_t need = strlen(f) + 4;
-            char *prefixed = malloc(need);
-            if (!prefixed) {
-                kdb_err_oom("OR-prefixed filter string");
-                free(f);
-                sql__free_filters(filters_buf, n);
-                return 0;
-            }
-            snprintf(prefixed, need, "OR:%s", f);
-            free(f);
-            f = prefixed;
-            start_new_group = 0;
-        }
-        filters_buf[n++] = f;
+typedef struct SqlCondNode {
+    SqlCondKind          kind;
+    char                 *leaf_filter;   /* SQL_COND_LEAF only */
+    struct SqlCondNode   *left;          /* AND/OR only */
+    struct SqlCondNode   *right;         /* AND/OR only */
+} SqlCondNode;
 
-        if (sql__kw_is(&p->cur, "OR")) {
-            sql__advance(p);
-            start_new_group = 1;
-            continue;
+static void sql__free_cond_node(SqlCondNode *n) {
+    if (!n) return;
+    free(n->leaf_filter);
+    sql__free_cond_node(n->left);
+    sql__free_cond_node(n->right);
+    free(n);
+}
+
+#define KDB_SQL_MAX_COND_DEPTH 16
+
+static SqlCondNode *sql__parse_or_expr(SqlParser *p, KumDB *db, int *used_parens, int *leaf_count, int depth);
+
+/* '(' expr ')' | leaf-condition. Bumps *used_parens the moment a '(' is
+ * seen anywhere in the clause -- callers use that to tell whether the tree
+ * still has the classic "OR'd AND-groups" shape (no parens => guaranteed
+ * by the grammar below) or needs real tree evaluation. */
+static SqlCondNode *sql__parse_cond_primary(SqlParser *p, KumDB *db, int *used_parens, int *leaf_count, int depth) {
+    if (p->cur.type == SQLTOK_LPAREN) {
+        if (depth + 1 > KDB_SQL_MAX_COND_DEPTH) {
+            sql__err("condition nested too deeply (max depth %d)", KDB_SQL_MAX_COND_DEPTH);
+            return NULL;
         }
-        if (sql__kw_is(&p->cur, "AND")) { sql__advance(p); continue; }
-        break;
+        sql__advance(p);
+        *used_parens = 1;
+        SqlCondNode *inner = sql__parse_or_expr(p, db, used_parens, leaf_count, depth + 1);
+        if (!inner) return NULL;
+        if (p->cur.type != SQLTOK_RPAREN) {
+            sql__err("expected ')' closing a parenthesized condition");
+            sql__free_cond_node(inner);
+            return NULL;
+        }
+        sql__advance(p);
+        return inner;
     }
-    *count_out = n;
+
+    if (*leaf_count >= KDB_SQL_MAX_COND) {
+        sql__err("too many conditions (max %d)", KDB_SQL_MAX_COND);
+        return NULL;
+    }
+    char *f = sql__parse_condition(p, db);
+    if (!f) return NULL;
+    SqlCondNode *n = KDB_ALLOC(SqlCondNode);
+    if (!n) { kdb_err_oom("condition tree node"); free(f); return NULL; }
+    n->kind = SQL_COND_LEAF;
+    n->leaf_filter = f;
+    (*leaf_count)++;
+    return n;
+}
+
+/* AND binds tighter than OR, same as standard SQL. */
+static SqlCondNode *sql__parse_and_expr(SqlParser *p, KumDB *db, int *used_parens, int *leaf_count, int depth) {
+    SqlCondNode *left = sql__parse_cond_primary(p, db, used_parens, leaf_count, depth);
+    if (!left) return NULL;
+    while (sql__kw_is(&p->cur, "AND")) {
+        sql__advance(p);
+        SqlCondNode *right = sql__parse_cond_primary(p, db, used_parens, leaf_count, depth);
+        if (!right) { sql__free_cond_node(left); return NULL; }
+        SqlCondNode *n = KDB_ALLOC(SqlCondNode);
+        if (!n) { kdb_err_oom("condition tree node"); sql__free_cond_node(left); sql__free_cond_node(right); return NULL; }
+        n->kind = SQL_COND_AND;
+        n->left = left;
+        n->right = right;
+        left = n;
+    }
+    return left;
+}
+
+static SqlCondNode *sql__parse_or_expr(SqlParser *p, KumDB *db, int *used_parens, int *leaf_count, int depth) {
+    SqlCondNode *left = sql__parse_and_expr(p, db, used_parens, leaf_count, depth);
+    if (!left) return NULL;
+    while (sql__kw_is(&p->cur, "OR")) {
+        sql__advance(p);
+        SqlCondNode *right = sql__parse_and_expr(p, db, used_parens, leaf_count, depth);
+        if (!right) { sql__free_cond_node(left); return NULL; }
+        SqlCondNode *n = KDB_ALLOC(SqlCondNode);
+        if (!n) { kdb_err_oom("condition tree node"); sql__free_cond_node(left); sql__free_cond_node(right); return NULL; }
+        n->kind = SQL_COND_OR;
+        n->left = left;
+        n->right = right;
+        left = n;
+    }
+    return left;
+}
+
+/* *tree_out comes back NULL if there's no WHERE/HAVING clause at all (not
+ * an error). *used_parens comes back 0 iff the clause never used '(' --
+ * in that case the grammar above guarantees the tree is exactly one
+ * left-nested AND-chain per OR-branch, the same shape the old flat parser
+ * produced, so sql__cond_flatten() below can losslessly turn it back into
+ * the "OR:"-prefixed filter-string array the storage engine understands
+ * and the fast pushdown path (no full-table fetch) keeps working unchanged.
+ * Shared by WHERE and HAVING -- the keyword itself is consumed by the
+ * caller. Returns 0 on error (error already set), 1 on success. */
+static int sql__parse_cond_clause(SqlParser *p, KumDB *db, SqlCondNode **tree_out, int *used_parens) {
+    int leaf_count = 0;
+    *used_parens = 0;
+    SqlCondNode *t = sql__parse_or_expr(p, db, used_parens, &leaf_count, 0);
+    if (!t) { *tree_out = NULL; return 0; }
+    *tree_out = t;
     return 1;
 }
 
 /* returns 0 on error (error already set), 1 on success */
-static int sql__parse_where(SqlParser *p, KumDB *db, char *filters_buf[KDB_SQL_MAX_COND], int *count_out) {
-    *count_out = 0;
+static int sql__parse_where_expr(SqlParser *p, KumDB *db, SqlCondNode **tree_out, int *used_parens) {
+    *tree_out = NULL;
+    *used_parens = 0;
     if (!sql__kw_is(&p->cur, "WHERE")) return 1;
     sql__advance(p);
-    return sql__parse_cond_list(p, db, filters_buf, count_out);
+    return sql__parse_cond_clause(p, db, tree_out, used_parens);
 }
 
 /* returns 0 on error (error already set), 1 on success */
-static int sql__parse_having(SqlParser *p, KumDB *db, char *filters_buf[KDB_SQL_MAX_COND], int *count_out) {
-    *count_out = 0;
+static int sql__parse_having_expr(SqlParser *p, KumDB *db, SqlCondNode **tree_out, int *used_parens) {
+    *tree_out = NULL;
+    *used_parens = 0;
     if (!sql__kw_is(&p->cur, "HAVING")) return 1;
     sql__advance(p);
-    return sql__parse_cond_list(p, db, filters_buf, count_out);
+    return sql__parse_cond_clause(p, db, tree_out, used_parens);
+}
+
+static int sql__cond_flatten_leaf(const SqlCondNode *node, char *filters_buf[KDB_SQL_MAX_COND], int *n, int is_or_start) {
+    if (*n >= KDB_SQL_MAX_COND) { sql__err("too many conditions (max %d)", KDB_SQL_MAX_COND); return 0; }
+    const char *src = node->leaf_filter;
+    size_t need = strlen(src) + (is_or_start ? 4 : 1);
+    char *f = malloc(need);
+    if (!f) { kdb_err_oom("flattened filter string"); return 0; }
+    if (is_or_start) snprintf(f, need, "OR:%s", src);
+    else             snprintf(f, need, "%s", src);
+    filters_buf[(*n)++] = f;
+    return 1;
+}
+
+/* node is guaranteed (by the no-parens invariant) to be either a single
+ * leaf or a left-nested AND-chain of leaves -- i.e. one whole OR-group. */
+static int sql__cond_flatten_and_chain(const SqlCondNode *node, char *filters_buf[KDB_SQL_MAX_COND], int *n, int is_or_start) {
+    if (node->kind == SQL_COND_AND) {
+        if (!sql__cond_flatten_and_chain(node->left, filters_buf, n, is_or_start)) return 0;
+        return sql__cond_flatten_leaf(node->right, filters_buf, n, 0);
+    }
+    return sql__cond_flatten_leaf(node, filters_buf, n, is_or_start);
+}
+
+static int sql__cond_flatten_or(const SqlCondNode *node, char *filters_buf[KDB_SQL_MAX_COND], int *n) {
+    if (node->kind == SQL_COND_OR) {
+        if (!sql__cond_flatten_or(node->left, filters_buf, n)) return 0;
+        return sql__cond_flatten_and_chain(node->right, filters_buf, n, 1);
+    }
+    return sql__cond_flatten_and_chain(node, filters_buf, n, 0);
+}
+
+/* Only valid to call when the tree was parsed with used_parens == 0. On
+ * success, filters_buf and n (out) are byte-for-byte what the old flat
+ * parser would have produced for the same clause. Returns 0 on error
+ * (error already set, n left however far it got -- caller should still
+ * free what's there via sql__free_filters). */
+static int sql__cond_flatten(const SqlCondNode *node, char *filters_buf[KDB_SQL_MAX_COND], int *n) {
+    *n = 0;
+    if (!node) return 1;
+    return sql__cond_flatten_or(node, filters_buf, n);
 }
 
 static int sql__is_reserved_column(const char *name) {
@@ -1199,11 +1312,12 @@ typedef struct {
 
 /* Parses one filter string in the exact shape sql__parse_condition() emits
  * ("col__op=value", "col=value", "col__isnull", optionally "OR:"-prefixed)
- * back into a structured condition -- so HAVING and post-JOIN WHERE can
- * evaluate the same filter strings sql__parse_where() already builds
- * directly against an in-memory KdbRow, instead of a stored table. Returns
- * 0 on a malformed string (shouldn't happen, these are always our own
- * output, but fail closed rather than assert). */
+ * back into a structured condition -- the leaf-level building block both
+ * sql__cond_tree_matches() (in-memory tree evaluation) and
+ * sql__cond_flatten()'s output (pushed into kdb_find_ex/kdb_update/
+ * kdb_delete) are made of. Returns 0 on a malformed string (shouldn't
+ * happen, these are always our own output, but fail closed rather than
+ * assert). */
 static int sql__parse_row_cond(const char *filter, SqlRowCond *out) {
     memset(out, 0, sizeof(*out));
     if (strncmp(filter, "OR:", 3) == 0) { out->is_or_start = 1; filter += 3; }
@@ -1310,35 +1424,33 @@ static int sql__row_cond_matches(const KdbRow *row, const SqlRowCond *c) {
     }
 }
 
-/* Same AND-within-group / OR-across-groups semantics sql__parse_where()'s
- * "OR:" convention encodes (and that the storage-layer query engine also
- * implements): a row matches if ANY group's conditions are ALL true. */
-static int sql__row_matches_filters(const KdbRow *row, char *const *filters, int nfilt) {
-    if (nfilt == 0) return 1;
-    int group_ok = 1;
-    int result = 0;
-    for (int i = 0; i < nfilt; i++) {
-        SqlRowCond c;
-        if (!sql__parse_row_cond(filters[i], &c)) return 0;
-        if (c.is_or_start && i > 0) {
-            if (group_ok) result = 1;
-            group_ok = 1;
+/* Recursive evaluation of a parsed WHERE/HAVING condition tree against one
+ * in-memory row -- the general form sql__cond_flatten()'s flat "OR:"-group
+ * shape is a restricted special case of. A NULL tree (no WHERE/HAVING
+ * clause at all) matches everything. */
+static int sql__cond_tree_matches(const KdbRow *row, const SqlCondNode *node) {
+    if (!node) return 1;
+    switch (node->kind) {
+        case SQL_COND_LEAF: {
+            SqlRowCond c;
+            if (!sql__parse_row_cond(node->leaf_filter, &c)) return 0;
+            return sql__row_cond_matches(row, &c);
         }
-        if (!sql__row_cond_matches(row, &c)) group_ok = 0;
+        case SQL_COND_AND: return sql__cond_tree_matches(row, node->left) && sql__cond_tree_matches(row, node->right);
+        case SQL_COND_OR:  return sql__cond_tree_matches(row, node->left) || sql__cond_tree_matches(row, node->right);
+        default: return 0;
     }
-    if (group_ok) result = 1;
-    return result;
 }
 
 /* In-place filter: drops rows that don't match, freeing their field
  * memory, preserving order of the rows that stay. Used for HAVING and
- * post-JOIN WHERE, both of which need to filter an already-materialized
- * KdbRows rather than fetch from a stored table. */
-static void sql__filter_rows(KdbRows *rows, char *const *filters, int nfilt) {
-    if (!rows || nfilt == 0) return;
+ * post-JOIN/view/parenthesized WHERE, all of which need to filter an
+ * already-materialized KdbRows rather than fetch from a stored table. */
+static void sql__filter_rows_tree(KdbRows *rows, const SqlCondNode *tree) {
+    if (!rows || !tree) return;
     size_t kept = 0;
     for (size_t i = 0; i < rows->count; i++) {
-        if (sql__row_matches_filters(&rows->rows[i], filters, nfilt)) {
+        if (sql__cond_tree_matches(&rows->rows[i], tree)) {
             if (kept != i) rows->rows[kept] = rows->rows[i];
             kept++;
         } else {
@@ -1971,15 +2083,17 @@ static KdbStatus sql__build_joined_rows_multi(KumDB *db, const char *table1, con
 
 /* Fetches the FROM target's rows before WHERE is applied -- from a real
  * table (the common case: filters get pushed straight into kdb_find_ex,
- * *needs_filtering comes back 0), a JOIN chain, or a view (executing its
- * stored SELECT as a subquery). The latter two have no stored table to
- * push a filter into, so they come back fully materialized and
- * *needs_filtering is set -- the caller applies WHERE itself afterward via
- * sql__filter_rows, same pattern either way. */
+ * *needs_filtering comes back 0), a JOIN chain, a view (executing its
+ * stored SELECT as a subquery), or a table whose WHERE used parens (the
+ * flat filter_ptrs array can't represent real nesting, only the tree can).
+ * The latter three have no way to push a filter into the fetch itself, so
+ * they come back fully materialized and *needs_filtering is set -- the
+ * caller applies WHERE itself afterward via sql__filter_rows_tree, same
+ * pattern either way. */
 static KdbStatus sql__fetch_base_rows(KumDB *db, const char *table_name, const char *alias1,
                                       int has_join, const SqlJoinClause *joins, int njoins,
                                       int from_is_view, const char *view_query,
-                                      const char **filter_ptrs, int nfilt,
+                                      const char **filter_ptrs, int nfilt, int where_used_parens,
                                       KdbRows **out, int *needs_filtering) {
     if (has_join) {
         *needs_filtering = 1;
@@ -1990,6 +2104,13 @@ static KdbStatus sql__fetch_base_rows(KumDB *db, const char *table_name, const c
         SqlParser vp;
         sql__init(&vp, view_query);
         return sql__exec_select_stmt(&vp, db, out);
+    }
+    if (where_used_parens) {
+        *needs_filtering = 1;
+        KdbRows *r = kdb_find_ex(db, table_name, NULL, NULL);
+        if (!r) return kdb_last_status();
+        *out = r;
+        return KDB_OK;
     }
     *needs_filtering = 0;
     KdbRows *r = kdb_find_ex(db, table_name, nfilt > 0 ? filter_ptrs : NULL, NULL);
@@ -2167,20 +2288,20 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     if (from_is_view && has_join)
         return sql__err("'%s' is a view -- JOINing a view isn't supported yet", table_name);
 
-    char *filters[KDB_SQL_MAX_COND];
-    int   nfilt = 0;
-    if (!sql__parse_where(p, db, filters, &nfilt)) return kdb_last_status();
+    SqlCondNode *where_tree = NULL;
+    int where_used_parens = 0;
+    if (!sql__parse_where_expr(p, db, &where_tree, &where_used_parens)) return kdb_last_status();
 
     char group_cols[KDB_SQL_MAX_GROUP_COLS][KDB_SQL_IDENT_BUF];
     int  ngroup_cols = 0;
     if (sql__kw_is(&p->cur, "GROUP")) {
         sql__advance(p);
-        if (!sql__kw_is(&p->cur, "BY")) { sql__free_filters(filters, nfilt); return sql__err("expected BY after GROUP"); }
+        if (!sql__kw_is(&p->cur, "BY")) { sql__free_cond_node(where_tree); return sql__err("expected BY after GROUP"); }
         sql__advance(p);
         for (;;) {
             const char *gcol;
-            if (!sql__ident_text(&p->cur, &gcol)) { sql__free_filters(filters, nfilt); return sql__err("expected a column name after GROUP BY"); }
-            if (ngroup_cols >= KDB_SQL_MAX_GROUP_COLS) { sql__free_filters(filters, nfilt); return sql__err("too many GROUP BY columns (max %d)", KDB_SQL_MAX_GROUP_COLS); }
+            if (!sql__ident_text(&p->cur, &gcol)) { sql__free_cond_node(where_tree); return sql__err("expected a column name after GROUP BY"); }
+            if (ngroup_cols >= KDB_SQL_MAX_GROUP_COLS) { sql__free_cond_node(where_tree); return sql__err("too many GROUP BY columns (max %d)", KDB_SQL_MAX_GROUP_COLS); }
             snprintf(group_cols[ngroup_cols++], sizeof(group_cols[0]), "%.255s", gcol);
             sql__advance(p);
             if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
@@ -2190,17 +2311,17 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     int has_group_by = ngroup_cols > 0;
 
     if (has_join && (has_aggregate || has_group_by)) {
-        sql__free_filters(filters, nfilt);
+        sql__free_cond_node(where_tree);
         return sql__err("JOIN doesn't support GROUP BY or aggregate functions yet");
     }
 
     if (has_case && (has_aggregate || has_group_by)) {
-        sql__free_filters(filters, nfilt);
+        sql__free_cond_node(where_tree);
         return sql__err("CASE doesn't support GROUP BY or aggregate functions yet");
     }
 
     if (project_all && has_group_by) {
-        sql__free_filters(filters, nfilt);
+        sql__free_cond_node(where_tree);
         return sql__err("can't use '*' with GROUP BY -- list the columns/aggregates you want");
     }
     if (!project_all && (has_aggregate || has_group_by)) {
@@ -2211,44 +2332,55 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
                 if (strcmp(items[i].arg_col, group_cols[k]) == 0) { in_group_by = 1; break; }
             }
             if (!in_group_by) {
-                sql__free_filters(filters, nfilt);
+                sql__free_cond_node(where_tree);
                 return sql__err("column '%s' must appear in GROUP BY or be used inside an aggregate function",
                                 items[i].arg_col);
             }
         }
     }
 
-    char *having_filters[KDB_SQL_MAX_COND];
-    int   nhaving = 0;
+    SqlCondNode *having_tree = NULL;
+    int having_used_parens = 0;
     if (sql__kw_is(&p->cur, "HAVING")) {
         if (!has_aggregate && !has_group_by) {
-            sql__free_filters(filters, nfilt);
+            sql__free_cond_node(where_tree);
             return sql__err("HAVING requires GROUP BY or an aggregate function -- use WHERE to filter plain columns");
         }
-        if (!sql__parse_having(p, db, having_filters, &nhaving)) { sql__free_filters(filters, nfilt); return kdb_last_status(); }
+        if (!sql__parse_having_expr(p, db, &having_tree, &having_used_parens)) { sql__free_cond_node(where_tree); return kdb_last_status(); }
     }
 
+    char *flat_filters[KDB_SQL_MAX_COND];
+    int   nfilt = 0;
+    if (where_tree && !where_used_parens) {
+        if (!sql__cond_flatten(where_tree, flat_filters, &nfilt)) {
+            sql__free_filters(flat_filters, nfilt);
+            sql__free_cond_node(where_tree);
+            sql__free_cond_node(having_tree);
+            return kdb_last_status();
+        }
+    }
     const char *filter_ptrs[KDB_SQL_MAX_COND + 1];
-    for (int i = 0; i < nfilt; i++) filter_ptrs[i] = filters[i];
+    for (int i = 0; i < nfilt; i++) filter_ptrs[i] = flat_filters[i];
     filter_ptrs[nfilt] = NULL;
 
     if (has_aggregate || has_group_by) {
         KdbRows *all = NULL;
         int needs_filtering = 0;
         KdbStatus fst = sql__fetch_base_rows(db, table_name, alias1, has_join, joins, njoins,
-                                             from_is_view, view_query, filter_ptrs, nfilt,
+                                             from_is_view, view_query, filter_ptrs, nfilt, where_used_parens,
                                              &all, &needs_filtering);
-        if (fst != KDB_OK) { sql__free_filters(filters, nfilt); sql__free_filters(having_filters, nhaving); return fst; }
-        if (needs_filtering && nfilt > 0) sql__filter_rows(all, filters, nfilt);
-        sql__free_filters(filters, nfilt);
+        sql__free_filters(flat_filters, nfilt);
+        if (fst != KDB_OK) { sql__free_cond_node(where_tree); sql__free_cond_node(having_tree); return fst; }
+        if (needs_filtering) sql__filter_rows_tree(all, where_tree);
+        sql__free_cond_node(where_tree);
 
         KdbRows *agg = NULL;
         KdbStatus ast = sql__compute_aggregates(all, items, nitems, group_cols, ngroup_cols, &agg);
         kdb_rows_free(all);
-        if (ast != KDB_OK) { sql__free_filters(having_filters, nhaving); return ast; }
+        if (ast != KDB_OK) { sql__free_cond_node(having_tree); return ast; }
 
-        if (nhaving > 0) sql__filter_rows(agg, having_filters, nhaving);
-        sql__free_filters(having_filters, nhaving);
+        sql__filter_rows_tree(agg, having_tree);
+        sql__free_cond_node(having_tree);
         if (distinct) sql__dedupe_rows(agg);
 
         if (rows_out) *rows_out = agg;
@@ -2260,11 +2392,12 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     {
         int needs_filtering = 0;
         KdbStatus fst = sql__fetch_base_rows(db, table_name, alias1, has_join, joins, njoins,
-                                             from_is_view, view_query, filter_ptrs, nfilt,
+                                             from_is_view, view_query, filter_ptrs, nfilt, where_used_parens,
                                              &rows, &needs_filtering);
-        if (fst != KDB_OK) { sql__free_filters(filters, nfilt); return fst; }
-        if (needs_filtering && nfilt > 0) sql__filter_rows(rows, filters, nfilt);
-        sql__free_filters(filters, nfilt);
+        sql__free_filters(flat_filters, nfilt);
+        if (fst != KDB_OK) { sql__free_cond_node(where_tree); return fst; }
+        if (needs_filtering) sql__filter_rows_tree(rows, where_tree);
+        sql__free_cond_node(where_tree);
     }
 
     if (!project_all) {
@@ -2414,6 +2547,33 @@ static KdbStatus sql__exec_select_stmt(SqlParser *p, KumDB *db, KdbRows **rows_o
     return KDB_OK;
 }
 
+/* kdb_update()/kdb_delete() only understand the flat "OR:"-prefixed
+ * OR'd-AND-groups filter model -- a WHERE that used parens can't be
+ * expressed that way. Resolved here instead: fetch every row, filter with
+ * the tree, then target the exact matching rows via the "id__in" filter
+ * both already understand (id is always a valid filter column). Writes a
+ * heap-allocated "id__in=1,2,..." string into *filter_out that the caller
+ * owns and must free, or NULL if nothing matched (caller should skip the
+ * update/delete call entirely in that case -- an empty IN list isn't a
+ * meaningful filter). Returns 0 on error (error already set). */
+static int sql__resolve_where_to_id_filter(KumDB *db, const char *table_name, const SqlCondNode *tree, char **filter_out) {
+    *filter_out = NULL;
+    KdbRows *all = kdb_find_ex(db, table_name, NULL, NULL);
+    if (!all) return 0;
+    sql__filter_rows_tree(all, tree);
+    if (all->count == 0) { kdb_rows_free(all); return 1; }
+
+    size_t need = 8 + all->count * 24;
+    char *buf = malloc(need);
+    if (!buf) { kdb_err_oom("id__in filter string"); kdb_rows_free(all); return 0; }
+    size_t pos = (size_t)snprintf(buf, need, "id__in=");
+    for (size_t i = 0; i < all->count; i++)
+        pos += (size_t)snprintf(buf + pos, need - pos, "%s%llu", i > 0 ? "," : "", (unsigned long long)all->rows[i].id);
+    kdb_rows_free(all);
+    *filter_out = buf;
+    return 1;
+}
+
 static KdbStatus sql__exec_update(SqlParser *p, KumDB *db, size_t *affected_out) {
     sql__advance(p); /* UPDATE */
     const char *tname;
@@ -2444,26 +2604,45 @@ static KdbStatus sql__exec_update(SqlParser *p, KumDB *db, size_t *affected_out)
         break;
     }
 
-    char *filters[KDB_SQL_MAX_COND];
-    int   nfilt = 0;
-    if (!sql__parse_where(p, db, filters, &nfilt)) return kdb_last_status();
+    SqlCondNode *where_tree = NULL;
+    int used_parens = 0;
+    if (!sql__parse_where_expr(p, db, &where_tree, &used_parens)) return kdb_last_status();
 
     KdbField patch[KDB_SQL_MAX_COLUMNS + 1];
     for (uint32_t i = 0; i < nset; i++) {
         if (!sql__value_to_field(set_names[i], &set_vals[i], &patch[i])) {
-            sql__free_filters(filters, nfilt);
+            sql__free_cond_node(where_tree);
             return sql__err("unsupported value for column '%s' in SET", set_names[i]);
         }
     }
     patch[nset] = kdb_field_end();
 
-    const char *filter_ptrs[KDB_SQL_MAX_COND + 1];
-    for (int i = 0; i < nfilt; i++) filter_ptrs[i] = filters[i];
-    filter_ptrs[nfilt] = NULL;
-
     size_t updated = 0;
-    KdbStatus st = kdb_update(db, table_name, nfilt > 0 ? filter_ptrs : NULL, patch, &updated);
-    sql__free_filters(filters, nfilt);
+    KdbStatus st;
+    if (used_parens) {
+        char *id_filter = NULL;
+        int ok = sql__resolve_where_to_id_filter(db, table_name, where_tree, &id_filter);
+        sql__free_cond_node(where_tree);
+        if (!ok) return kdb_last_status();
+        if (!id_filter) { if (affected_out) *affected_out = 0; return KDB_OK; }
+        const char *fp[2] = { id_filter, NULL };
+        st = kdb_update(db, table_name, fp, patch, &updated);
+        free(id_filter);
+    } else {
+        char *flat_filters[KDB_SQL_MAX_COND];
+        int   nfilt = 0;
+        if (where_tree && !sql__cond_flatten(where_tree, flat_filters, &nfilt)) {
+            sql__free_filters(flat_filters, nfilt);
+            sql__free_cond_node(where_tree);
+            return kdb_last_status();
+        }
+        sql__free_cond_node(where_tree);
+        const char *filter_ptrs[KDB_SQL_MAX_COND + 1];
+        for (int i = 0; i < nfilt; i++) filter_ptrs[i] = flat_filters[i];
+        filter_ptrs[nfilt] = NULL;
+        st = kdb_update(db, table_name, nfilt > 0 ? filter_ptrs : NULL, patch, &updated);
+        sql__free_filters(flat_filters, nfilt);
+    }
     if (st == KDB_OK && affected_out) *affected_out = updated;
     return st;
 }
@@ -2478,17 +2657,36 @@ static KdbStatus sql__exec_delete(SqlParser *p, KumDB *db, size_t *affected_out)
     snprintf(table_name, sizeof(table_name), "%.255s", tname);
     sql__advance(p);
 
-    char *filters[KDB_SQL_MAX_COND];
-    int   nfilt = 0;
-    if (!sql__parse_where(p, db, filters, &nfilt)) return kdb_last_status();
-
-    const char *filter_ptrs[KDB_SQL_MAX_COND + 1];
-    for (int i = 0; i < nfilt; i++) filter_ptrs[i] = filters[i];
-    filter_ptrs[nfilt] = NULL;
+    SqlCondNode *where_tree = NULL;
+    int used_parens = 0;
+    if (!sql__parse_where_expr(p, db, &where_tree, &used_parens)) return kdb_last_status();
 
     size_t deleted = 0;
-    KdbStatus st = kdb_delete(db, table_name, nfilt > 0 ? filter_ptrs : NULL, &deleted);
-    sql__free_filters(filters, nfilt);
+    KdbStatus st;
+    if (used_parens) {
+        char *id_filter = NULL;
+        int ok = sql__resolve_where_to_id_filter(db, table_name, where_tree, &id_filter);
+        sql__free_cond_node(where_tree);
+        if (!ok) return kdb_last_status();
+        if (!id_filter) { if (affected_out) *affected_out = 0; return KDB_OK; }
+        const char *fp[2] = { id_filter, NULL };
+        st = kdb_delete(db, table_name, fp, &deleted);
+        free(id_filter);
+    } else {
+        char *flat_filters[KDB_SQL_MAX_COND];
+        int   nfilt = 0;
+        if (where_tree && !sql__cond_flatten(where_tree, flat_filters, &nfilt)) {
+            sql__free_filters(flat_filters, nfilt);
+            sql__free_cond_node(where_tree);
+            return kdb_last_status();
+        }
+        sql__free_cond_node(where_tree);
+        const char *filter_ptrs[KDB_SQL_MAX_COND + 1];
+        for (int i = 0; i < nfilt; i++) filter_ptrs[i] = flat_filters[i];
+        filter_ptrs[nfilt] = NULL;
+        st = kdb_delete(db, table_name, nfilt > 0 ? filter_ptrs : NULL, &deleted);
+        sql__free_filters(flat_filters, nfilt);
+    }
     if (st == KDB_OK && affected_out) *affected_out = deleted;
     return st;
 }

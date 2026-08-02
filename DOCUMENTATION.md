@@ -338,9 +338,16 @@ skipped (or rejected for `ADD`) rather than erroring, so a copy-pasted
 **`WHERE`** supports `=`, `!=`/`<>`, `>`, `>=`, `<`, `<=`,
 `BETWEEN a AND b`, `IN (a, b, c)`, `IS [NOT] NULL`, `LIKE 'pat'`
 (leading/trailing `%` only — no `_` wildcard, no mid-pattern `%`), and
-`AND`/`OR` at standard SQL precedence (`AND` binds tighter than `OR`, no
-parens/nesting: `a=1 AND b=2 OR c=3` means `(a=1 AND b=2) OR (c=3)`).
-Same syntax works in `UPDATE`/`DELETE`'s `WHERE` too.
+`AND`/`OR` at standard SQL precedence (`AND` binds tighter than `OR`:
+`a=1 AND b=2 OR c=3` means `(a=1 AND b=2) OR (c=3)`) — parenthesize to
+override that, nested as deep as you like (up to 16 levels):
+`(a=1 OR b=2) AND c=3`. Same syntax works in `UPDATE`/`DELETE`'s `WHERE`
+too. Parens are free on a `SELECT`'s `WHERE`/`HAVING` (evaluated in
+memory, same as any post-`JOIN`/view filter); on `UPDATE`/`DELETE` a
+parenthesized `WHERE` costs a full table scan to resolve which rows match
+before touching them, since the storage engine's own filter pushdown only
+understands flat `OR`'d `AND`-groups — fine for the row counts this engine
+targets, not something to reach for on a huge table repeatedly.
 
 **Subqueries**: `=`/`!=`/`>`/`>=`/`<`/`<=` accept `(SELECT ...)` as a
 scalar right-hand side (must return exactly one row, one column), and `IN`
