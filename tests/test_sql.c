@@ -419,6 +419,100 @@ static void test_group_by_and_aggregates(void) {
     teardown(db);
 }
 
+static void test_group_by_extensions(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE sales (region TEXT, rep TEXT, amount INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, rep, amount) VALUES ('east', 'alice', 100)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, rep, amount) VALUES ('east', 'alice', 50)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, rep, amount) VALUES ('east', 'bob', 30)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, rep, amount) VALUES ('west', 'carol', 70)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, rep, amount) VALUES ('west', 'carol', 70)"));
+
+    KdbRows *rows = NULL;
+
+    /* COUNT(DISTINCT col) per group, alongside a plain COUNT(*) */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT region, COUNT(DISTINCT rep) AS n_reps, COUNT(*) AS n_sales FROM sales GROUP BY region ORDER BY region ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        int64_t n_reps0 = 0, n_sales0 = 0, n_reps1 = 0, n_sales1 = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "n_reps", &n_reps0));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "n_sales", &n_sales0));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[1], "n_reps", &n_reps1));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[1], "n_sales", &n_sales1));
+        ASSERT_EQ(n_reps0, 2);  /* east: alice, bob */
+        ASSERT_EQ(n_sales0, 3);
+        ASSERT_EQ(n_reps1, 1);  /* west: carol only */
+        ASSERT_EQ(n_sales1, 2);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* COUNT(DISTINCT) with no GROUP BY (one summary row) */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT COUNT(DISTINCT region) AS n FROM sales", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        int64_t n = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "n", &n));
+        ASSERT_EQ(n, 2);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* STRING_AGG(col, sep) per group */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT region, STRING_AGG(rep, ',') AS reps FROM sales GROUP BY region ORDER BY region ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const char *reps0 = NULL, *reps1 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "reps", &reps0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "reps", &reps1));
+        ASSERT_STR(reps0, "alice,alice,bob");
+        ASSERT_STR(reps1, "carol,carol");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* GROUP_CONCAT is the same function under MySQL's name */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT region, GROUP_CONCAT(rep, '|') AS reps FROM sales GROUP BY region ORDER BY region ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const char *reps0 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "reps", &reps0));
+        ASSERT_STR(reps0, "alice|alice|bob");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* STRING_AGG composes with other aggregates in the same SELECT */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT region, STRING_AGG(rep, ',') AS reps, SUM(amount) AS total FROM sales GROUP BY region ORDER BY region ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        double total0 = 0;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "total", &total0));
+        ASSERT(total0 > 179.9 && total0 < 180.1); /* east: 100+50+30 */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* STRING_AGG as a window function (OVER) isn't supported */
+    ASSERT_ERR(sql(db, "SELECT STRING_AGG(rep, ',') OVER (PARTITION BY region) FROM sales"));
+
+    /* COUNT(DISTINCT) on an empty result set is 0, not an error */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT COUNT(DISTINCT rep) AS n FROM sales WHERE region = 'nowhere'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        int64_t n = -1;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "n", &n));
+        ASSERT_EQ(n, 0);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    teardown(db);
+}
+
 static void test_multi_column_group_by(void) {
     KumDB *db;
     setup(&db);
@@ -2061,6 +2155,7 @@ int main(void) {
     test_or();
     test_parenthesized_where();
     test_group_by_and_aggregates();
+    test_group_by_extensions();
     test_multi_column_group_by();
     test_having();
     test_union();

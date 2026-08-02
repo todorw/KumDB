@@ -1436,7 +1436,7 @@ static void sql__free_row_fields(KdbRow *row) {
 
 typedef enum {
     SQL_AGG_NONE, SQL_AGG_COUNT, SQL_AGG_SUM, SQL_AGG_AVG, SQL_AGG_MIN, SQL_AGG_MAX,
-    SQL_AGG_ROW_NUMBER, SQL_AGG_RANK, SQL_AGG_DENSE_RANK
+    SQL_AGG_ROW_NUMBER, SQL_AGG_RANK, SQL_AGG_DENSE_RANK, SQL_AGG_STRING_AGG
 } SqlAggFn;
 
 #define KDB_SQL_MAX_WINDOW_PARTITION_COLS 4
@@ -1492,6 +1492,8 @@ typedef struct {
     SqlAggFn fn;                          /* SQL_AGG_NONE = plain column or CASE, not an aggregate */
     char     arg_col[KDB_SQL_IDENT_BUF];  /* column name, or "*" for COUNT(*); unused for CASE */
     char     alias[KDB_SQL_IDENT_BUF];    /* output field name */
+    int      is_distinct;                 /* COUNT(DISTINCT col) only */
+    char     agg_sep[KDB_SQL_CASE_VAL_BUF]; /* SQL_AGG_STRING_AGG only: the separator literal */
 
     int           is_case;
     SqlCaseBranch case_branches[KDB_SQL_MAX_CASE_BRANCHES];
@@ -1536,6 +1538,11 @@ static int sql__agg_fn_from_ident(const char *s, SqlAggFn *out) {
     if (strcasecmp(s, "AVG")   == 0) { *out = SQL_AGG_AVG;   return 1; }
     if (strcasecmp(s, "MIN")   == 0) { *out = SQL_AGG_MIN;   return 1; }
     if (strcasecmp(s, "MAX")   == 0) { *out = SQL_AGG_MAX;   return 1; }
+    /* STRING_AGG (standard) and GROUP_CONCAT (MySQL) are the same thing
+     * under two names -- both spelled here as "fn(col, 'sep')", a
+     * required separator argument, rather than also supporting
+     * GROUP_CONCAT's default-separator/SEPARATOR-keyword variants. */
+    if (strcasecmp(s, "STRING_AGG") == 0 || strcasecmp(s, "GROUP_CONCAT") == 0) { *out = SQL_AGG_STRING_AGG; return 1; }
     return 0;
 }
 
@@ -2642,6 +2649,7 @@ static int sql__eval_func_item(const SqlSelectItem *item, const KdbRow *row, Kdb
 
 #define KDB_SQL_MAX_GROUPS     512
 #define KDB_SQL_MAX_GROUP_COLS 8
+#define KDB_SQL_MAX_COUNT_DISTINCT_VALS 128
 
 typedef struct {
     /* one group-by column's value per slot, pointing into the source
@@ -2731,6 +2739,42 @@ static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uin
 
     if (ngroup_cols == 0 && ngroups == 0) ngroups = 1; /* no matching rows: still emit one summary row */
 
+    /* COUNT(DISTINCT col) needs the set of distinct values per group, not
+     * just a running tally -- computed here as a separate rescan per
+     * (item, group) rather than tracked incrementally in the main loop
+     * above, same "no new heap-owned state in SqlGroupAcc" reasoning
+     * SQL_AGG_STRING_AGG's rescan follows below. Overwrites whatever the
+     * main loop's plain (non-distinct) COUNT already put in
+     * count_nonnull[it] for these items. */
+    for (uint32_t it = 0; it < nitems; it++) {
+        if (items[it].fn != SQL_AGG_COUNT || !items[it].is_distinct) continue;
+        for (uint32_t gi = 0; gi < ngroups; gi++) {
+            const KdbField *seen[KDB_SQL_MAX_COUNT_DISTINCT_VALS];
+            int nseen = 0;
+            for (size_t r = 0; r < all->count; r++) {
+                KdbRow *row = &all->rows[r];
+                int belongs = 1;
+                for (int k = 0; k < ngroup_cols; k++) {
+                    const KdbField *kf = kdb_row_get(row, group_cols[k]);
+                    if (!sql__field_equal(groups[gi].key_refs[k], kf)) { belongs = 0; break; }
+                }
+                if (!belongs) continue;
+                const KdbField *f = kdb_row_get(row, items[it].arg_col);
+                if (!f || f->type == KDB_TYPE_NULL) continue;
+                int dup = 0;
+                for (int s = 0; s < nseen; s++) if (sql__field_equal(seen[s], f)) { dup = 1; break; }
+                if (dup) continue;
+                if (nseen >= KDB_SQL_MAX_COUNT_DISTINCT_VALS) {
+                    free(groups);
+                    kdb_set_error(KDB_ERR_SQL_SYNTAX, "SQL error: too many distinct values for COUNT(DISTINCT) in one group (max %d)", KDB_SQL_MAX_COUNT_DISTINCT_VALS);
+                    return KDB_ERR_SQL_SYNTAX;
+                }
+                seen[nseen++] = f;
+            }
+            groups[gi].count_nonnull[it] = (size_t)nseen;
+        }
+    }
+
     KdbRows *result = (KdbRows *)calloc(1, sizeof(KdbRows));
     if (!result) { free(groups); kdb_err_oom("aggregate result"); return KDB_ERR_OOM; }
     result->rows = (KdbRow *)calloc(ngroups, sizeof(KdbRow));
@@ -2787,6 +2831,45 @@ static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uin
                     if (g->max_ref[it]) { of->type = g->max_ref[it]->type; copy_ok = sql__copy_field_value(of, g->max_ref[it]); }
                     else                { of->type = KDB_TYPE_NULL; }
                     break;
+                case SQL_AGG_STRING_AGG: {
+                    /* Not accumulated incrementally in the main per-row loop
+                     * above (there's nowhere to retain a growable string in
+                     * SqlGroupAcc without giving it a heap-cleanup path every
+                     * one of this function's several early-return sites would
+                     * need auditing for -- same POD reasoning the rest of
+                     * this file follows). Instead this rescans 'all' for
+                     * this group's rows directly, right here, building the
+                     * result string straight into the final owned field. */
+                    char *acc = NULL;
+                    size_t acc_len = 0;
+                    int agg_ok = 1;
+                    for (size_t r = 0; r < all->count && agg_ok; r++) {
+                        KdbRow *arow = &all->rows[r];
+                        int belongs = 1;
+                        for (int k = 0; k < ngroup_cols; k++) {
+                            const KdbField *kf = kdb_row_get(arow, group_cols[k]);
+                            if (!sql__field_equal(g->key_refs[k], kf)) { belongs = 0; break; }
+                        }
+                        if (!belongs) continue;
+                        const KdbField *f = kdb_row_get(arow, items[it].arg_col);
+                        if (!f || f->type == KDB_TYPE_NULL) continue;
+                        char valbuf[KDB_SQL_IDENT_BUF];
+                        if (!sql__field_to_filter_text(f, valbuf, sizeof(valbuf))) continue;
+                        size_t vlen = strlen(valbuf);
+                        size_t seplen = acc ? strlen(items[it].agg_sep) : 0;
+                        char *grown = (char *)realloc(acc, acc_len + seplen + vlen + 1);
+                        if (!grown) { free(acc); acc = NULL; agg_ok = 0; break; }
+                        acc = grown;
+                        if (seplen) { memcpy(acc + acc_len, items[it].agg_sep, seplen); acc_len += seplen; }
+                        memcpy(acc + acc_len, valbuf, vlen);
+                        acc_len += vlen;
+                        acc[acc_len] = '\0';
+                    }
+                    if (!agg_ok) { copy_ok = 0; break; }
+                    if (acc) { of->type = KDB_TYPE_STRING; of->v.as_string = acc; }
+                    else     { of->type = KDB_TYPE_NULL; }
+                    break;
+                }
                 case SQL_AGG_ROW_NUMBER:
                 case SQL_AGG_RANK:
                 case SQL_AGG_DENSE_RANK:
@@ -3825,6 +3908,27 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
                     if (is_window_only_fn) {
                         if (p->cur.type != SQLTOK_RPAREN) return sql__err("%s() takes no arguments", first_ident);
                         snprintf(item.alias, sizeof(item.alias), "%.100s()", first_ident);
+                    } else if (fn == SQL_AGG_COUNT && sql__kw_is(&p->cur, "DISTINCT")) {
+                        sql__advance(p);
+                        item.is_distinct = 1;
+                        const char *acol;
+                        if (!sql__ident_text(&p->cur, &acol))
+                            return sql__err("expected a column name after DISTINCT inside COUNT(...)");
+                        snprintf(item.arg_col, sizeof(item.arg_col), "%.255s", acol);
+                        sql__advance(p);
+                        snprintf(item.alias, sizeof(item.alias), "%.100s(DISTINCT %.100s)", first_ident, item.arg_col);
+                    } else if (fn == SQL_AGG_STRING_AGG) {
+                        const char *acol;
+                        if (!sql__ident_text(&p->cur, &acol))
+                            return sql__err("expected a column name inside %s(...)", first_ident);
+                        snprintf(item.arg_col, sizeof(item.arg_col), "%.255s", acol);
+                        sql__advance(p);
+                        if (p->cur.type != SQLTOK_COMMA) return sql__err("%s(col, sep) needs a separator argument", first_ident);
+                        sql__advance(p);
+                        if (p->cur.type != SQLTOK_STRING) return sql__err("%s's separator must be a string literal", first_ident);
+                        snprintf(item.agg_sep, sizeof(item.agg_sep), "%.255s", p->cur.text);
+                        sql__advance(p);
+                        snprintf(item.alias, sizeof(item.alias), "%.100s(%.100s)", first_ident, item.arg_col);
                     } else if (p->cur.type == SQLTOK_STAR) {
                         if (fn != SQL_AGG_COUNT) return sql__err("only COUNT(*) is supported, not %s(*)", first_ident);
                         snprintf(item.arg_col, sizeof(item.arg_col), "*");
@@ -3841,6 +3945,9 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
                     if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing %s(...)", first_ident);
                     sql__advance(p);
                     item.fn = fn;
+
+                    if (fn == SQL_AGG_STRING_AGG && sql__kw_is(&p->cur, "OVER"))
+                        return sql__err("%s() as a window function isn't supported -- only as a GROUP BY-collapsing aggregate", first_ident);
 
                     if (sql__kw_is(&p->cur, "OVER")) {
                         item.is_window = 1;

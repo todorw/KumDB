@@ -513,17 +513,30 @@ join itself, `WHERE` runs afterward over the combined rows. Fine for the
 row counts this engine targets, not something to reach for on huge tables.
 
 **`SELECT` items** can be a plain column, `*`, an aggregate call —
-`COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` —
-or a `CASE` expression (below), optionally renamed with `AS alias` (default
-alias is e.g. `SUM(amount)`, or `case` for an unaliased `CASE`).
-Without `GROUP BY`, one or more aggregate items collapse the result into a
-single summary row. `GROUP BY` takes one or more comma-separated columns —
+`COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`, `SUM(col)`, `AVG(col)`,
+`MIN(col)`, `MAX(col)`, `STRING_AGG(col, 'sep')`/`GROUP_CONCAT(col, 'sep')`
+(the same function under two names, both requiring an explicit separator
+— no default-separator or MySQL `SEPARATOR`-keyword form) — or a `CASE`
+expression (below), optionally renamed with `AS alias` (default alias is
+e.g. `SUM(amount)`, or `case` for an unaliased `CASE`). Without
+`GROUP BY`, one or more aggregate items collapse the result into a single
+summary row. `GROUP BY` takes one or more comma-separated columns —
 `GROUP BY region` or `GROUP BY region, product` — and you get one row per
 distinct combination of values across all of them; every other selected
 item must be an aggregate call — same rule real SQL uses. `SELECT col FROM
 t GROUP BY col` with no aggregate at all is a valid way to get distinct
 values. `SUM`/`AVG` always come back as `FLOAT` regardless of the source
-column's type.
+column's type; `STRING_AGG`/`GROUP_CONCAT` comes back `NULL` for a group
+with no non-`NULL` values to concatenate, not an empty string.
+
+```sql
+SELECT region, COUNT(DISTINCT rep) AS n_reps, STRING_AGG(rep, ', ') AS reps
+    FROM sales GROUP BY region
+```
+
+`STRING_AGG`/`GROUP_CONCAT` only works as a `GROUP BY`-collapsing
+aggregate, not as a window function (`OVER (...)` on it is rejected) —
+the other aggregates can be either, `OVER`'s presence is what decides.
 
 **Scalar functions** can also be a `SELECT` item, freely alongside plain
 columns/`CASE`/window functions (but not combined with `GROUP BY` or a

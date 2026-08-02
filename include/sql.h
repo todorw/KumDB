@@ -48,9 +48,12 @@ extern "C" {
  * HAVING are free (evaluated in memory either way).
  *
  * A SELECT item is a plain column, an aggregate call --
- * COUNT(*)/COUNT(col)/SUM(col)/AVG(col)/MIN(col)/MAX(col) -- or a CASE
- * expression (below), optionally renamed with "AS alias" (default alias
- * is e.g. "SUM(amount)", or "case" for an unaliased CASE). Without
+ * COUNT(*)/COUNT(col)/COUNT(DISTINCT col)/SUM(col)/AVG(col)/MIN(col)/
+ * MAX(col)/STRING_AGG(col, 'sep')/GROUP_CONCAT(col, 'sep') (the same
+ * function under two names, both requiring an explicit separator
+ * argument -- no default-separator or MySQL SEPARATOR-keyword form) -- or
+ * a CASE expression (below), optionally renamed with "AS alias" (default
+ * alias is e.g. "SUM(amount)", or "case" for an unaliased CASE). Without
  * GROUP BY, one or more aggregate items collapse the whole result into a
  * single summary row. GROUP BY takes one or more comma-separated columns;
  * you get one row per distinct combination of values across all of them.
@@ -58,8 +61,11 @@ extern "C" {
  * -- a plain column that isn't one of the GROUP BY columns is rejected).
  * "SELECT col FROM t GROUP BY col" with no aggregate at all is a valid way
  * to get distinct values. SUM/AVG always come back as FLOAT regardless of
- * the source column's type. HAVING filters the aggregated output (needs
- * GROUP BY or an aggregate item).
+ * the source column's type; STRING_AGG/GROUP_CONCAT comes back NULL for a
+ * group with no non-NULL values, not an empty string; STRING_AGG/
+ * GROUP_CONCAT only works as a GROUP BY-collapsing aggregate, not as a
+ * window function (OVER on it is rejected, unlike the others). HAVING
+ * filters the aggregated output (needs GROUP BY or an aggregate item).
  *
  * Scalar functions also work as a SELECT item, freely alongside plain
  * columns/CASE/window functions (not combined with GROUP BY/a plain
