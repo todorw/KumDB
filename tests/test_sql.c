@@ -770,6 +770,93 @@ static void test_join(void) {
     teardown(db);
 }
 
+static void test_outer_joins(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE users (name TEXT)"));
+    ASSERT_OK(sql(db, "CREATE TABLE orders (user_id INT, item TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO users (name) VALUES ('alice')"));  /* id 1, has an order */
+    ASSERT_OK(sql(db, "INSERT INTO users (name) VALUES ('bob')"));    /* id 2, no orders */
+    ASSERT_OK(sql(db, "INSERT INTO orders (user_id, item) VALUES (1, 'widget')"));
+    ASSERT_OK(sql(db, "INSERT INTO orders (user_id, item) VALUES (99, 'orphan')")); /* no matching user */
+
+    KdbRows *rows = NULL;
+
+    /* RIGHT JOIN: keeps every order, padding NULL for unmatched users */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT u.name, o.item FROM users u RIGHT JOIN orders o ON u.id = o.user_id ORDER BY o.item ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const KdbField *name_f = kdb_row_get(&rows->rows[0], "u.name");
+        ASSERT(name_f && name_f->type == KDB_TYPE_NULL);
+        const char *item = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "o.item", &item));
+        ASSERT_STR(item, "orphan");
+        const char *name1 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "u.name", &name1));
+        ASSERT_STR(name1, "alice");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* FULL [OUTER] JOIN: both unmatched sides appear */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT u.name, o.item FROM users u FULL JOIN orders o ON u.id = o.user_id",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT u.name, o.item FROM users u FULL OUTER JOIN orders o ON u.id = o.user_id",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* CROSS JOIN: full cartesian product, no ON */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT u.name, o.item FROM users u CROSS JOIN orders o", &rows, NULL));
+    ASSERT(rows && rows->count == 4u); /* 2 users x 2 orders */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* CROSS JOIN rejects an ON clause */
+    ASSERT_ERR(sql(db, "SELECT u.name FROM users u CROSS JOIN orders o ON u.id = o.user_id"));
+
+    /* RIGHT JOIN against a table with zero rows on the left still pads
+     * correctly -- the left side's qualified NULL shape has to come from
+     * schema, not from a live row, since there isn't one */
+    ASSERT_OK(sql(db, "CREATE TABLE empty_t (x INT)"));
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT e.x, o.item FROM empty_t e RIGHT JOIN orders o ON e.x = o.user_id",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const KdbField *x_f = kdb_row_get(&rows->rows[0], "e.x");
+        ASSERT(x_f && x_f->type == KDB_TYPE_NULL);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* 3-table chain mixing LEFT then RIGHT: the RIGHT step pads NULLs for
+     * the *entire* accumulated (users LEFT JOIN orders) side */
+    ASSERT_OK(sql(db, "CREATE TABLE reviews (item TEXT, stars INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO reviews (item, stars) VALUES ('widget', 5)"));
+    ASSERT_OK(sql(db, "INSERT INTO reviews (item, stars) VALUES ('gizmo', 3)"));
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT u.name, o.item, r.stars FROM users u "
+        "LEFT JOIN orders o ON u.id = o.user_id "
+        "RIGHT JOIN reviews r ON o.item = r.item",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* WHERE still applies after a RIGHT/FULL join, over the combined rows */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT u.name, o.item FROM users u RIGHT JOIN orders o ON u.id = o.user_id WHERE o.item = 'orphan'",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    teardown(db);
+}
+
 static void test_join_chain(void) {
     KumDB *db;
     setup(&db);
@@ -1836,6 +1923,7 @@ int main(void) {
     test_intersect_except();
     test_subqueries();
     test_join();
+    test_outer_joins();
     test_join_chain();
     test_bare_alias();
     test_exists();

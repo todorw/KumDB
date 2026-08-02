@@ -322,7 +322,7 @@ INSERT INTO t (col, ...) VALUES (val, ...)
 
 [WITH name AS (SELECT ...) [, name2 AS (SELECT ...)]*]
 SELECT [DISTINCT] * | item, ... FROM t | (SELECT ...) [[AS] alias]
-    [[INNER|LEFT [OUTER]] JOIN t2 [[AS] alias2] ON a.col = b.col [AND ...]]*
+    [[INNER|LEFT [OUTER]|RIGHT [OUTER]|FULL [OUTER]|CROSS] JOIN t2 [[AS] alias2] [ON a.col = b.col [AND ...]]]*
     [WHERE cond [AND|OR cond ...]]
     [GROUP BY col, ...]
     [HAVING cond [AND|OR cond ...]]
@@ -429,12 +429,19 @@ too (via the same full-scan `id` targeting a parenthesized `WHERE` there
 uses). Not supported in `HAVING` — it filters aggregated aliases like
 `total` from `SUM(amount) AS total`, not a real row to correlate against.
 
-**`JOIN`** (`INNER`/`LEFT`) matches rows via `ON`, a conjunction of
-`col = col` equalities — no `OR`, no comparing to a literal in `ON`
-(that's what `WHERE`, applied after the join, is for). Chain as many
-`JOIN` clauses as you want; each one matches against everything
-accumulated so far, so a later `ON` can reference any earlier alias in
-the chain, not just the table right before it:
+**`JOIN`** (`INNER`/`LEFT [OUTER]`/`RIGHT [OUTER]`/`FULL [OUTER]`/`CROSS`)
+matches rows via `ON`, a conjunction of `col = col` equalities — no `OR`,
+no comparing to a literal in `ON` (that's what `WHERE`, applied after the
+join, is for). `INNER` (the default) drops unmatched rows; `LEFT` keeps
+every row from everything accumulated so far, padding an unmatched one
+with `NULL` for the new table's columns; `RIGHT` is the mirror — keeps
+every row of the new table, padding `NULL` for every column accumulated
+so far when nothing matches; `FULL` does both directions at once. `CROSS`
+is the odd one out: no `ON` at all (rejected if you write one), just
+every combination of both sides — the cartesian product. Chain as many
+`JOIN` clauses as you want, mixing kinds freely; each one matches against
+everything accumulated so far, so a later `ON` can reference any earlier
+alias in the chain, not just the table right before it:
 
 ```sql
 SELECT u.name, o.item
@@ -443,6 +450,9 @@ SELECT u.name, o.item
     WHERE o.item = 'widget'
 
 SELECT u.name, o.item FROM users AS u LEFT JOIN orders AS o ON u.id = o.user_id
+SELECT u.name, o.item FROM users AS u RIGHT JOIN orders AS o ON u.id = o.user_id
+SELECT u.name, o.item FROM users AS u FULL JOIN orders AS o ON u.id = o.user_id
+SELECT u.name, o.item FROM users AS u CROSS JOIN orders AS o
 
 SELECT u.name, o.item, r.stars
     FROM users AS u
@@ -464,10 +474,11 @@ including those three.
 
 Aliasing itself doesn't need `AS` — `FROM orders o` works the same as
 `FROM orders AS o` (same for a `JOIN` target), except for a handful of
-words (`WHERE`, `GROUP`, `HAVING`, `ORDER`, `LIMIT`, `UNION`, `JOIN`,
-`INNER`, `LEFT`, `ON`, `AS`) that always mean the keyword, never a bare
-alias — `FROM t WHERE ...` parses `WHERE` as the clause, not as `t`'s
-alias, exactly like real SQL's reserved-word handling.
+words (`WHERE`, `GROUP`, `HAVING`, `ORDER`, `LIMIT`, `UNION`, `INTERSECT`,
+`EXCEPT`, `JOIN`, `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, `OUTER`,
+`ON`, `AS`) that always mean the keyword, never a bare alias — `FROM t
+WHERE ...` parses `WHERE` as the clause, not as `t`'s alias, exactly like
+real SQL's reserved-word handling.
 
 A query with no `JOIN` at all can still qualify its own columns with its
 own alias if one's in scope (explicit, bare, or just the table name) —
@@ -476,10 +487,9 @@ unqualified `WHERE name = 'alice'`. Mostly useful for `EXISTS`'s inner
 query, where qualifying is the natural way to write a self-reference
 alongside a correlated one to the outer row (see below).
 
-`LEFT JOIN` keeps every row accumulated so far; one with no `ON` match
-against that step's table gets every column from that table set to
-`NULL` (including `alias.id`) instead of being dropped, same as real
-`LEFT JOIN`. `INNER JOIN` (or just `JOIN`) drops unmatched rows.
+(`LEFT`/`RIGHT`/`FULL`'s NULL-padding, described above, always includes
+the `alias.id`/`alias.created_at`/`alias.updated_at` pseudo-columns too,
+same as a real matched row would have them.)
 
 `GROUP BY`/aggregate functions work fine after a `JOIN` — group and
 aggregate on qualified columns same as any other post-`JOIN` reference:

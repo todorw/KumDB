@@ -88,28 +88,35 @@ extern "C" {
  * window function with GROUP BY or a plain aggregate. Works after a JOIN,
  * on qualified columns, same as anything else there.
  *
- * JOIN (INNER or LEFT) matches rows via a conjunction of col = col
- * equalities in ON (no OR, no comparing to a literal there -- that's what
- * WHERE, applied after the join, is for). Chain as many JOIN clauses as
- * you want -- "FROM t1 JOIN t2 ON ... JOIN t3 ON ..." -- each one matches
- * against everything accumulated so far, so a later ON can reference any
- * earlier alias in the chain, not just the table immediately before it.
- * Every column reference anywhere after a JOIN -- SELECT list, ON, WHERE,
- * ORDER BY -- must be table-qualified ("alias.col" or "table.col"),
- * including the synthetic "alias.id"/"alias.created_at"/"alias.updated_at"
- * pseudo-columns each table gets for joining against (id/created_at/
- * updated_at aren't ordinarily part of a row's field list, but they're
- * common join keys, e.g. "ON orders.user_id = users.id"). LEFT JOIN pads
- * an unmatched row with NULL for every column from that step's table.
- * GROUP BY/aggregates work fine after a JOIN too -- group/aggregate on
- * qualified columns same as any other post-JOIN reference. An alias
- * doesn't need AS --
+ * JOIN (INNER, LEFT [OUTER], RIGHT [OUTER], FULL [OUTER], or CROSS)
+ * matches rows via a conjunction of col = col equalities in ON (no OR, no
+ * comparing to a literal there -- that's what WHERE, applied after the
+ * join, is for). INNER (the default) drops unmatched rows; LEFT keeps
+ * every row accumulated so far, padding an unmatched one with NULL for
+ * the new table's columns; RIGHT is the mirror (keeps every row of the
+ * new table, padding NULL for everything accumulated so far); FULL does
+ * both directions; CROSS takes no ON at all (rejected if given one) and
+ * is just the cartesian product of both sides. Chain as many JOIN clauses
+ * as you want, mixing kinds freely -- "FROM t1 JOIN t2 ON ... RIGHT JOIN
+ * t3 ON ..." -- each one matches against everything accumulated so far,
+ * so a later ON can reference any earlier alias in the chain, not just
+ * the table immediately before it. Every column reference anywhere after
+ * a JOIN -- SELECT list, ON, WHERE, ORDER BY -- must be table-qualified
+ * ("alias.col" or "table.col"), including the synthetic
+ * "alias.id"/"alias.created_at"/"alias.updated_at" pseudo-columns each
+ * table gets for joining against (id/created_at/updated_at aren't
+ * ordinarily part of a row's field list, but they're common join keys,
+ * e.g. "ON orders.user_id = users.id") -- NULL padding includes these
+ * pseudo-columns too. GROUP BY/aggregates work fine after a JOIN too --
+ * group/aggregate on qualified columns same as any other post-JOIN
+ * reference. An alias doesn't need AS --
  * "FROM t alias"/"JOIN t2 alias2" work the same as with it -- except for a
- * short list of words (WHERE/GROUP/HAVING/ORDER/LIMIT/UNION/JOIN/INNER/
- * LEFT/ON/AS) that always mean the keyword, never a bare alias. A
- * non-JOIN query can also qualify its own columns with its own alias if
- * one's in scope ("FROM users u WHERE u.name=..." works same as
- * unqualified); mostly useful for EXISTS's inner query (below).
+ * short list of words (WHERE/GROUP/HAVING/ORDER/LIMIT/UNION/INTERSECT/
+ * EXCEPT/JOIN/INNER/LEFT/RIGHT/FULL/CROSS/OUTER/ON/AS) that always mean
+ * the keyword, never a bare alias. A non-JOIN query can also qualify its
+ * own columns with its own alias if one's in scope ("FROM users u WHERE
+ * u.name=..." works same as unqualified); mostly useful for EXISTS's
+ * inner query (below).
  *
  * CASE (as a SELECT item): "CASE WHEN cond THEN val [WHEN cond THEN val
  * ...] [ELSE val] END". First matching WHEN wins; NULL if nothing matches
