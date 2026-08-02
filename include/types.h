@@ -24,6 +24,12 @@ int kdb_value_matches(const KdbValue *field,
                       const KdbValue *filter_value,
                       const KdbValue *filter_value2);
 
+/* Standard SQL LIKE wildcards against plain C strings ('%' = any run of
+ * characters including none, '_' = exactly one), case-sensitive, no
+ * ESCAPE clause. Shared by KDB_OP_LIKE's own match case above and sql.c's
+ * SQL_ROP_LIKE (the SQL layer's row-cond form of the same operator). */
+int kdb_like_match(const char *pattern, const char *text);
+
 const char *kdb_type_name(KdbType type);
 const char *kdb_op_name  (KdbOperator op);
 

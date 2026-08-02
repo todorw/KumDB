@@ -182,6 +182,24 @@ static void test_where_operators(void) {
     ASSERT(rows && rows->count == 1u);
     if (rows) { kdb_rows_free(rows); rows = NULL; }
 
+    /* mid-pattern % and single-char _ wildcards -- real SQL LIKE, not just
+     * the leading/trailing-only version this used to be limited to */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE s LIKE 'f%e'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u); /* "five" */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE s LIKE '_ne'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u); /* "one" */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE s LIKE 'z_ro'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u); /* "zero" */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE s LIKE 'nomatch'", &rows, NULL));
+    ASSERT(rows && rows->count == 0u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
     ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE n BETWEEN 1 AND 5", &rows, NULL));
     ASSERT(rows && rows->count == 2u);
     if (rows) { kdb_rows_free(rows); rows = NULL; }
@@ -1056,7 +1074,7 @@ static void test_syntax_errors(void) {
 
     ASSERT_ERR(sql(db, "SELEKT * FROM t"));
     ASSERT_ERR(sql(db, "SELECT * FROM t WHERE n = NULL"));
-    ASSERT_ERR(sql(db, "SELECT * FROM t WHERE n LIKE '%mid%dle%'"));
+    ASSERT_ERR(sql(db, "SELECT * FROM t WHERE n LIKE 5"));           /* pattern must be a string literal */
     ASSERT_ERR(sql(db, "INSERT INTO t VALUES (1)"));                 /* no column list */
     ASSERT_ERR(sql(db, "INSERT INTO t (n) VALUES (1, 2)"));          /* count mismatch */
     ASSERT_ERR(sql(db, "CREATE TABLE t2 (n WEIRDTYPE)"));

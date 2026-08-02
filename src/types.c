@@ -426,6 +426,29 @@ int kdb_value_compare(const KdbValue *a, const KdbValue *b) {
 }
 
 
+/* Standard SQL LIKE wildcards: '%' matches any run of characters
+ * (including none), '_' matches exactly one. No ESCAPE clause -- there's
+ * no way to match a literal '%'/'_' -- same "don't over-build it" call as
+ * the rest of this engine's pattern matching. Case-sensitive, same as
+ * every other string comparison here. Classic linear-time greedy-with-
+ * backtrack algorithm (remember the last '%' and retry from just past it
+ * on a mismatch), not recursive -- a pathological pattern can't blow the
+ * stack. */
+int kdb_like_match(const char *pattern, const char *text) {
+    if (!pattern || !text) return 0;
+    const char *p = pattern, *t = text;
+    const char *star_p = NULL, *star_t = NULL;
+
+    while (*t) {
+        if (*p == '_' || *p == *t) { p++; t++; }
+        else if (*p == '%') { star_p = p++; star_t = t; }
+        else if (star_p) { p = star_p + 1; t = ++star_t; }
+        else return 0;
+    }
+    while (*p == '%') p++;
+    return *p == '\0';
+}
+
 int kdb_value_matches(const KdbValue *field,
                       KdbOperator     op,
                       const KdbValue *fv,
@@ -523,6 +546,11 @@ int kdb_value_matches(const KdbValue *field,
             return 0;
         }
 
+        case KDB_OP_LIKE:
+            if (field->type != KDB_TYPE_STRING || !fv || fv->type != KDB_TYPE_STRING)
+                return 0;
+            return kdb_like_match(fv->v.as_string.data, field->v.as_string.data);
+
         default:
             return 0;
     }
@@ -558,6 +586,7 @@ const char *kdb_op_name(KdbOperator op) {
         case KDB_OP_BETWEEN:     return "between";
         case KDB_OP_IS_NULL:     return "isnull";
         case KDB_OP_IS_NOT_NULL: return "isnotnull";
+        case KDB_OP_LIKE:        return "like";
         default:                 return "unknown";
     }
 }
@@ -605,9 +634,10 @@ KdbStatus kdb_parse_filter_key(const char  *key,
     if (strcmp(op_str, "between")     == 0) { *op_out = KDB_OP_BETWEEN;     return KDB_OK; }
     if (strcmp(op_str, "isnull")      == 0) { *op_out = KDB_OP_IS_NULL;     return KDB_OK; }
     if (strcmp(op_str, "isnotnull")   == 0) { *op_out = KDB_OP_IS_NOT_NULL; return KDB_OK; }
+    if (strcmp(op_str, "like")        == 0) { *op_out = KDB_OP_LIKE;        return KDB_OK; }
 
     kdb_err_bad_filter(key, "unknown operator suffix — valid: eq, neq, gt, gte, lt, lte, "
-                            "contains, startswith, endswith, in, between, isnull, isnotnull");
+                            "contains, startswith, endswith, in, between, isnull, isnotnull, like");
     return KDB_ERR_BAD_FILTER;
 }
 

@@ -184,6 +184,7 @@ suffix means equals.
 | `__contains` | `name__contains=ali` | substring match |
 | `__startswith` | `name__startswith=al` | prefix match |
 | `__endswith` | `name__endswith=ice` | suffix match |
+| `__like` | `name__like=a%_ce` | SQL-style wildcard match (`%` = any run, `_` = one char) |
 | `__isnull` | `notes__isnull` | field is null (or missing) |
 | `__isnotnull` | `notes__isnotnull` | field is present and not null |
 
@@ -337,7 +338,9 @@ skipped (or rejected for `ADD`) rather than erroring, so a copy-pasted
 
 **`WHERE`** supports `=`, `!=`/`<>`, `>`, `>=`, `<`, `<=`,
 `BETWEEN a AND b`, `IN (a, b, c)`, `IS [NOT] NULL`, `LIKE 'pat'`
-(leading/trailing `%` only — no `_` wildcard, no mid-pattern `%`), and
+(standard SQL wildcards: `%` matches any run of characters including
+none, `_` matches exactly one, anywhere in the pattern — no `ESCAPE`
+clause, so there's no way to match a literal `%`/`_`), and
 `AND`/`OR` at standard SQL precedence (`AND` binds tighter than `OR`:
 `a=1 AND b=2 OR c=3` means `(a=1 AND b=2) OR (c=3)`) — parenthesize to
 override that, nested as deep as you like (up to 16 levels):

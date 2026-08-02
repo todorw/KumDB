@@ -205,6 +205,41 @@ static void test_in_filter(void) {
     kdb_rows_free(rows);
 }
 
+static void test_like_filter(void) {
+    /* real SQL LIKE wildcards -- '%' any run (incl. none), '_' exactly
+     * one -- available as a NoSQL filter operator too, not just through
+     * SQL's LIKE keyword. names: alpha, beta, gamma, delta, epsilon. */
+    const char *f1[] = { "name__like=%eta", NULL };
+    KdbRows *rows = kdb_find(db, TABLE, f1);
+    ASSERT(rows != NULL);
+    ASSERT_EQ(rows->count, 1u); /* beta */
+    kdb_rows_free(rows);
+
+    const char *f2[] = { "name__like=%a%", NULL };
+    rows = kdb_find(db, TABLE, f2);
+    ASSERT(rows != NULL);
+    ASSERT_EQ(rows->count, 4u); /* alpha, beta, gamma, delta -- not epsilon */
+    kdb_rows_free(rows);
+
+    const char *f3[] = { "name__like=_eta", NULL };
+    rows = kdb_find(db, TABLE, f3);
+    ASSERT(rows != NULL);
+    ASSERT_EQ(rows->count, 1u); /* beta */
+    kdb_rows_free(rows);
+
+    const char *f4[] = { "name__like=z%", NULL };
+    rows = kdb_find(db, TABLE, f4);
+    ASSERT(rows != NULL);
+    ASSERT_EQ(rows->count, 0u);
+    kdb_rows_free(rows);
+
+    const char *f5[] = { "name__like=%", NULL };
+    rows = kdb_find(db, TABLE, f5);
+    ASSERT(rows != NULL);
+    ASSERT_EQ(rows->count, 5u);
+    kdb_rows_free(rows);
+}
+
 static void test_find_all(void) {
     KdbRows *rows = kdb_find(db, TABLE, NULL);
     ASSERT(rows != NULL);
@@ -244,6 +279,7 @@ int main(void) {
     test_multi_filter_and();
     test_or_filter();
     test_in_filter();
+    test_like_filter();
     test_find_all();
     test_no_results();
     test_float_filter();

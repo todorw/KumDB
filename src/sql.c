@@ -6,6 +6,7 @@
 
 #include "../include/sql.h"
 #include "../include/error.h"
+#include "../include/types.h"
 
 #define KDB_SQL_TOK_MAX      2200
 #define KDB_SQL_MAX_COLUMNS  64
@@ -415,28 +416,10 @@ static char *sql__parse_condition(SqlParser *p, KumDB *db) {
         sql__advance(p);
         if (p->cur.type != SQLTOK_STRING) { sql__err("expected a string pattern after LIKE on '%s'", col_buf); return NULL; }
         const char *pat = p->cur.text;
-        size_t plen = strlen(pat);
-        int lead  = plen > 0 && pat[0] == '%';
-        int trail = plen > 0 && pat[plen - 1] == '%';
-        size_t start = lead ? 1 : 0;
-        size_t end   = plen - (trail ? 1 : 0);
-        if (end < start) end = start;
-        size_t slen = end - start;
-
-        char stripped[KDB_SQL_TOK_MAX];
-        if (slen >= sizeof(stripped)) slen = sizeof(stripped) - 1;
-        memcpy(stripped, pat + start, slen);
-        stripped[slen] = '\0';
-
-        if (strchr(stripped, '%') || strchr(stripped, '_')) {
-            sql__err("LIKE only supports a leading and/or trailing %% on '%s' -- no mid-pattern wildcards", col_buf);
-            return NULL;
-        }
-        const char *suffix = (lead && trail) ? "contains" : (trail ? "startswith" : (lead ? "endswith" : "eq"));
-        sql__advance(p);
-        size_t need = strlen(col_buf) + strlen(suffix) + slen + 8;
+        size_t need = strlen(col_buf) + strlen(pat) + 10;
         char *buf = malloc(need);
-        if (buf) snprintf(buf, need, "%s__%s=%s", col_buf, suffix, stripped);
+        if (buf) snprintf(buf, need, "%s__like=%s", col_buf, pat);
+        sql__advance(p);
         return buf;
     }
 
@@ -1420,8 +1403,7 @@ static int sql__field_cmp_text(const KdbField *f, const char *text) {
 
 typedef enum {
     SQL_ROP_EQ, SQL_ROP_NEQ, SQL_ROP_GT, SQL_ROP_GTE, SQL_ROP_LT, SQL_ROP_LTE,
-    SQL_ROP_BETWEEN, SQL_ROP_IN, SQL_ROP_CONTAINS, SQL_ROP_STARTSWITH,
-    SQL_ROP_ENDSWITH, SQL_ROP_ISNULL, SQL_ROP_ISNOTNULL
+    SQL_ROP_BETWEEN, SQL_ROP_IN, SQL_ROP_LIKE, SQL_ROP_ISNULL, SQL_ROP_ISNOTNULL
 } SqlRowOp;
 
 typedef struct {
@@ -1467,9 +1449,7 @@ static int sql__parse_row_cond(const char *filter, SqlRowCond *out) {
         else if (strcmp(op_buf, "lte")        == 0) out->op = SQL_ROP_LTE;
         else if (strcmp(op_buf, "between")    == 0) out->op = SQL_ROP_BETWEEN;
         else if (strcmp(op_buf, "in")         == 0) out->op = SQL_ROP_IN;
-        else if (strcmp(op_buf, "contains")   == 0) out->op = SQL_ROP_CONTAINS;
-        else if (strcmp(op_buf, "startswith") == 0) out->op = SQL_ROP_STARTSWITH;
-        else if (strcmp(op_buf, "endswith")   == 0) out->op = SQL_ROP_ENDSWITH;
+        else if (strcmp(op_buf, "like")       == 0) out->op = SQL_ROP_LIKE;
         else if (strcmp(op_buf, "isnull")     == 0) out->op = SQL_ROP_ISNULL;
         else if (strcmp(op_buf, "isnotnull")  == 0) out->op = SQL_ROP_ISNOTNULL;
         else return 0;
@@ -1502,17 +1482,8 @@ static int sql__row_cond_matches(const KdbRow *row, const SqlRowCond *c) {
         case SQL_ROP_GTE: { int r = sql__field_cmp_text(f, c->value); return r != SQL_CMP_INCOMPARABLE && r >= 0; }
         case SQL_ROP_LT:  { int r = sql__field_cmp_text(f, c->value); return r != SQL_CMP_INCOMPARABLE && r < 0; }
         case SQL_ROP_LTE: { int r = sql__field_cmp_text(f, c->value); return r != SQL_CMP_INCOMPARABLE && r <= 0; }
-        case SQL_ROP_CONTAINS:
-            return f->type == KDB_TYPE_STRING && f->v.as_string && strstr(f->v.as_string, c->value) != NULL;
-        case SQL_ROP_STARTSWITH:
-            return f->type == KDB_TYPE_STRING && f->v.as_string &&
-                   strncmp(f->v.as_string, c->value, strlen(c->value)) == 0;
-        case SQL_ROP_ENDSWITH: {
-            if (f->type != KDB_TYPE_STRING || !f->v.as_string) return 0;
-            size_t flen = strlen(f->v.as_string), slen = strlen(c->value);
-            if (slen > flen) return 0;
-            return strcmp(f->v.as_string + (flen - slen), c->value) == 0;
-        }
+        case SQL_ROP_LIKE:
+            return f->type == KDB_TYPE_STRING && f->v.as_string && kdb_like_match(c->value, f->v.as_string);
         case SQL_ROP_BETWEEN: {
             const char *comma = strchr(c->value, ',');
             if (!comma) return 0;

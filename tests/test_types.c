@@ -146,6 +146,13 @@ static void test_value_matches(void) {
     kdb_value_from_string("world", KDB_TYPE_STRING, &fv);
     ASSERT(kdb_value_matches(&field, KDB_OP_ENDSWITH, &fv, NULL));
 
+    kdb_value_free(&fv);
+    kdb_value_from_string("hel_o w%d", KDB_TYPE_STRING, &fv);
+    ASSERT(kdb_value_matches(&field, KDB_OP_LIKE, &fv, NULL));
+    kdb_value_free(&fv);
+    kdb_value_from_string("nomatch", KDB_TYPE_STRING, &fv);
+    ASSERT(!kdb_value_matches(&field, KDB_OP_LIKE, &fv, NULL));
+
     kdb_value_free(&field);
     kdb_value_free(&fv);
 
