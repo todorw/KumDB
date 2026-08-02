@@ -43,6 +43,24 @@ typedef struct {
  * order these top-to-bottom without one forward declaration somewhere. */
 static KdbStatus sql__exec_select_stmt(SqlParser *p, KumDB *db, KdbRows **rows_out);
 
+/* Forward declarations: RETURNING is shared by INSERT/UPDATE/DELETE
+ * (defined well before sql__copy_row and friends, which live in the
+ * JOIN-adjacent row-utility section further down and are the natural
+ * place for RETURNING's own row-building helpers to live too, rather
+ * than duplicating that logic up here). */
+static int sql__parse_returning_clause(SqlParser *p, int *has_returning, int *return_all,
+                                        char cols[][KDB_SQL_IDENT_BUF], int *ncols);
+static int sql__build_returning_row(KdbRow *dst, const KdbRow *src, int return_all,
+                                     char cols[][KDB_SQL_IDENT_BUF], int ncols);
+static int sql__returning_rows_append(KdbRows *acc, KdbRow *row);
+static KdbStatus sql__fetch_just_inserted_row(KumDB *db, const char *table_name, KdbRow **out);
+static KdbRows *sql__fetch_last_inserted_rows(KumDB *db, const char *table_name, size_t n);
+static KdbStatus sql__build_returning_rows_from_filter(KumDB *db, const char *table_name, const char **filters,
+                                                         int return_all, char cols[][KDB_SQL_IDENT_BUF], int ncols,
+                                                         KdbRows **rows_out);
+static char *sql__build_id_in_filter_from_rows(const KdbRows *rows);
+static void sql__free_row_fields(KdbRow *row);
+
 static KdbStatus sql__err(const char *fmt, ...) {
     char buf[512];
     va_list args;
@@ -1299,7 +1317,7 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
  * otherwise. */
 static KdbStatus sql__exec_insert_on_conflict(SqlParser *p, KumDB *db, const char *table_name,
                                                char col_names[][KDB_SQL_IDENT_BUF], const SqlToken *value_toks,
-                                               uint32_t ncols, size_t *affected_out) {
+                                               uint32_t ncols, size_t *affected_out, KdbRows **rows_out) {
     sql__advance(p); /* ON */
     if (!sql__kw_is(&p->cur, "CONFLICT")) return sql__err("expected CONFLICT after ON");
     sql__advance(p);
@@ -1342,69 +1360,126 @@ static KdbStatus sql__exec_insert_on_conflict(SqlParser *p, KumDB *db, const cha
     if (!sql__kw_is(&p->cur, "DO")) return sql__err("expected DO after ON CONFLICT (...)");
     sql__advance(p);
 
+    int did_insert = 0, did_update = 0;
+    size_t action_count = 0;
+
     if (sql__kw_is(&p->cur, "NOTHING")) {
         sql__advance(p);
-        if (existing > 0) { if (affected_out) *affected_out = 0; return KDB_OK; }
-
-        KdbField fields[KDB_SQL_MAX_COLUMNS + 1];
-        for (uint32_t i = 0; i < ncols; i++) {
-            if (!sql__value_to_field(col_names[i], &value_toks[i], &fields[i]))
-                return sql__err("unsupported value for column '%s'", col_names[i]);
+        if (existing == 0) {
+            KdbField fields[KDB_SQL_MAX_COLUMNS + 1];
+            for (uint32_t i = 0; i < ncols; i++) {
+                if (!sql__value_to_field(col_names[i], &value_toks[i], &fields[i]))
+                    return sql__err("unsupported value for column '%s'", col_names[i]);
+            }
+            fields[ncols] = kdb_field_end();
+            KdbStatus st = kdb_add(db, table_name, fields);
+            if (st != KDB_OK) return st;
+            did_insert = 1;
+            action_count = 1;
         }
-        fields[ncols] = kdb_field_end();
-        KdbStatus st = kdb_add(db, table_name, fields);
-        if (st == KDB_OK && affected_out) *affected_out = 1;
-        return st;
-    }
-
-    if (!sql__kw_is(&p->cur, "UPDATE")) return sql__err("expected NOTHING or UPDATE after ON CONFLICT (...) DO");
-    sql__advance(p);
-    if (!sql__kw_is(&p->cur, "SET")) return sql__err("expected SET after ON CONFLICT (...) DO UPDATE");
-    sql__advance(p);
-
-    char set_names[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
-    SqlToken set_vals[KDB_SQL_MAX_COLUMNS];
-    uint32_t nset = 0;
-    for (;;) {
-        const char *cname;
-        if (!sql__ident_text(&p->cur, &cname)) return sql__err("expected a column name after SET");
-        if (nset >= KDB_SQL_MAX_COLUMNS) return sql__err("too many SET assignments (max %d)", KDB_SQL_MAX_COLUMNS);
-        snprintf(set_names[nset], sizeof(set_names[0]), "%.255s", cname);
+        /* existing > 0: a true no-op, did_insert/did_update/action_count all stay 0 */
+    } else if (sql__kw_is(&p->cur, "UPDATE")) {
         sql__advance(p);
-        if (p->cur.type != SQLTOK_EQ) return sql__err("expected '=' after column '%s' in SET", set_names[nset]);
+        if (!sql__kw_is(&p->cur, "SET")) return sql__err("expected SET after ON CONFLICT (...) DO UPDATE");
         sql__advance(p);
-        set_vals[nset] = p->cur;
-        sql__advance(p);
-        nset++;
-        if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
-        break;
-    }
 
-    if (existing > 0) {
-        KdbField patch[KDB_SQL_MAX_COLUMNS + 1];
-        for (uint32_t i = 0; i < nset; i++) {
-            if (!sql__value_to_field(set_names[i], &set_vals[i], &patch[i]))
-                return sql__err("unsupported value for column '%s' in SET", set_names[i]);
+        char set_names[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
+        SqlToken set_vals[KDB_SQL_MAX_COLUMNS];
+        uint32_t nset = 0;
+        for (;;) {
+            const char *cname;
+            if (!sql__ident_text(&p->cur, &cname)) return sql__err("expected a column name after SET");
+            if (nset >= KDB_SQL_MAX_COLUMNS) return sql__err("too many SET assignments (max %d)", KDB_SQL_MAX_COLUMNS);
+            snprintf(set_names[nset], sizeof(set_names[0]), "%.255s", cname);
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_EQ) return sql__err("expected '=' after column '%s' in SET", set_names[nset]);
+            sql__advance(p);
+            set_vals[nset] = p->cur;
+            sql__advance(p);
+            nset++;
+            if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+            break;
         }
-        patch[nset] = kdb_field_end();
-        size_t updated = 0;
-        KdbStatus st = kdb_update(db, table_name, nkeys > 0 ? filters : NULL, patch, &updated);
-        if (st == KDB_OK && affected_out) *affected_out = updated;
-        return st;
+
+        if (existing > 0) {
+            KdbField patch[KDB_SQL_MAX_COLUMNS + 1];
+            for (uint32_t i = 0; i < nset; i++) {
+                if (!sql__value_to_field(set_names[i], &set_vals[i], &patch[i]))
+                    return sql__err("unsupported value for column '%s' in SET", set_names[i]);
+            }
+            patch[nset] = kdb_field_end();
+            size_t updated = 0;
+            KdbStatus st = kdb_update(db, table_name, nkeys > 0 ? filters : NULL, patch, &updated);
+            if (st != KDB_OK) return st;
+            did_update = 1;
+            action_count = updated;
+        } else {
+            KdbField fields[KDB_SQL_MAX_COLUMNS + 1];
+            for (uint32_t i = 0; i < ncols; i++) {
+                if (!sql__value_to_field(col_names[i], &value_toks[i], &fields[i]))
+                    return sql__err("unsupported value for column '%s'", col_names[i]);
+            }
+            fields[ncols] = kdb_field_end();
+            KdbStatus st = kdb_add(db, table_name, fields);
+            if (st != KDB_OK) return st;
+            did_insert = 1;
+            action_count = 1;
+        }
+    } else {
+        return sql__err("expected NOTHING or UPDATE after ON CONFLICT (...) DO");
     }
 
-    KdbField fields[KDB_SQL_MAX_COLUMNS + 1];
-    for (uint32_t i = 0; i < ncols; i++) {
-        if (!sql__value_to_field(col_names[i], &value_toks[i], &fields[i]))
-            return sql__err("unsupported value for column '%s'", col_names[i]);
+    if (affected_out) *affected_out = action_count;
+
+    int has_returning = 0, return_all = 0, rncols = 0;
+    char ret_cols[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
+    if (!sql__parse_returning_clause(p, &has_returning, &return_all, ret_cols, &rncols)) return kdb_last_status();
+    if (!has_returning || !rows_out) return KDB_OK;
+
+    KdbRows *acc = (KdbRows *)calloc(1, sizeof(KdbRows));
+    if (!acc) { kdb_err_oom("returning rows"); return KDB_ERR_OOM; }
+
+    if (did_insert) {
+        KdbRow *ins = NULL;
+        KdbStatus st = sql__fetch_just_inserted_row(db, table_name, &ins);
+        if (st != KDB_OK) { kdb_rows_free(acc); return st; }
+        KdbRow rr;
+        if (!sql__build_returning_row(&rr, ins, return_all, ret_cols, rncols)) {
+            sql__free_row_fields(ins); free(ins); kdb_rows_free(acc);
+            kdb_err_oom("returning row");
+            return KDB_ERR_OOM;
+        }
+        sql__free_row_fields(ins); free(ins);
+        if (!sql__returning_rows_append(acc, &rr)) {
+            sql__free_row_fields(&rr); kdb_rows_free(acc);
+            kdb_err_oom("returning rows");
+            return KDB_ERR_OOM;
+        }
+    } else if (did_update) {
+        KdbRows *matched = kdb_find_ex(db, table_name, nkeys > 0 ? filters : NULL, NULL);
+        if (!matched) { kdb_rows_free(acc); return kdb_last_status(); }
+        for (size_t i = 0; i < matched->count; i++) {
+            KdbRow rr;
+            if (!sql__build_returning_row(&rr, &matched->rows[i], return_all, ret_cols, rncols)) {
+                kdb_rows_free(matched); kdb_rows_free(acc);
+                kdb_err_oom("returning row");
+                return KDB_ERR_OOM;
+            }
+            if (!sql__returning_rows_append(acc, &rr)) {
+                sql__free_row_fields(&rr); kdb_rows_free(matched); kdb_rows_free(acc);
+                kdb_err_oom("returning rows");
+                return KDB_ERR_OOM;
+            }
+        }
+        kdb_rows_free(matched);
     }
-    fields[ncols] = kdb_field_end();
-    KdbStatus st = kdb_add(db, table_name, fields);
-    if (st == KDB_OK && affected_out) *affected_out = 1;
-    return st;
+    /* DO NOTHING's no-op case: acc stays empty, correctly returning 0 rows */
+
+    *rows_out = acc;
+    return KDB_OK;
 }
 
-static KdbStatus sql__exec_insert(SqlParser *p, KumDB *db, size_t *affected_out) {
+static KdbStatus sql__exec_insert(SqlParser *p, KumDB *db, size_t *affected_out, KdbRows **rows_out) {
     sql__advance(p); /* INSERT */
     if (!sql__kw_is(&p->cur, "INTO")) return sql__err("expected INTO after INSERT");
     sql__advance(p);
@@ -1477,8 +1552,41 @@ static KdbStatus sql__exec_insert(SqlParser *p, KumDB *db, size_t *affected_out)
             affected++;
         }
         kdb_rows_free(rows);
+        if (st != KDB_OK) { if (affected_out) *affected_out = affected; return st; }
+
+        int has_returning = 0, return_all = 0, rncols = 0;
+        char ret_cols[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
+        if (!sql__parse_returning_clause(p, &has_returning, &return_all, ret_cols, &rncols)) return kdb_last_status();
+        if (has_returning && rows_out) {
+            /* One query for all `affected` rows (ORDER BY id DESC LIMIT
+             * affected, reversed back to insertion order), not one fetch
+             * per row -- same single-writer-safe "the last N ids are
+             * unambiguously the N rows this loop just added" reasoning
+             * sql__fetch_just_inserted_row relies on for the single-row
+             * case. */
+            KdbRows *inserted = sql__fetch_last_inserted_rows(db, table_name, affected);
+            if (!inserted) return kdb_last_status();
+            KdbRows *acc = (KdbRows *)calloc(1, sizeof(KdbRows));
+            if (!acc) { kdb_rows_free(inserted); kdb_err_oom("returning rows"); return KDB_ERR_OOM; }
+            for (size_t i = 0; i < inserted->count; i++) {
+                KdbRow rr;
+                if (!sql__build_returning_row(&rr, &inserted->rows[i], return_all, ret_cols, rncols)) {
+                    kdb_rows_free(inserted); kdb_rows_free(acc);
+                    kdb_err_oom("returning row");
+                    return KDB_ERR_OOM;
+                }
+                if (!sql__returning_rows_append(acc, &rr)) {
+                    sql__free_row_fields(&rr); kdb_rows_free(inserted); kdb_rows_free(acc);
+                    kdb_err_oom("returning rows");
+                    return KDB_ERR_OOM;
+                }
+            }
+            kdb_rows_free(inserted);
+            *rows_out = acc;
+        }
+
         if (affected_out) *affected_out = affected;
-        return st;
+        return KDB_OK;
     }
 
     if (!sql__kw_is(&p->cur, "VALUES")) return sql__err("expected VALUES or SELECT after the column list for '%s'", table_name);
@@ -1516,7 +1624,7 @@ static KdbStatus sql__exec_insert(SqlParser *p, KumDB *db, size_t *affected_out)
             return sql__err("column count (%u) doesn't match value count (%u) for '%s'", ncols, nvals, table_name);
 
         if (first_tuple && sql__kw_is(&p->cur, "ON"))
-            return sql__exec_insert_on_conflict(p, db, table_name, col_names, value_toks, ncols, affected_out);
+            return sql__exec_insert_on_conflict(p, db, table_name, col_names, value_toks, ncols, affected_out, rows_out);
 
         KdbField fields[KDB_SQL_MAX_COLUMNS + 1];
         for (uint32_t i = 0; i < ncols; i++) {
@@ -1538,6 +1646,32 @@ static KdbStatus sql__exec_insert(SqlParser *p, KumDB *db, size_t *affected_out)
         return sql__err("ON CONFLICT is only supported with a single-row VALUES list, not a multi-row INSERT");
 
     if (affected_out) *affected_out = affected;
+
+    int has_returning = 0, return_all = 0, rncols = 0;
+    char ret_cols[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
+    if (!sql__parse_returning_clause(p, &has_returning, &return_all, ret_cols, &rncols)) return kdb_last_status();
+    if (has_returning && rows_out) {
+        KdbRows *inserted = sql__fetch_last_inserted_rows(db, table_name, affected);
+        if (!inserted) return kdb_last_status();
+        KdbRows *acc = (KdbRows *)calloc(1, sizeof(KdbRows));
+        if (!acc) { kdb_rows_free(inserted); kdb_err_oom("returning rows"); return KDB_ERR_OOM; }
+        for (size_t i = 0; i < inserted->count; i++) {
+            KdbRow rr;
+            if (!sql__build_returning_row(&rr, &inserted->rows[i], return_all, ret_cols, rncols)) {
+                kdb_rows_free(inserted); kdb_rows_free(acc);
+                kdb_err_oom("returning row");
+                return KDB_ERR_OOM;
+            }
+            if (!sql__returning_rows_append(acc, &rr)) {
+                sql__free_row_fields(&rr); kdb_rows_free(inserted); kdb_rows_free(acc);
+                kdb_err_oom("returning rows");
+                return KDB_ERR_OOM;
+            }
+        }
+        kdb_rows_free(inserted);
+        *rows_out = acc;
+    }
+
     return KDB_OK;
 }
 
@@ -3764,6 +3898,205 @@ static int sql__copy_row(KdbRow *dst, const KdbRow *src) {
     return 1;
 }
 
+/* RETURNING * | col, ... -- optional, trailing on INSERT/UPDATE/DELETE.
+ * *has_returning comes back 0 if the clause isn't there at all (not an
+ * error -- cols, ncols, and return_all are untouched in that case).
+ * Returns 0 on a genuine parse error (message already set), 1 otherwise. */
+static int sql__parse_returning_clause(SqlParser *p, int *has_returning, int *return_all,
+                                        char cols[][KDB_SQL_IDENT_BUF], int *ncols) {
+    *has_returning = 0;
+    if (!sql__kw_is(&p->cur, "RETURNING")) return 1;
+    sql__advance(p);
+    *has_returning = 1;
+    *return_all = 0;
+    *ncols = 0;
+
+    if (p->cur.type == SQLTOK_STAR) {
+        *return_all = 1;
+        sql__advance(p);
+        return 1;
+    }
+    for (;;) {
+        const char *cname;
+        if (!sql__ident_text(&p->cur, &cname)) { sql__err("expected a column name or '*' after RETURNING"); return 0; }
+        if (*ncols >= KDB_SQL_MAX_COLUMNS) { sql__err("too many RETURNING columns (max %d)", KDB_SQL_MAX_COLUMNS); return 0; }
+        snprintf(cols[*ncols], KDB_SQL_IDENT_BUF, "%.255s", cname);
+        (*ncols)++;
+        sql__advance(p);
+        if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+        break;
+    }
+    return 1;
+}
+
+/* Builds one RETURNING output row from a fetched/materialized row.
+ * RETURNING * copies every ordinary field, same convention plain
+ * "SELECT *" already uses in this dialect -- it excludes the id/
+ * created_at/updated_at pseudo-columns (they're not really part of a
+ * row's field list, same reasoning as everywhere else that's true here),
+ * so naming one explicitly ("RETURNING id, name") is how to get it back;
+ * given RETURNING's single most common real use is recovering a
+ * generated id, that's an important asymmetry to know about, not just a
+ * corner case. Returns 0 on OOM. */
+static int sql__build_returning_row(KdbRow *dst, const KdbRow *src, int return_all,
+                                     char cols[][KDB_SQL_IDENT_BUF], int ncols) {
+    if (return_all) return sql__copy_row(dst, src);
+
+    memset(dst, 0, sizeof(*dst));
+    dst->fields = (KdbField *)calloc(ncols > 0 ? (size_t)ncols : 1, sizeof(KdbField));
+    if (!dst->fields) return 0;
+    for (int i = 0; i < ncols; i++) {
+        char *nm = strdup(cols[i]);
+        if (!nm) return 0;
+        KdbField f;
+        f.name = nm;
+        if (strcmp(cols[i], "id") == 0) {
+            f.type = KDB_TYPE_INT; f.v.as_int = (int64_t)src->id;
+        } else if (strcmp(cols[i], "created_at") == 0) {
+            f.type = KDB_TYPE_INT; f.v.as_int = (int64_t)src->created_at;
+        } else if (strcmp(cols[i], "updated_at") == 0) {
+            f.type = KDB_TYPE_INT; f.v.as_int = (int64_t)src->updated_at;
+        } else {
+            const KdbField *sf = kdb_row_get(src, cols[i]);
+            if (sf) {
+                f.type = sf->type;
+                if (!sql__copy_field_value(&f, sf)) { free(nm); return 0; }
+            } else {
+                f.type = KDB_TYPE_NULL;
+            }
+        }
+        dst->fields[dst->field_count++] = f;
+    }
+    return 1;
+}
+
+/* Moves row into acc (row's own storage becomes acc's -- caller must not
+ * separately free row after a successful call). Returns 0 on OOM (row is
+ * left untouched, still safe for the caller to free itself). */
+static int sql__returning_rows_append(KdbRows *acc, KdbRow *row) {
+    KdbRow *grown = (KdbRow *)realloc(acc->rows, (acc->count + 1) * sizeof(KdbRow));
+    if (!grown) return 0;
+    acc->rows = grown;
+    acc->rows[acc->count++] = *row;
+    return 1;
+}
+
+/* Locates the row a just-completed kdb_add() added, for RETURNING --
+ * there's no "give me the row I just added" API, so this re-queries for
+ * the highest id in the table instead. Correct specifically because this
+ * engine is single-writer/single-process: nothing else can insert
+ * between kdb_add() returning and this fetch running, so the highest id
+ * unambiguously names the row that was just added, every time. *out is
+ * heap-owned (sql__free_row_fields, then free()) on success. Returns
+ * KDB_ERR_NOT_FOUND if the table is somehow empty right after an insert
+ * into it (would mean an invariant this function relies on broke
+ * elsewhere, not a normal runtime condition). */
+static KdbStatus sql__fetch_just_inserted_row(KumDB *db, const char *table_name, KdbRow **out) {
+    KdbFindOpts opts = { "id", 0, 1, 0 }; /* ORDER BY id DESC LIMIT 1 */
+    KdbRows *r = kdb_find_ex(db, table_name, NULL, &opts);
+    if (!r) return kdb_last_status();
+    if (r->count == 0) {
+        kdb_rows_free(r);
+        kdb_set_error(KDB_ERR_NOT_FOUND, "SQL error: couldn't locate the row just inserted into '%s' for RETURNING", table_name);
+        return KDB_ERR_NOT_FOUND;
+    }
+    KdbRow *copy = (KdbRow *)malloc(sizeof(KdbRow));
+    if (!copy) { kdb_rows_free(r); kdb_err_oom("returning row"); return KDB_ERR_OOM; }
+    if (!sql__copy_row(copy, &r->rows[0])) {
+        sql__free_row_fields(copy);
+        free(copy);
+        kdb_rows_free(r);
+        kdb_err_oom("returning row");
+        return KDB_ERR_OOM;
+    }
+    copy->id = r->rows[0].id;
+    copy->created_at = r->rows[0].created_at;
+    copy->updated_at = r->rows[0].updated_at;
+    kdb_rows_free(r);
+    *out = copy;
+    return KDB_OK;
+}
+
+/* Same idea as sql__fetch_just_inserted_row, generalized to n rows added
+ * by a run of n consecutive kdb_add() calls (a multi-row VALUES list or
+ * an INSERT ... SELECT) -- fetched in one query (ORDER BY id DESC LIMIT
+ * n) rather than n separate ones, then reversed back into insertion
+ * order for a more intuitive RETURNING result. Correct for the same
+ * single-writer reason: as long as nothing else can insert into the
+ * table between the last kdb_add() and this call, the n highest ids are
+ * unambiguously exactly the rows that run just added. Returns NULL on
+ * error (error already set). */
+static KdbRows *sql__fetch_last_inserted_rows(KumDB *db, const char *table_name, size_t n) {
+    if (n == 0) return (KdbRows *)calloc(1, sizeof(KdbRows));
+    KdbFindOpts opts = { "id", 0, n, 0 }; /* ORDER BY id DESC LIMIT n */
+    KdbRows *r = kdb_find_ex(db, table_name, NULL, &opts);
+    if (!r) return NULL;
+    if (r->count == 0) return r;
+    for (size_t i = 0, j = r->count - 1; i < j; i++, j--) {
+        KdbRow tmp = r->rows[i];
+        r->rows[i] = r->rows[j];
+        r->rows[j] = tmp;
+    }
+    return r;
+}
+
+/* Fetches rows matching filters and builds a RETURNING result set from
+ * them -- shared by UPDATE (fetched with the same filter that selected
+ * which rows to touch, run *after* kdb_update so the returned state
+ * reflects the patch -- correct since neither WHERE nor SET here can
+ * change which rows match filters, only column values that aren't part
+ * of it) and DELETE (fetched by the caller *before* kdb_delete runs,
+ * since there's nothing left to fetch by filter afterward -- that's the
+ * pre-delete image, which is what RETURNING on a DELETE means anyway).
+ * *rows_out is set on success. Returns an error status on failure (error
+ * already set). */
+static KdbStatus sql__build_returning_rows_from_filter(KumDB *db, const char *table_name, const char **filters,
+                                                         int return_all, char cols[][KDB_SQL_IDENT_BUF], int ncols,
+                                                         KdbRows **rows_out) {
+    KdbRows *matched = kdb_find_ex(db, table_name, filters, NULL);
+    if (!matched) return kdb_last_status();
+    KdbRows *acc = (KdbRows *)calloc(1, sizeof(KdbRows));
+    if (!acc) { kdb_rows_free(matched); kdb_err_oom("returning rows"); return KDB_ERR_OOM; }
+    for (size_t i = 0; i < matched->count; i++) {
+        KdbRow rr;
+        if (!sql__build_returning_row(&rr, &matched->rows[i], return_all, cols, ncols)) {
+            kdb_rows_free(matched); kdb_rows_free(acc);
+            kdb_err_oom("returning row");
+            return KDB_ERR_OOM;
+        }
+        if (!sql__returning_rows_append(acc, &rr)) {
+            sql__free_row_fields(&rr); kdb_rows_free(matched); kdb_rows_free(acc);
+            kdb_err_oom("returning rows");
+            return KDB_ERR_OOM;
+        }
+    }
+    kdb_rows_free(matched);
+    *rows_out = acc;
+    return KDB_OK;
+}
+
+/* Builds an "id__in=1,2,..." filter string (the same shape
+ * sql__resolve_where_to_id_filter's own id-list-building loop produces)
+ * from an already-fetched KdbRows -- used to re-target the exact same
+ * rows by id after they've been mutated, when re-applying the original
+ * WHERE filter wouldn't reliably find them anymore (UPDATE's WHERE and
+ * SET can reference the same column, e.g. "SET status='done' WHERE
+ * status='pending'" -- re-querying WHERE status='pending' after that
+ * update runs would wrongly find nothing). Returns a heap string the
+ * caller owns ("id__in=-1" for zero rows -- no real row has that id, so
+ * it just matches nothing, keeping every caller's code uniform without a
+ * separate empty-set case), or NULL on OOM (error already set). */
+static char *sql__build_id_in_filter_from_rows(const KdbRows *rows) {
+    if (rows->count == 0) return strdup("id__in=-1");
+    size_t need = 8 + rows->count * 24;
+    char *buf = malloc(need);
+    if (!buf) { kdb_err_oom("id__in filter string"); return NULL; }
+    size_t pos = (size_t)snprintf(buf, need, "id__in=");
+    for (size_t i = 0; i < rows->count; i++)
+        pos += (size_t)snprintf(buf + pos, need - pos, "%s%llu", i > 0 ? "," : "", (unsigned long long)rows->rows[i].id);
+    return buf;
+}
+
 /* Fetches a JOIN operand's rows -- straight from storage for a real
  * table, or by re-running its stored query fresh for a view/CTE (same
  * "no caching" philosophy every other view-consuming path in this file
@@ -4720,7 +5053,7 @@ static int sql__resolve_where_to_id_filter(KumDB *db, const char *table_name, co
     return 1;
 }
 
-static KdbStatus sql__exec_update(SqlParser *p, KumDB *db, size_t *affected_out) {
+static KdbStatus sql__exec_update(SqlParser *p, KumDB *db, size_t *affected_out, KdbRows **rows_out) {
     sql__advance(p); /* UPDATE */
     const char *tname;
     if (!sql__ident_text(&p->cur, &tname)) return sql__err("expected a table name after UPDATE");
@@ -4754,6 +5087,13 @@ static KdbStatus sql__exec_update(SqlParser *p, KumDB *db, size_t *affected_out)
     int used_parens = 0;
     if (!sql__parse_where_expr(p, db, table_name, table_name, &where_tree, &used_parens)) return kdb_last_status();
 
+    int has_returning = 0, return_all = 0, rncols = 0;
+    char ret_cols[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
+    if (!sql__parse_returning_clause(p, &has_returning, &return_all, ret_cols, &rncols)) {
+        sql__free_cond_node(where_tree);
+        return kdb_last_status();
+    }
+
     KdbField patch[KDB_SQL_MAX_COLUMNS + 1];
     for (uint32_t i = 0; i < nset; i++) {
         if (!sql__value_to_field(set_names[i], &set_vals[i], &patch[i])) {
@@ -4770,9 +5110,23 @@ static KdbStatus sql__exec_update(SqlParser *p, KumDB *db, size_t *affected_out)
         int ok = sql__resolve_where_to_id_filter(db, table_name, where_tree, &id_filter);
         sql__free_cond_node(where_tree);
         if (!ok) return kdb_last_status();
-        if (!id_filter) { if (affected_out) *affected_out = 0; return KDB_OK; }
+        if (!id_filter) {
+            if (affected_out) *affected_out = 0;
+            if (has_returning && rows_out) {
+                KdbRows *acc = (KdbRows *)calloc(1, sizeof(KdbRows));
+                if (!acc) { kdb_err_oom("returning rows"); return KDB_ERR_OOM; }
+                *rows_out = acc;
+            }
+            return KDB_OK;
+        }
         const char *fp[2] = { id_filter, NULL };
         st = kdb_update(db, table_name, fp, patch, &updated);
+        /* RETURNING re-fetches by the same filter, after the update --
+         * correct here since fp names rows by id, which SET can't change. */
+        if (st == KDB_OK && has_returning && rows_out) {
+            KdbStatus rst = sql__build_returning_rows_from_filter(db, table_name, fp, return_all, ret_cols, rncols, rows_out);
+            if (rst != KDB_OK) { free(id_filter); return rst; }
+        }
         free(id_filter);
     } else {
         char *flat_filters[KDB_SQL_MAX_COND];
@@ -4786,14 +5140,37 @@ static KdbStatus sql__exec_update(SqlParser *p, KumDB *db, size_t *affected_out)
         const char *filter_ptrs[KDB_SQL_MAX_COND + 1];
         for (int i = 0; i < nfilt; i++) filter_ptrs[i] = flat_filters[i];
         filter_ptrs[nfilt] = NULL;
+
+        /* WHERE and SET can reference the same column ("SET status='done'
+         * WHERE status='pending'"), so re-applying filter_ptrs itself
+         * after the update could wrongly find nothing -- the matching
+         * rows' ids are captured *before* the update instead, then
+         * re-targeted by id (which SET can never change) afterward. Only
+         * done when RETURNING is actually requested -- no extra fetch for
+         * the common case. */
+        char *id_filter = NULL;
+        if (has_returning && rows_out) {
+            KdbRows *pre = kdb_find_ex(db, table_name, nfilt > 0 ? filter_ptrs : NULL, NULL);
+            if (!pre) { sql__free_filters(flat_filters, nfilt); return kdb_last_status(); }
+            id_filter = sql__build_id_in_filter_from_rows(pre);
+            kdb_rows_free(pre);
+            if (!id_filter) { sql__free_filters(flat_filters, nfilt); return KDB_ERR_OOM; }
+        }
+
         st = kdb_update(db, table_name, nfilt > 0 ? filter_ptrs : NULL, patch, &updated);
+        if (st == KDB_OK && has_returning && rows_out) {
+            const char *idf[2] = { id_filter, NULL };
+            KdbStatus rst = sql__build_returning_rows_from_filter(db, table_name, idf, return_all, ret_cols, rncols, rows_out);
+            if (rst != KDB_OK) { free(id_filter); sql__free_filters(flat_filters, nfilt); return rst; }
+        }
+        free(id_filter);
         sql__free_filters(flat_filters, nfilt);
     }
     if (st == KDB_OK && affected_out) *affected_out = updated;
     return st;
 }
 
-static KdbStatus sql__exec_delete(SqlParser *p, KumDB *db, size_t *affected_out) {
+static KdbStatus sql__exec_delete(SqlParser *p, KumDB *db, size_t *affected_out, KdbRows **rows_out) {
     sql__advance(p); /* DELETE */
     if (!sql__kw_is(&p->cur, "FROM")) return sql__err("expected FROM after DELETE");
     sql__advance(p);
@@ -4807,6 +5184,13 @@ static KdbStatus sql__exec_delete(SqlParser *p, KumDB *db, size_t *affected_out)
     int used_parens = 0;
     if (!sql__parse_where_expr(p, db, table_name, table_name, &where_tree, &used_parens)) return kdb_last_status();
 
+    int has_returning = 0, return_all = 0, rncols = 0;
+    char ret_cols[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
+    if (!sql__parse_returning_clause(p, &has_returning, &return_all, ret_cols, &rncols)) {
+        sql__free_cond_node(where_tree);
+        return kdb_last_status();
+    }
+
     size_t deleted = 0;
     KdbStatus st;
     if (used_parens) {
@@ -4814,9 +5198,29 @@ static KdbStatus sql__exec_delete(SqlParser *p, KumDB *db, size_t *affected_out)
         int ok = sql__resolve_where_to_id_filter(db, table_name, where_tree, &id_filter);
         sql__free_cond_node(where_tree);
         if (!ok) return kdb_last_status();
-        if (!id_filter) { if (affected_out) *affected_out = 0; return KDB_OK; }
+        if (!id_filter) {
+            if (affected_out) *affected_out = 0;
+            if (has_returning && rows_out) {
+                KdbRows *acc = (KdbRows *)calloc(1, sizeof(KdbRows));
+                if (!acc) { kdb_err_oom("returning rows"); return KDB_ERR_OOM; }
+                *rows_out = acc;
+            }
+            return KDB_OK;
+        }
         const char *fp[2] = { id_filter, NULL };
+
+        /* Fetched *before* deleting -- this is the pre-delete image
+         * RETURNING on a DELETE means, and there's nothing left to fetch
+         * by filter afterward anyway. Only committed to *rows_out once
+         * kdb_delete itself actually succeeds. */
+        KdbRows *ret_rows = NULL;
+        if (has_returning && rows_out) {
+            KdbStatus rst = sql__build_returning_rows_from_filter(db, table_name, fp, return_all, ret_cols, rncols, &ret_rows);
+            if (rst != KDB_OK) { free(id_filter); return rst; }
+        }
         st = kdb_delete(db, table_name, fp, &deleted);
+        if (st == KDB_OK && ret_rows) *rows_out = ret_rows;
+        else if (ret_rows) kdb_rows_free(ret_rows);
         free(id_filter);
     } else {
         char *flat_filters[KDB_SQL_MAX_COND];
@@ -4830,7 +5234,16 @@ static KdbStatus sql__exec_delete(SqlParser *p, KumDB *db, size_t *affected_out)
         const char *filter_ptrs[KDB_SQL_MAX_COND + 1];
         for (int i = 0; i < nfilt; i++) filter_ptrs[i] = flat_filters[i];
         filter_ptrs[nfilt] = NULL;
+
+        KdbRows *ret_rows = NULL;
+        if (has_returning && rows_out) {
+            KdbStatus rst = sql__build_returning_rows_from_filter(db, table_name, nfilt > 0 ? filter_ptrs : NULL,
+                                                                    return_all, ret_cols, rncols, &ret_rows);
+            if (rst != KDB_OK) { sql__free_filters(flat_filters, nfilt); return rst; }
+        }
         st = kdb_delete(db, table_name, nfilt > 0 ? filter_ptrs : NULL, &deleted);
+        if (st == KDB_OK && ret_rows) *rows_out = ret_rows;
+        else if (ret_rows) kdb_rows_free(ret_rows);
         sql__free_filters(flat_filters, nfilt);
     }
     if (st == KDB_OK && affected_out) *affected_out = deleted;
@@ -4853,10 +5266,10 @@ KdbStatus kdb_exec_sql(KumDB *db, const char *sql, KdbRows **rows_out, size_t *a
     if      (sql__kw_is(&p.cur, "CREATE")) st = sql__exec_create_table(&p, db);
     else if (sql__kw_is(&p.cur, "ALTER"))  st = sql__exec_alter_table(&p, db);
     else if (sql__kw_is(&p.cur, "DROP"))   st = sql__exec_drop_table(&p, db);
-    else if (sql__kw_is(&p.cur, "INSERT")) st = sql__exec_insert(&p, db, affected_out);
+    else if (sql__kw_is(&p.cur, "INSERT")) st = sql__exec_insert(&p, db, affected_out, rows_out);
     else if (sql__kw_is(&p.cur, "SELECT")) st = sql__exec_select_stmt(&p, db, rows_out);
-    else if (sql__kw_is(&p.cur, "UPDATE")) st = sql__exec_update(&p, db, affected_out);
-    else if (sql__kw_is(&p.cur, "DELETE")) st = sql__exec_delete(&p, db, affected_out);
+    else if (sql__kw_is(&p.cur, "UPDATE")) st = sql__exec_update(&p, db, affected_out, rows_out);
+    else if (sql__kw_is(&p.cur, "DELETE")) st = sql__exec_delete(&p, db, affected_out, rows_out);
     else if (sql__kw_is(&p.cur, "WITH"))   { sql__advance(&p); st = sql__exec_with_stmt(&p, db, rows_out); }
     else return sql__err("unrecognized statement -- expected CREATE, ALTER, DROP, INSERT, SELECT, UPDATE, DELETE, or WITH");
 

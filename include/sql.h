@@ -22,9 +22,9 @@ extern "C" {
  *   DROP TABLE t
  *   CREATE VIEW v AS SELECT ...
  *   DROP VIEW v
- *   INSERT INTO t (col, ...) VALUES (val, ...) [, (val, ...)]*
- *   INSERT INTO t (col, ...) SELECT ...
- *   INSERT INTO t (col, ...) VALUES (val, ...) ON CONFLICT (col, ...) DO NOTHING | DO UPDATE SET col = val, ...
+ *   INSERT INTO t (col, ...) VALUES (val, ...) [, (val, ...)]* [RETURNING * | col, ...]
+ *   INSERT INTO t (col, ...) SELECT ... [RETURNING * | col, ...]
+ *   INSERT INTO t (col, ...) VALUES (val, ...) ON CONFLICT (col, ...) DO NOTHING | DO UPDATE SET col = val, ... [RETURNING * | col, ...]
  *   [WITH name AS (SELECT ...) [, name2 AS (SELECT ...)]*]
  *   SELECT [DISTINCT] * | item, ... FROM t [[AS] alias]
  *                               [[INNER|LEFT [OUTER]|RIGHT [OUTER]|FULL [OUTER]|CROSS] JOIN t2 [[AS] alias2] [ON a.col OP (b.col|literal) [AND ...]]]*
@@ -34,8 +34,8 @@ extern "C" {
  *                               [(UNION|INTERSECT|EXCEPT) [ALL] SELECT ...]*
  *                               [ORDER BY col [ASC|DESC], ...]
  *                               [LIMIT n [OFFSET m]]
- *   UPDATE t SET col = val, ... [WHERE cond [AND|OR cond ...]]
- *   DELETE FROM t [WHERE cond [AND|OR cond ...]]
+ *   UPDATE t SET col = val, ... [WHERE cond [AND|OR cond ...]] [RETURNING * | col, ...]
+ *   DELETE FROM t [WHERE cond [AND|OR cond ...]] [RETURNING * | col, ...]
  *
  * INSERT always needs an explicit column list, never a bare
  * "INSERT INTO t VALUES (...)". VALUES accepts more than one
@@ -60,6 +60,19 @@ extern "C" {
  * back to a plain insert. Every ON CONFLICT column must be one of the
  * INSERT's own target columns; DO UPDATE SET's values are literals, same
  * as a plain UPDATE's SET (no referencing the row about to be inserted).
+ *
+ * RETURNING * | col, ... trails INSERT (every form, including multi-row
+ * VALUES, INSERT ... SELECT, and ON CONFLICT)/UPDATE/DELETE and hands
+ * back the affected rows instead of just a count -- newly inserted
+ * row(s) for INSERT, post-update state for UPDATE, the pre-delete image
+ * for DELETE. RETURNING * excludes id/created_at/updated_at, same
+ * convention plain SELECT * already uses; name one explicitly
+ * ("RETURNING id") to get it back, which matters more here than almost
+ * anywhere else since recovering a generated id is RETURNING's single
+ * most common real use. 0 matching rows on UPDATE/DELETE just means 0
+ * returned rows, not an error. No EXCLUDED-style reference to the row
+ * that would have been inserted (Postgres's upsert idiom) -- DO UPDATE
+ * SET's values are plain literals either way.
  *
  * ORDER BY (top-level, not OVER's own) takes one or more comma-separated
  * columns, each with its own optional ASC/DESC, ties broken left to right

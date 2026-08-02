@@ -318,9 +318,9 @@ DROP TABLE t
 CREATE VIEW v AS SELECT ...
 DROP VIEW v
 
-INSERT INTO t (col, ...) VALUES (val, ...) [, (val, ...)]*
-INSERT INTO t (col, ...) SELECT ...
-INSERT INTO t (col, ...) VALUES (val, ...) ON CONFLICT (col, ...) DO NOTHING | DO UPDATE SET col = val, ...
+INSERT INTO t (col, ...) VALUES (val, ...) [, (val, ...)]* [RETURNING * | col, ...]
+INSERT INTO t (col, ...) SELECT ... [RETURNING * | col, ...]
+INSERT INTO t (col, ...) VALUES (val, ...) ON CONFLICT (col, ...) DO NOTHING | DO UPDATE SET col = val, ... [RETURNING * | col, ...]
 
 [WITH name AS (SELECT ...) [, name2 AS (SELECT ...)]*]
 SELECT [DISTINCT] * | item, ... FROM t | (SELECT ...) [[AS] alias]
@@ -332,8 +332,8 @@ SELECT [DISTINCT] * | item, ... FROM t | (SELECT ...) [[AS] alias]
     [ORDER BY col [ASC|DESC], ...]
     [LIMIT n [OFFSET m]]
 
-UPDATE t SET col = val, ... [WHERE cond [AND|OR cond ...]]
-DELETE FROM t [WHERE cond [AND|OR cond ...]]
+UPDATE t SET col = val, ... [WHERE cond [AND|OR cond ...]] [RETURNING * | col, ...]
+DELETE FROM t [WHERE cond [AND|OR cond ...]] [RETURNING * | col, ...]
 ```
 
 **Comments:** `-- to end of line` and `/* block, can span lines */` are
@@ -388,6 +388,29 @@ than one column is fine, checked together as a conjunction, same
 INSERT INTO sales (region, amount) VALUES ('east', 100.0), ('west', 50.0)
 INSERT INTO archive (name, total) SELECT name, SUM(amount) FROM sales GROUP BY name
 ```
+
+**`RETURNING * | col, ...`** trails `INSERT`/`UPDATE`/`DELETE` (every form
+of `INSERT`, including multi-row `VALUES`, `INSERT ... SELECT`, and the
+upsert forms above) and hands back the affected rows instead of just a
+count — the newly inserted row(s) for `INSERT`, the post-update state for
+`UPDATE`, the row(s) as they were right before deletion for `DELETE`.
+`RETURNING *` excludes the `id`/`created_at`/`updated_at` pseudo-columns,
+same convention plain `SELECT *` already uses elsewhere in this dialect —
+name one explicitly (`RETURNING id, name`) to get it back, which matters
+here more than almost anywhere else, since recovering a generated `id` is
+`RETURNING`'s single most common real use:
+
+```sql
+INSERT INTO users (name, email) VALUES ('Alice', 'a@x.com') RETURNING id
+UPDATE users SET status = 'active' WHERE id = 5 RETURNING id, status
+DELETE FROM users WHERE status = 'banned' RETURNING id, email
+```
+
+An `UPDATE`/`DELETE` `RETURNING` with no matching rows just comes back
+with 0 rows, not an error, same as an unmatched `ON CONFLICT ... DO
+NOTHING`. There's no `EXCLUDED`-style reference to the row that would
+have been inserted (Postgres's upsert idiom) — `DO UPDATE SET`'s values
+are plain literals either way, `RETURNING` or not.
 
 **`ORDER BY`** (the top-level clause, after `GROUP BY`/`UNION`/etc, not
 `OVER`'s own `ORDER BY`) takes one or more comma-separated columns, each

@@ -241,6 +241,157 @@ static void test_upsert(void) {
     teardown(db);
 }
 
+static void test_returning(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (name TEXT, status TEXT)"));
+
+    KdbRows *rows = NULL;
+
+    /* RETURNING * excludes id/created_at/updated_at, same convention
+     * plain SELECT * already uses -- name them explicitly to get them */
+    ASSERT_OK(kdb_exec_sql(db, "INSERT INTO t (name, status) VALUES ('alice', 'new') RETURNING *", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &name));
+        ASSERT_STR(name, "alice");
+        ASSERT(kdb_row_get(&rows->rows[0], "id") == NULL);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* single-row INSERT RETURNING id explicitly */
+    ASSERT_OK(kdb_exec_sql(db, "INSERT INTO t (name, status) VALUES ('bob', 'new') RETURNING id, name", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        int64_t id = 0;
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "id", &id));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &name));
+        ASSERT_EQ(id, 2);
+        ASSERT_STR(name, "bob");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* multi-row INSERT RETURNING, in insertion order */
+    ASSERT_OK(kdb_exec_sql(db,
+        "INSERT INTO t (name, status) VALUES ('carol','new'), ('dave','new'), ('eve','new') RETURNING id, name",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        const char *n0 = NULL, *n1 = NULL, *n2 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &n0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "name", &n1));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[2], "name", &n2));
+        ASSERT_STR(n0, "carol");
+        ASSERT_STR(n1, "dave");
+        ASSERT_STR(n2, "eve");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* INSERT ... SELECT RETURNING */
+    ASSERT_OK(sql(db, "CREATE TABLE t2 (name TEXT)"));
+    ASSERT_OK(kdb_exec_sql(db,
+        "INSERT INTO t2 (name) SELECT name FROM t WHERE status = 'new' RETURNING id, name",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 5u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* UPDATE RETURNING gives the post-update state */
+    ASSERT_OK(kdb_exec_sql(db,
+        "UPDATE t SET status = 'active' WHERE name = 'alice' RETURNING id, name, status",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *status = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "status", &status));
+        ASSERT_STR(status, "active");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* UPDATE RETURNING when WHERE and SET reference the same column --
+     * re-fetching by the original WHERE filter after the update would
+     * wrongly find nothing, so this specifically checks the id-based
+     * re-targeting path instead */
+    ASSERT_OK(kdb_exec_sql(db,
+        "UPDATE t SET status = 'done' WHERE status = 'new' RETURNING id, name, status",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 4u); /* bob, carol, dave, eve */
+    if (rows) {
+        for (size_t i = 0; i < rows->count; i++) {
+            const char *status = NULL;
+            ASSERT_OK(kdb_row_get_string(&rows->rows[i], "status", &status));
+            ASSERT_STR(status, "done");
+        }
+        kdb_rows_free(rows); rows = NULL;
+    }
+
+    /* DELETE RETURNING gives the pre-delete image */
+    ASSERT_OK(kdb_exec_sql(db, "DELETE FROM t WHERE name = 'alice' RETURNING id, name, status", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *status = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "status", &status));
+        ASSERT_STR(status, "active");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+    {
+        const char *alice_filter[] = { "name=alice", NULL };
+        ASSERT_EQ(kdb_count(db, "t", alice_filter), 0);
+    }
+
+    /* DELETE RETURNING with a parenthesized WHERE (the id-list path) */
+    ASSERT_OK(kdb_exec_sql(db,
+        "DELETE FROM t WHERE (name = 'bob' OR name = 'carol') RETURNING id, name",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* upsert RETURNING -- insert branch, update branch, and DO NOTHING's
+     * true no-op (0 rows, not an error) */
+    ASSERT_OK(sql(db, "CREATE TABLE u (email TEXT, visits INT)"));
+    ASSERT_OK(kdb_exec_sql(db,
+        "INSERT INTO u (email, visits) VALUES ('a@x.com', 1) ON CONFLICT (email) DO UPDATE SET visits = 1 RETURNING id, visits",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    int64_t first_id = 0;
+    if (rows && rows->count == 1) ASSERT_OK(kdb_row_get_int(&rows->rows[0], "id", &first_id));
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db,
+        "INSERT INTO u (email, visits) VALUES ('a@x.com', 2) ON CONFLICT (email) DO UPDATE SET visits = 2 RETURNING id, visits",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        int64_t id = 0, visits = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "id", &id));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "visits", &visits));
+        ASSERT_EQ(id, first_id); /* same row, updated -- not a new insert */
+        ASSERT_EQ(visits, 2);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db,
+        "INSERT INTO u (email, visits) VALUES ('a@x.com', 99) ON CONFLICT (email) DO NOTHING RETURNING id, visits",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 0u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* RETURNING still parses fine when the caller passes rows_out=NULL */
+    ASSERT_OK(kdb_exec_sql(db, "INSERT INTO t (name, status) VALUES ('zed', 'x') RETURNING *", NULL, NULL));
+
+    /* statements without RETURNING still work unchanged */
+    size_t affected = 0;
+    ASSERT_OK(kdb_exec_sql(db, "INSERT INTO t (name, status) VALUES ('yolanda', 'x')", NULL, &affected));
+    ASSERT_EQ(affected, 1u);
+    ASSERT_OK(kdb_exec_sql(db, "UPDATE t SET status = 'y' WHERE name = 'yolanda'", NULL, &affected));
+    ASSERT_EQ(affected, 1u);
+    ASSERT_OK(kdb_exec_sql(db, "DELETE FROM t WHERE name = 'yolanda'", NULL, &affected));
+    ASSERT_EQ(affected, 1u);
+
+    teardown(db);
+}
+
 static void test_projection(void) {
     KumDB *db;
     setup(&db);
@@ -2321,6 +2472,7 @@ int main(void) {
     test_create_insert_select();
     test_multi_row_insert_and_insert_select();
     test_upsert();
+    test_returning();
     test_projection();
     test_limit_offset();
     test_multi_column_order_by();
