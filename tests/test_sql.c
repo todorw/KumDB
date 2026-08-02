@@ -551,6 +551,81 @@ static void test_union(void) {
     teardown(db);
 }
 
+static void test_intersect_except(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE a (v INT)"));
+    ASSERT_OK(sql(db, "CREATE TABLE b (v INT)"));
+    /* a: 1,2,2,3   b: 2,3,3,4 */
+    ASSERT_OK(sql(db, "INSERT INTO a (v) VALUES (1)"));
+    ASSERT_OK(sql(db, "INSERT INTO a (v) VALUES (2)"));
+    ASSERT_OK(sql(db, "INSERT INTO a (v) VALUES (2)"));
+    ASSERT_OK(sql(db, "INSERT INTO a (v) VALUES (3)"));
+    ASSERT_OK(sql(db, "INSERT INTO b (v) VALUES (2)"));
+    ASSERT_OK(sql(db, "INSERT INTO b (v) VALUES (3)"));
+    ASSERT_OK(sql(db, "INSERT INTO b (v) VALUES (3)"));
+    ASSERT_OK(sql(db, "INSERT INTO b (v) VALUES (4)"));
+
+    KdbRows *rows = NULL;
+
+    /* INTERSECT dedupes -- distinct values present on both sides */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT v FROM a INTERSECT SELECT v FROM b ORDER BY v ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* INTERSECT ALL: multiset intersection (min occurrence count each side) */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT v FROM a INTERSECT ALL SELECT v FROM b ORDER BY v ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u); /* one 2 (a has 2, b has 1 -> min 1), one 3 (a has 1, b has 2 -> min 1) */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* EXCEPT dedupes -- distinct values only on the left */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT v FROM a EXCEPT SELECT v FROM b", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        int64_t v = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "v", &v));
+        ASSERT_EQ(v, 1);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* EXCEPT ALL: multiset difference (a's count minus b's count per value) */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT v FROM a EXCEPT ALL SELECT v FROM b ORDER BY v ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u); /* 1 (1-0), 2 (2-1=1 survives), 3 (1-2 -> 0, gone) */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* chains 3 arms deep */
+    ASSERT_OK(sql(db, "CREATE TABLE c (v INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO c (v) VALUES (3)"));
+    ASSERT_OK(sql(db, "INSERT INTO c (v) VALUES (9)"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT v FROM a INTERSECT SELECT v FROM b INTERSECT SELECT v FROM c", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        int64_t v = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "v", &v));
+        ASSERT_EQ(v, 3);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* ORDER BY/LIMIT apply to the combined result */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT v FROM a EXCEPT SELECT v FROM b ORDER BY v ASC LIMIT 5", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* an INTERSECT that empties out stays empty and stable */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT v FROM a INTERSECT SELECT v FROM a WHERE v = 999", &rows, NULL));
+    ASSERT(rows && rows->count == 0u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* column-count mismatch is rejected */
+    ASSERT_ERR(sql(db, "SELECT v FROM a INTERSECT SELECT v, v FROM b"));
+
+    /* mixing different set operators, or ALL and non-ALL, in one chain is rejected */
+    ASSERT_ERR(sql(db, "SELECT v FROM a UNION SELECT v FROM b INTERSECT SELECT v FROM a"));
+    ASSERT_ERR(sql(db, "SELECT v FROM a INTERSECT SELECT v FROM b INTERSECT ALL SELECT v FROM a"));
+
+    teardown(db);
+}
+
 static void test_subqueries(void) {
     KumDB *db;
     setup(&db);
@@ -1758,6 +1833,7 @@ int main(void) {
     test_multi_column_group_by();
     test_having();
     test_union();
+    test_intersect_except();
     test_subqueries();
     test_join();
     test_join_chain();

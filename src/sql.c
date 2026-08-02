@@ -187,7 +187,7 @@ static int sql__ident_text(const SqlToken *t, const char **out) {
  * reserved-word list. */
 static int sql__is_clause_keyword(const char *text) {
     static const char *kws[] = {
-        "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "UNION",
+        "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "UNION", "INTERSECT", "EXCEPT",
         "JOIN", "INNER", "LEFT", "ON", "AS", NULL
     };
     for (int i = 0; kws[i]; i++)
@@ -2876,6 +2876,72 @@ static void sql__dedupe_rows(KdbRows *rows) {
     rows->count = kept;
 }
 
+/* INTERSECT (dst := dst set-intersect src, deduped) / INTERSECT ALL
+ * (multiset intersect: each dst row that matches consumes one distinct
+ * occurrence in src, so a run of duplicates in dst survives only up to
+ * however many equal rows src actually has). src is read-only and stays
+ * fully owned by the caller either way -- only dst's own rows are kept or
+ * freed here. O(n*m) row comparisons, same "fine at target row counts"
+ * precedent DISTINCT/UNION's O(n^2) dedupe already established. */
+static void sql__intersect_rows(KdbRows *dst, const KdbRows *src, int keep_all) {
+    if (!dst) return;
+    int *src_used = NULL;
+    if (keep_all && src->count > 0) src_used = calloc(src->count, sizeof(int));
+    /* calloc failure here just means ALL's multiset consumption tracking
+     * degrades to plain-set behavior for this call (every dst row can
+     * match the same src row) -- never wrong presence/absence, so it's
+     * safe to just fall through with src_used left NULL. */
+
+    size_t kept = 0;
+    for (size_t i = 0; i < dst->count; i++) {
+        long found = -1;
+        for (size_t j = 0; j < src->count; j++) {
+            if (src_used && src_used[j]) continue;
+            if (sql__row_equal(&dst->rows[i], &src->rows[j])) { found = (long)j; break; }
+        }
+        if (found >= 0) {
+            if (src_used) src_used[found] = 1;
+            if (kept != i) dst->rows[kept] = dst->rows[i];
+            kept++;
+        } else {
+            sql__free_row_fields(&dst->rows[i]);
+        }
+    }
+    dst->count = kept;
+    free(src_used);
+    if (!keep_all) sql__dedupe_rows(dst);
+}
+
+/* EXCEPT (dst := dst set-minus src, deduped) / EXCEPT ALL (multiset
+ * difference: each dst row that matches consumes one distinct occurrence
+ * in src, so a run of duplicates in dst not fully matched by src
+ * survives past however many src has). Same ownership/complexity notes
+ * as sql__intersect_rows. */
+static void sql__except_rows(KdbRows *dst, const KdbRows *src, int keep_all) {
+    if (!dst) return;
+    int *src_used = NULL;
+    if (keep_all && src->count > 0) src_used = calloc(src->count, sizeof(int));
+
+    size_t kept = 0;
+    for (size_t i = 0; i < dst->count; i++) {
+        long found = -1;
+        for (size_t j = 0; j < src->count; j++) {
+            if (src_used && src_used[j]) continue;
+            if (sql__row_equal(&dst->rows[i], &src->rows[j])) { found = (long)j; break; }
+        }
+        if (found >= 0) {
+            if (src_used) src_used[found] = 1;
+            sql__free_row_fields(&dst->rows[i]); /* excluded -- matched a row in src */
+        } else {
+            if (kept != i) dst->rows[kept] = dst->rows[i];
+            kept++;
+        }
+    }
+    dst->count = kept;
+    free(src_used);
+    if (!keep_all) sql__dedupe_rows(dst);
+}
+
 /* Projects each row down to the SELECT list -- a plain column looked up
  * by items[i].arg_col, or a CASE item evaluated fresh per row. Either way
  * the output field is named items[i].alias (defaults to arg_col when
@@ -3928,33 +3994,56 @@ static int sql__append_rows(KdbRows *dst, KdbRows *src) {
     return 1;
 }
 
-/* SELECT, plus an optional chain of UNION/UNION ALL SELECT arms, plus one
- * final ORDER BY/LIMIT applying to the combined result -- same grammar
- * real SQL uses (ORDER BY/LIMIT can only appear once, after the last arm).
- * Mixing UNION and UNION ALL in the same chain isn't supported (which one
- * binds first is a real ambiguity without parenthesized subqueries); pick
- * one for the whole statement. Column names in the output come from the
+/* Which set operator a chain of SELECT arms after the first uses -- see
+ * sql__exec_select_stmt. */
+typedef enum { SQL_SETOP_UNION, SQL_SETOP_INTERSECT, SQL_SETOP_EXCEPT } SqlSetOp;
+
+static const char *sql__setop_name(SqlSetOp op) {
+    switch (op) {
+        case SQL_SETOP_INTERSECT: return "INTERSECT";
+        case SQL_SETOP_EXCEPT:    return "EXCEPT";
+        default:                  return "UNION";
+    }
+}
+
+/* SELECT, plus an optional chain of UNION/UNION ALL/INTERSECT/
+ * INTERSECT ALL/EXCEPT/EXCEPT ALL SELECT arms, plus one final ORDER BY/
+ * LIMIT applying to the combined result -- same grammar real SQL uses
+ * (ORDER BY/LIMIT can only appear once, after the last arm). Mixing
+ * different set operators, or ALL and non-ALL, in the same chain isn't
+ * supported (which one binds first is a real ambiguity without
+ * parenthesized subqueries -- real SQL gives INTERSECT higher precedence
+ * than UNION/EXCEPT, but that's not worth the plumbing here); pick one
+ * for the whole statement. Column names in the output come from the
  * first arm that returned at least one row. */
 static KdbStatus sql__exec_select_stmt(SqlParser *p, KumDB *db, KdbRows **rows_out) {
     KdbRows *acc = NULL;
     KdbStatus st = sql__exec_select_core(p, db, &acc);
     if (st != KDB_OK) return st;
 
-    int seen_all = -1; /* -1 = no UNION yet, 0 = plain UNION seen, 1 = UNION ALL seen */
+    int seen_all = -1; /* -1 = no set op yet, 0 = plain seen, 1 = ALL seen */
+    SqlSetOp seen_op = SQL_SETOP_UNION; /* only meaningful once seen_all != -1 */
     long acc_shape = acc->count > 0 ? (long)acc->rows[0].field_count : -1;
 
-    while (sql__kw_is(&p->cur, "UNION")) {
+    for (;;) {
+        SqlSetOp op;
+        if (sql__kw_is(&p->cur, "UNION"))          op = SQL_SETOP_UNION;
+        else if (sql__kw_is(&p->cur, "INTERSECT")) op = SQL_SETOP_INTERSECT;
+        else if (sql__kw_is(&p->cur, "EXCEPT"))    op = SQL_SETOP_EXCEPT;
+        else break;
         sql__advance(p);
+
         int is_all = 0;
         if (sql__kw_is(&p->cur, "ALL")) { is_all = 1; sql__advance(p); }
 
-        if (seen_all != -1 && seen_all != is_all) {
+        if (seen_all != -1 && (seen_all != is_all || seen_op != op)) {
             kdb_rows_free(acc);
-            return sql__err("can't mix UNION and UNION ALL in the same statement");
+            return sql__err("can't mix different set operators, or ALL and non-ALL, in the same statement");
         }
         seen_all = is_all;
+        seen_op = op;
 
-        if (!sql__kw_is(&p->cur, "SELECT")) { kdb_rows_free(acc); return sql__err("expected SELECT after UNION [ALL]"); }
+        if (!sql__kw_is(&p->cur, "SELECT")) { kdb_rows_free(acc); return sql__err("expected SELECT after %s [ALL]", sql__setop_name(op)); }
 
         KdbRows *next = NULL;
         st = sql__exec_select_core(p, db, &next);
@@ -3965,27 +4054,43 @@ static KdbStatus sql__exec_select_stmt(SqlParser *p, KumDB *db, KdbRows **rows_o
             if (acc_shape != -1 && next_shape != acc_shape) {
                 kdb_rows_free(acc);
                 kdb_rows_free(next);
-                return sql__err("UNION arms must select the same number of columns");
+                return sql__err("%s arms must select the same number of columns", sql__setop_name(op));
             }
             if (acc_shape == -1) {
                 acc_shape = next_shape;
-            } else if (!sql__rename_rows_like(next, &acc->rows[0])) {
+            } else if (acc->count > 0 && !sql__rename_rows_like(next, &acc->rows[0])) {
                 kdb_rows_free(acc);
                 kdb_rows_free(next);
-                kdb_err_oom("UNION row rename");
+                kdb_err_oom("set-op row rename");
                 return KDB_ERR_OOM;
             }
+            /* acc_shape set but acc->count == 0: only possible mid-chain
+             * for INTERSECT/EXCEPT (the only ops that can shrink acc back
+             * to empty) -- the result stays empty regardless of names, so
+             * skipping the rename here is safe, nothing will ever observe
+             * next's names once its rows are compared-and-discarded below. */
         }
 
-        if (!sql__append_rows(acc, next)) {
-            kdb_rows_free(acc);
-            free(next);
-            kdb_err_oom("UNION row append");
-            return KDB_ERR_OOM;
+        switch (op) {
+            case SQL_SETOP_UNION:
+                if (!sql__append_rows(acc, next)) {
+                    kdb_rows_free(acc);
+                    free(next);
+                    kdb_err_oom("UNION row append");
+                    return KDB_ERR_OOM;
+                }
+                free(next);
+                if (!is_all) sql__dedupe_rows(acc);
+                break;
+            case SQL_SETOP_INTERSECT:
+                sql__intersect_rows(acc, next, is_all);
+                kdb_rows_free(next);
+                break;
+            case SQL_SETOP_EXCEPT:
+                sql__except_rows(acc, next, is_all);
+                kdb_rows_free(next);
+                break;
         }
-        free(next);
-
-        if (!is_all) sql__dedupe_rows(acc);
     }
 
     char order_col_bufs[KDB_SQL_MAX_ORDER_COLS][KDB_SQL_IDENT_BUF];

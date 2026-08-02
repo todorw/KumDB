@@ -326,7 +326,7 @@ SELECT [DISTINCT] * | item, ... FROM t | (SELECT ...) [[AS] alias]
     [WHERE cond [AND|OR cond ...]]
     [GROUP BY col, ...]
     [HAVING cond [AND|OR cond ...]]
-    [UNION [ALL] SELECT ...]*
+    [(UNION|INTERSECT|EXCEPT) [ALL] SELECT ...]*
     [ORDER BY col [ASC|DESC], ...]
     [LIMIT n [OFFSET m]]
 
@@ -608,6 +608,27 @@ arm, and apply to the combined result, not to any one arm. Mixing `UNION`
 and `UNION ALL` in the same chain isn't supported -- pick one for the
 whole statement (which one binds first is a real ambiguity without
 parenthesized subqueries, which KumDB's SQL doesn't have).
+
+**`INTERSECT`/`INTERSECT ALL`/`EXCEPT`/`EXCEPT ALL`** work the same way,
+with set semantics instead of concatenation: `INTERSECT` keeps only
+distinct rows present in *every* arm, `EXCEPT` keeps distinct rows from
+the first arm that don't appear in any later one. The `ALL` variants use
+multiset semantics instead of deduping -- a run of duplicate rows on one
+side survives up to however many matching rows the other side actually
+has (`INTERSECT ALL`: the smaller of the two counts; `EXCEPT ALL`: the
+left's count minus the right's, floored at zero):
+
+```sql
+SELECT dept FROM current_employees INTERSECT SELECT dept FROM managers
+SELECT id FROM orders EXCEPT SELECT id FROM refunded_orders
+```
+
+Same column-count/output-naming rules as `UNION`, and same restriction on
+mixing -- a chain uses exactly one operator (`UNION`/`INTERSECT`/`EXCEPT`)
+and one `ALL`-ness throughout; real SQL gives `INTERSECT` higher
+precedence than `UNION`/`EXCEPT` when they're mixed in one statement, but
+that's not implemented here (mixing errors out instead of silently
+picking a precedence you didn't ask for).
 
 **`SELECT DISTINCT`** dedupes the result by the exact set of selected
 columns (after projection, so `SELECT DISTINCT col` dedupes on `col`

@@ -29,7 +29,7 @@ extern "C" {
  *                               [WHERE cond [AND|OR cond ...]]
  *                               [GROUP BY col, ...]
  *                               [HAVING cond [AND|OR cond ...]]
- *                               [UNION [ALL] SELECT ...]*
+ *                               [(UNION|INTERSECT|EXCEPT) [ALL] SELECT ...]*
  *                               [ORDER BY col [ASC|DESC], ...]
  *                               [LIMIT n [OFFSET m]]
  *   UPDATE t SET col = val, ... [WHERE cond [AND|OR cond ...]]
@@ -121,10 +121,15 @@ extern "C" {
  * reference qualified columns), not combined with GROUP BY/aggregates.
  *
  * DISTINCT dedupes the result by the exact selected columns, after
- * projection. UNION/UNION ALL chain multiple SELECTs (same column count
- * required); UNION dedupes across every arm, UNION ALL doesn't; mixing the
- * two operators in one chain isn't supported. ORDER BY/LIMIT, when a UNION
- * is present, apply once to the combined result, not to an individual arm.
+ * projection. UNION/UNION ALL/INTERSECT/INTERSECT ALL/EXCEPT/EXCEPT ALL
+ * chain multiple SELECTs (same column count required): UNION/INTERSECT/
+ * EXCEPT dedupe (concat, set-intersect, set-minus respectively), the ALL
+ * variants use multiset semantics instead (ALL keeps duplicates; INTERSECT
+ * ALL/EXCEPT ALL cap a run of duplicates at how many matching rows the
+ * other side has). Mixing different operators, or ALL and non-ALL, in one
+ * chain isn't supported -- pick one for the whole statement. ORDER BY/
+ * LIMIT, when a chain is present, apply once to the combined result, not
+ * to an individual arm.
  *
  * (SELECT ...) works as a value in WHERE/HAVING: scalar form for
  * =/!=/>/>=/</<= (must return exactly one row, one column), or
