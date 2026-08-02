@@ -1369,11 +1369,23 @@ static KdbStatus sql__project_rows(KdbRows *rows, char proj_cols[][KDB_SQL_IDENT
 }
 
 #define KDB_SQL_MAX_JOIN_COND 8
+#define KDB_SQL_MAX_JOINS     4
 
 typedef struct {
     char left[KDB_SQL_IDENT_BUF];
     char right[KDB_SQL_IDENT_BUF];
 } SqlJoinCond;
+
+/* One JOIN clause in a chain: FROM t1 JOIN t2 ON ... JOIN t3 ON ... each
+ * become one SqlJoinClause, joined against the accumulated result of
+ * everything before it (see sql__build_joined_rows_multi). */
+typedef struct {
+    char        table[KDB_SQL_IDENT_BUF];
+    char        alias[KDB_SQL_IDENT_BUF];
+    int         is_left;
+    SqlJoinCond conds[KDB_SQL_MAX_JOIN_COND];
+    int         ncond;
+} SqlJoinClause;
 
 /* ON is a conjunction of col = col equalities only -- no OR, no comparing
  * to a literal. That's what WHERE (applied after the join, over the
@@ -1496,87 +1508,138 @@ static int sql__append_qualified_nulls(KdbRow *dst, const KdbColumnInfo *schema,
 #pragma GCC diagnostic pop
 #endif
 
-/* Nested-loop join of two tables into qualified combined rows -- every
- * column from both sides is renamed "<qual>.col" (qual is the table's own
- * name, or its alias if one was given), so a shared column name on both
- * sides ("name" on both employees and managers, say) never collides.
- * There's no unqualified fallback; every column reference after a JOIN
- * (SELECT list, WHERE, ORDER BY) needs the "<qual>." prefix.
+/* Deep-copies a row's fields into dst (id/created_at/updated_at aren't
+ * copied -- irrelevant for a synthesized combined row, which never has one
+ * single meaningful id/timestamp anyway). field_count only ever counts
+ * fully-built fields, so a mid-copy OOM failure still leaves dst safe to
+ * free. Returns 0 on OOM. */
+static int sql__copy_row(KdbRow *dst, const KdbRow *src) {
+    memset(dst, 0, sizeof(*dst));
+    if (src->field_count == 0) return 1;
+    dst->fields = (KdbField *)calloc(src->field_count, sizeof(KdbField));
+    if (!dst->fields) return 0;
+    for (uint32_t i = 0; i < src->field_count; i++) {
+        char *nm = strdup(src->fields[i].name);
+        if (!nm) return 0;
+        KdbField f;
+        f.name = nm;
+        f.type = src->fields[i].type;
+        if (!sql__copy_field_value(&f, &src->fields[i])) { free(nm); return 0; }
+        dst->fields[dst->field_count++] = f;
+    }
+    return 1;
+}
+
+/* Joins table1 against a chain of JOIN clauses (JOIN t2 ON ... JOIN t3
+ * ON ..., etc), each one matched against the accumulated combined rows
+ * from everything before it -- so "JOIN t3 ON t1.x = t3.y" and
+ * "JOIN t3 ON t2.x = t3.y" both work, t3 can reference any earlier alias
+ * in the chain, not just the immediately preceding one. Every column from
+ * every table is renamed "<qual>.col" (qual is the table's own name, or
+ * its alias if one was given), so a shared column name across any two
+ * sides never collides. There's no unqualified fallback; every column
+ * reference after a JOIN (SELECT list, ON, WHERE, ORDER BY) needs the
+ * "<qual>." prefix.
  *
- * INNER drops rows with no ON match; LEFT keeps every left-side row,
- * padding an unmatched one with NULLs for every right-side column. Fetches
- * both tables in full (no filter pushdown into the join itself) -- WHERE
- * is applied by the caller afterward, over the combined rows. */
-static KdbStatus sql__build_joined_rows(KumDB *db, const char *table1, const char *alias1,
-                                        const char *table2, const char *alias2, int is_left,
-                                        const SqlJoinCond *conds, int ncond, KdbRows **rows_out) {
+ * INNER (the default) drops rows with no ON match; LEFT keeps every row
+ * from the accumulated-so-far side, padding an unmatched one with NULLs
+ * for that step's table. Fetches every table in full (no filter pushdown
+ * into the join itself) -- WHERE is applied by the caller afterward, over
+ * the final combined rows. */
+static KdbStatus sql__build_joined_rows_multi(KumDB *db, const char *table1, const char *alias1,
+                                              const SqlJoinClause *joins, int njoins, KdbRows **rows_out) {
     KdbRows *r1 = kdb_find_ex(db, table1, NULL, NULL);
     if (!r1) return kdb_last_status();
-    KdbRows *r2 = kdb_find_ex(db, table2, NULL, NULL);
-    if (!r2) { kdb_rows_free(r1); return kdb_last_status(); }
 
-    KdbColumnInfo schema2[KDB_MAX_COLUMNS];
-    uint32_t schema2_count = 0;
-    if (is_left && kdb_get_schema(db, table2, schema2, KDB_MAX_COLUMNS, &schema2_count) != KDB_OK) {
-        kdb_rows_free(r1);
-        kdb_rows_free(r2);
-        return kdb_last_status();
+    KdbRows *combined = (KdbRows *)calloc(1, sizeof(KdbRows));
+    if (!combined) { kdb_rows_free(r1); kdb_err_oom("joined rows"); return KDB_ERR_OOM; }
+    if (r1->count > 0) {
+        combined->rows = (KdbRow *)calloc(r1->count, sizeof(KdbRow));
+        if (!combined->rows) { kdb_rows_free(r1); free(combined); kdb_err_oom("joined rows"); return KDB_ERR_OOM; }
     }
+    for (size_t i = 0; i < r1->count; i++) {
+        KdbRow combo;
+        memset(&combo, 0, sizeof(combo));
+        if (!sql__append_qualified_fields(&combo, &r1->rows[i], alias1)) {
+            sql__free_row_fields(&combo);
+            kdb_rows_free(r1);
+            kdb_rows_free(combined);
+            kdb_err_oom("joined row");
+            return KDB_ERR_OOM;
+        }
+        combined->rows[combined->count++] = combo;
+    }
+    kdb_rows_free(r1);
 
-    KdbRows *out = (KdbRows *)calloc(1, sizeof(KdbRows));
-    if (!out) { kdb_rows_free(r1); kdb_rows_free(r2); kdb_err_oom("joined rows"); return KDB_ERR_OOM; }
+    for (int ji = 0; ji < njoins; ji++) {
+        const SqlJoinClause *jc = &joins[ji];
+
+        KdbRows *rN = kdb_find_ex(db, jc->table, NULL, NULL);
+        if (!rN) { kdb_rows_free(combined); return kdb_last_status(); }
+
+        KdbColumnInfo schemaN[KDB_MAX_COLUMNS];
+        uint32_t schemaN_count = 0;
+        if (jc->is_left && kdb_get_schema(db, jc->table, schemaN, KDB_MAX_COLUMNS, &schemaN_count) != KDB_OK) {
+            kdb_rows_free(rN);
+            kdb_rows_free(combined);
+            return kdb_last_status();
+        }
+
+        KdbRows *next = (KdbRows *)calloc(1, sizeof(KdbRows));
+        if (!next) { kdb_rows_free(rN); kdb_rows_free(combined); kdb_err_oom("joined rows"); return KDB_ERR_OOM; }
 
 #define KDB_SQL_JOIN_FAIL(row, msg) do { \
-        sql__free_row_fields(&(row)); \
-        kdb_rows_free(r1); kdb_rows_free(r2); kdb_rows_free(out); \
-        kdb_err_oom(msg); \
-        return KDB_ERR_OOM; \
-    } while (0)
+            sql__free_row_fields(&(row)); \
+            kdb_rows_free(rN); kdb_rows_free(combined); kdb_rows_free(next); \
+            kdb_err_oom(msg); \
+            return KDB_ERR_OOM; \
+        } while (0)
 
-    for (size_t i = 0; i < r1->count; i++) {
-        int matched = 0;
-        for (size_t j = 0; j < r2->count; j++) {
-            KdbRow combo;
-            memset(&combo, 0, sizeof(combo));
-            if (!sql__append_qualified_fields(&combo, &r1->rows[i], alias1) ||
-                !sql__append_qualified_fields(&combo, &r2->rows[j], alias2))
-                KDB_SQL_JOIN_FAIL(combo, "joined row");
+        for (size_t i = 0; i < combined->count; i++) {
+            int matched = 0;
+            for (size_t j = 0; j < rN->count; j++) {
+                KdbRow combo;
+                if (!sql__copy_row(&combo, &combined->rows[i]) ||
+                    !sql__append_qualified_fields(&combo, &rN->rows[j], jc->alias))
+                    KDB_SQL_JOIN_FAIL(combo, "joined row");
 
-            int on_ok = 1;
-            for (int c = 0; c < ncond; c++) {
-                const KdbField *lf = kdb_row_get(&combo, conds[c].left);
-                const KdbField *rf = kdb_row_get(&combo, conds[c].right);
-                if (!lf || !rf || !sql__field_equal(lf, rf)) { on_ok = 0; break; }
+                int on_ok = 1;
+                for (int c = 0; c < jc->ncond; c++) {
+                    const KdbField *lf = kdb_row_get(&combo, jc->conds[c].left);
+                    const KdbField *rf = kdb_row_get(&combo, jc->conds[c].right);
+                    if (!lf || !rf || !sql__field_equal(lf, rf)) { on_ok = 0; break; }
+                }
+
+                if (!on_ok) { sql__free_row_fields(&combo); continue; }
+                matched = 1;
+
+                KdbRow *grown = (KdbRow *)realloc(next->rows, (next->count + 1) * sizeof(KdbRow));
+                if (!grown) KDB_SQL_JOIN_FAIL(combo, "joined rows grow");
+                next->rows = grown;
+                next->rows[next->count++] = combo;
             }
 
-            if (!on_ok) { sql__free_row_fields(&combo); continue; }
-            matched = 1;
+            if (jc->is_left && !matched) {
+                KdbRow combo;
+                if (!sql__copy_row(&combo, &combined->rows[i]) ||
+                    !sql__append_qualified_nulls(&combo, schemaN, schemaN_count, jc->alias))
+                    KDB_SQL_JOIN_FAIL(combo, "left-join padded row");
 
-            KdbRow *grown = (KdbRow *)realloc(out->rows, (out->count + 1) * sizeof(KdbRow));
-            if (!grown) KDB_SQL_JOIN_FAIL(combo, "joined rows grow");
-            out->rows = grown;
-            out->rows[out->count++] = combo;
+                KdbRow *grown = (KdbRow *)realloc(next->rows, (next->count + 1) * sizeof(KdbRow));
+                if (!grown) KDB_SQL_JOIN_FAIL(combo, "joined rows grow");
+                next->rows = grown;
+                next->rows[next->count++] = combo;
+            }
         }
-
-        if (is_left && !matched) {
-            KdbRow combo;
-            memset(&combo, 0, sizeof(combo));
-            if (!sql__append_qualified_fields(&combo, &r1->rows[i], alias1) ||
-                !sql__append_qualified_nulls(&combo, schema2, schema2_count, alias2))
-                KDB_SQL_JOIN_FAIL(combo, "left-join padded row");
-
-            KdbRow *grown = (KdbRow *)realloc(out->rows, (out->count + 1) * sizeof(KdbRow));
-            if (!grown) KDB_SQL_JOIN_FAIL(combo, "joined rows grow");
-            out->rows = grown;
-            out->rows[out->count++] = combo;
-        }
-    }
 
 #undef KDB_SQL_JOIN_FAIL
 
-    kdb_rows_free(r1);
-    kdb_rows_free(r2);
-    *rows_out = out;
+        kdb_rows_free(rN);
+        kdb_rows_free(combined);
+        combined = next;
+    }
+
+    *rows_out = combined;
     return KDB_OK;
 }
 
@@ -1673,46 +1736,59 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
         sql__advance(p);
     }
 
-    int  has_join = 0, is_left = 0;
-    char table2[KDB_SQL_IDENT_BUF] = "";
-    char alias2[KDB_SQL_IDENT_BUF] = "";
-    SqlJoinCond join_conds[KDB_SQL_MAX_JOIN_COND];
-    int  njoin_cond = 0;
+    SqlJoinClause joins[KDB_SQL_MAX_JOINS];
+    int njoins = 0;
 
-    if (sql__kw_is(&p->cur, "JOIN") || sql__kw_is(&p->cur, "INNER") || sql__kw_is(&p->cur, "LEFT")) {
+    char used_aliases[KDB_SQL_MAX_JOINS + 1][KDB_SQL_IDENT_BUF];
+    int  nused_aliases = 1;
+    snprintf(used_aliases[0], sizeof(used_aliases[0]), "%s", alias1);
+
+    while (sql__kw_is(&p->cur, "JOIN") || sql__kw_is(&p->cur, "INNER") || sql__kw_is(&p->cur, "LEFT")) {
+        if (njoins >= KDB_SQL_MAX_JOINS) return sql__err("too many JOINs (max %d)", KDB_SQL_MAX_JOINS);
+        SqlJoinClause *jc = &joins[njoins];
+        memset(jc, 0, sizeof(*jc));
+
         if (sql__kw_is(&p->cur, "LEFT")) {
-            is_left = 1;
+            jc->is_left = 1;
             sql__advance(p);
             if (sql__kw_is(&p->cur, "OUTER")) sql__advance(p);
         } else if (sql__kw_is(&p->cur, "INNER")) {
             sql__advance(p);
         }
-        if (!sql__kw_is(&p->cur, "JOIN")) return sql__err("expected JOIN after %s", is_left ? "LEFT" : "INNER");
+        if (!sql__kw_is(&p->cur, "JOIN")) return sql__err("expected JOIN after %s", jc->is_left ? "LEFT" : "INNER");
         sql__advance(p);
 
-        const char *t2name;
-        if (!sql__ident_text(&p->cur, &t2name)) return sql__err("expected a table name after JOIN");
-        snprintf(table2, sizeof(table2), "%.255s", t2name);
-        snprintf(alias2, sizeof(alias2), "%s", table2);
+        const char *tNname;
+        if (!sql__ident_text(&p->cur, &tNname)) return sql__err("expected a table name after JOIN");
+        /* Both copied straight from tNname, not from each other -- some
+         * snprintf implementations (mingw's) flag -Wrestrict on a same-
+         * struct src/dst copy like table->alias, even though the two
+         * fields don't actually overlap. */
+        snprintf(jc->table, sizeof(jc->table), "%.255s", tNname);
+        snprintf(jc->alias, sizeof(jc->alias), "%.255s", tNname);
         sql__advance(p);
 
         if (sql__kw_is(&p->cur, "AS")) {
             sql__advance(p);
             const char *aname;
             if (!sql__ident_text(&p->cur, &aname)) return sql__err("expected an alias after AS");
-            snprintf(alias2, sizeof(alias2), "%.255s", aname);
+            snprintf(jc->alias, sizeof(jc->alias), "%.255s", aname);
             sql__advance(p);
         }
 
-        if (!sql__kw_is(&p->cur, "ON")) return sql__err("expected ON after JOIN %s", table2);
+        if (!sql__kw_is(&p->cur, "ON")) return sql__err("expected ON after JOIN %s", jc->table);
         sql__advance(p);
-        if (!sql__parse_join_on(p, join_conds, &njoin_cond)) return kdb_last_status();
+        if (!sql__parse_join_on(p, jc->conds, &jc->ncond)) return kdb_last_status();
 
-        if (strcmp(alias1, alias2) == 0)
-            return sql__err("JOIN needs distinct table names or aliases -- both sides are '%s'", alias1);
+        for (int u = 0; u < nused_aliases; u++) {
+            if (strcmp(used_aliases[u], jc->alias) == 0)
+                return sql__err("JOIN needs distinct table names or aliases -- '%s' is used more than once", jc->alias);
+        }
+        snprintf(used_aliases[nused_aliases++], sizeof(used_aliases[0]), "%s", jc->alias);
 
-        has_join = 1;
+        njoins++;
     }
+    int has_join = njoins > 0;
 
     char *filters[KDB_SQL_MAX_COND];
     int   nfilt = 0;
@@ -1786,8 +1862,7 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
 
     KdbRows *rows = NULL;
     if (has_join) {
-        KdbStatus jst = sql__build_joined_rows(db, table_name, alias1, table2, alias2, is_left,
-                                               join_conds, njoin_cond, &rows);
+        KdbStatus jst = sql__build_joined_rows_multi(db, table_name, alias1, joins, njoins, &rows);
         if (jst != KDB_OK) { sql__free_filters(filters, nfilt); return jst; }
         if (nfilt > 0) sql__filter_rows(rows, filters, nfilt);
         sql__free_filters(filters, nfilt);

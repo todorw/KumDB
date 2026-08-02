@@ -487,6 +487,64 @@ static void test_join(void) {
     teardown(db);
 }
 
+static void test_join_chain(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE users (name TEXT)"));
+    ASSERT_OK(sql(db, "CREATE TABLE orders (user_id INT, item TEXT)"));
+    ASSERT_OK(sql(db, "CREATE TABLE reviews (order_item TEXT, stars INT)"));
+
+    ASSERT_OK(sql(db, "INSERT INTO users (name) VALUES ('alice')"));  /* id 1 */
+    ASSERT_OK(sql(db, "INSERT INTO users (name) VALUES ('bob')"));    /* id 2 */
+    ASSERT_OK(sql(db, "INSERT INTO orders (user_id, item) VALUES (1, 'widget')"));
+    ASSERT_OK(sql(db, "INSERT INTO orders (user_id, item) VALUES (2, 'gizmo')"));
+    ASSERT_OK(sql(db, "INSERT INTO reviews (order_item, stars) VALUES ('widget', 5)"));
+    /* gizmo has no review */
+
+    KdbRows *rows = NULL;
+
+    /* 3-way INNER chain */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT u.name, o.item, rv.stars FROM users AS u "
+        "JOIN orders AS o ON u.id = o.user_id "
+        "JOIN reviews AS rv ON o.item = rv.order_item "
+        "ORDER BY u.name ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *name = NULL;
+        int64_t stars = 0;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "u.name", &name));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "rv.stars", &stars));
+        ASSERT_STR(name, "alice");
+        ASSERT_EQ(stars, 5);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* LEFT JOIN mid-chain: bob's gizmo has no review, so rv.stars is NULL
+     * but the row still appears */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT u.name, rv.stars FROM users AS u "
+        "JOIN orders AS o ON u.id = o.user_id "
+        "LEFT JOIN reviews AS rv ON o.item = rv.order_item "
+        "ORDER BY u.name ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const char *n1 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "u.name", &n1));
+        ASSERT_STR(n1, "bob");
+        const KdbField *sf = kdb_row_get(&rows->rows[1], "rv.stars");
+        ASSERT(sf && sf->type == KDB_TYPE_NULL);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* duplicate alias anywhere in the chain (not just adjacent) is rejected */
+    ASSERT_ERR(sql(db,
+        "SELECT * FROM users AS u JOIN orders AS o ON u.id = o.user_id "
+        "JOIN reviews AS u ON o.item = u.order_item"));
+
+    teardown(db);
+}
+
 static void test_distinct(void) {
     KumDB *db;
     setup(&db);
@@ -691,6 +749,7 @@ int main(void) {
     test_union();
     test_subqueries();
     test_join();
+    test_join_chain();
     test_distinct();
     test_alter_table();
     test_nested_values_through_sql();

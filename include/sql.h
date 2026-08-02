@@ -19,7 +19,7 @@ extern "C" {
  *   DROP TABLE t
  *   INSERT INTO t (col, ...) VALUES (val, ...)
  *   SELECT [DISTINCT] * | item, ... FROM t [[AS] alias]
- *                               [[INNER|LEFT [OUTER]] JOIN t2 [[AS] alias2] ON a.col = b.col [AND ...]]
+ *                               [[INNER|LEFT [OUTER]] JOIN t2 [[AS] alias2] ON a.col = b.col [AND ...]]*
  *                               [WHERE cond [AND|OR cond ...]]
  *                               [GROUP BY col]
  *                               [HAVING cond [AND|OR cond ...]]
@@ -45,16 +45,19 @@ extern "C" {
  * aggregated output (needs GROUP BY or an aggregate item). No grouping by
  * more than one column, no window functions.
  *
- * JOIN (INNER or LEFT, two tables) matches rows via a conjunction of
- * col = col equalities in ON (no OR, no comparing to a literal there --
- * that's what WHERE, applied after the join, is for). Every column
- * reference anywhere after a JOIN -- SELECT list, ON, WHERE, ORDER BY --
- * must be table-qualified ("alias.col" or "table.col"), including the
- * synthetic "alias.id"/"alias.created_at"/"alias.updated_at"
- * pseudo-columns each side gets for joining against (id/created_at/
+ * JOIN (INNER or LEFT) matches rows via a conjunction of col = col
+ * equalities in ON (no OR, no comparing to a literal there -- that's what
+ * WHERE, applied after the join, is for). Chain as many JOIN clauses as
+ * you want -- "FROM t1 JOIN t2 ON ... JOIN t3 ON ..." -- each one matches
+ * against everything accumulated so far, so a later ON can reference any
+ * earlier alias in the chain, not just the table immediately before it.
+ * Every column reference anywhere after a JOIN -- SELECT list, ON, WHERE,
+ * ORDER BY -- must be table-qualified ("alias.col" or "table.col"),
+ * including the synthetic "alias.id"/"alias.created_at"/"alias.updated_at"
+ * pseudo-columns each table gets for joining against (id/created_at/
  * updated_at aren't ordinarily part of a row's field list, but they're
  * common join keys, e.g. "ON orders.user_id = users.id"). LEFT JOIN pads
- * an unmatched left-side row with NULL for every right-side column. JOIN
+ * an unmatched row with NULL for every column from that step's table. JOIN
  * doesn't support GROUP BY/aggregates yet.
  *
  * DISTINCT dedupes the result by the exact selected columns, after
