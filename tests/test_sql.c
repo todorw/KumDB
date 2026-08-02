@@ -1855,6 +1855,66 @@ static void test_create_drop_index(void) {
     teardown(db);
 }
 
+static void test_alter_table_rename(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (name TEXT, dept TEXT INDEX)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, dept) VALUES ('alice', 'eng')"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, dept) VALUES ('bob', 'sales')"));
+
+    KdbRows *rows = NULL;
+
+    /* RENAME COLUMN -- data and the index both follow the new name */
+    ASSERT_OK(sql(db, "ALTER TABLE t RENAME COLUMN dept TO department"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM t WHERE department = 'eng'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &name));
+        ASSERT_STR(name, "alice");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* renaming to an already-existing column name is rejected */
+    ASSERT_ERR(sql(db, "ALTER TABLE t RENAME COLUMN department TO name"));
+
+    /* ALTER COLUMN SET/DROP NOT NULL -- metadata only, always succeeds */
+    ASSERT_OK(sql(db, "ALTER TABLE t ALTER COLUMN name SET NOT NULL"));
+    ASSERT_OK(sql(db, "ALTER TABLE t ALTER COLUMN name DROP NOT NULL"));
+
+    /* changing a column's type isn't supported */
+    ASSERT_ERR(sql(db, "ALTER TABLE t ALTER COLUMN name TYPE INT"));
+
+    /* RENAME TO -- the table itself, data and index intact */
+    ASSERT_OK(sql(db, "ALTER TABLE t RENAME TO people"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM people WHERE department = 'sales'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &name));
+        ASSERT_STR(name, "bob");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+    ASSERT_ERR(sql(db, "SELECT * FROM t")); /* old name is gone */
+
+    /* RENAME without TO (MySQL-style) is also accepted */
+    ASSERT_OK(sql(db, "ALTER TABLE people RENAME humans"));
+    ASSERT_EQ(kdb_count(db, "humans", NULL), 2);
+
+    /* renaming to an already-existing table name is rejected */
+    ASSERT_OK(sql(db, "CREATE TABLE other (x INT)"));
+    ASSERT_ERR(sql(db, "ALTER TABLE humans RENAME TO other"));
+
+    /* the index (now on 'department') still works for rows inserted
+     * after the rename, not just the ones that existed before it */
+    ASSERT_OK(sql(db, "INSERT INTO humans (name, department) VALUES ('carol', 'eng')"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM humans WHERE department = 'eng' ORDER BY name ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    teardown(db);
+}
+
 static void test_nested_values_through_sql(void) {
     /* no SQL literal syntax for arrays/objects -- build via the C API,
        then confirm SQL's SELECT/projection/GROUP BY-MIN paths carry them
@@ -2556,6 +2616,7 @@ int main(void) {
     test_distinct();
     test_alter_table();
     test_create_drop_index();
+    test_alter_table_rename();
     test_nested_values_through_sql();
     test_reserved_columns_skipped();
     test_drop_table();

@@ -198,6 +198,21 @@ KdbStatus kdb_create_index(KumDB *db, const char *table_name, const char *col_na
  * indexed). The column and its data are untouched -- only the index. */
 KdbStatus kdb_drop_index(KumDB *db, const char *table_name, const char *col_name);
 
+/* Renames a column: schema, its index (if any), and every row's field
+ * name -- the last part rewrites the whole table file, same cost as
+ * kdb_drop_column/kdb_compact. KDB_ERR_EXISTS if new_col already names a
+ * column on this table. */
+KdbStatus kdb_rename_column(KumDB *db, const char *table_name, const char *old_col, const char *new_col);
+
+/* Toggles a column's declared nullable flag -- metadata only, not
+ * enforced against inserted/updated values anywhere in this engine, just
+ * recorded and reported back by schema introspection. */
+KdbStatus kdb_alter_column_nullable(KumDB *db, const char *table_name, const char *col_name, int nullable);
+
+/* Renames the table itself (the file on disk, and the header's own
+ * stored name). KDB_ERR_EXISTS if new_name already names a table. */
+KdbStatus kdb_rename_table(KumDB *db, const char *old_name, const char *new_name);
+
 /* names_out entries point into thread-local storage owned by KumDB and are
  * valid until the next call to kdb_list_tables() on this thread. Copy them
  * if you need to keep them around longer. */

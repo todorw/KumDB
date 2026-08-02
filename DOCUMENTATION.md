@@ -313,6 +313,9 @@ hits the exact same storage/query engine the NoSQL API uses.
 CREATE TABLE t (col TYPE [NOT NULL] [INDEX], ...)
 ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [INDEX]
 ALTER TABLE t DROP [COLUMN] col
+ALTER TABLE t RENAME COLUMN col TO new_col
+ALTER TABLE t ALTER [COLUMN] col SET NOT NULL | DROP NOT NULL
+ALTER TABLE t RENAME [TO] new_name
 DROP TABLE t
 
 CREATE VIEW v AS SELECT ...
@@ -454,6 +457,29 @@ DROP INDEX ON employees (department)
 
 Indexing an already-indexed column, or dropping an index from a column
 that doesn't have one, both error rather than silently no-opping.
+
+**`ALTER TABLE t RENAME COLUMN col TO new_col`** renames a column —
+schema, its index if it has one, and every existing row's field, so it's
+a full table rewrite, same cost as `ALTER TABLE ... DROP COLUMN`.
+**`ALTER TABLE t RENAME [TO] new_name`** renames the table itself (the
+file on disk, not just in-memory state) — `TO` is optional, both spellings
+work. **`ALTER TABLE t ALTER [COLUMN] col SET NOT NULL`**/**`DROP NOT
+NULL`** toggles a column's declared nullable flag — metadata only, same
+as `NOT NULL` on a `CREATE TABLE` column definition elsewhere in this
+dialect: not actually enforced against inserted or updated values, just
+recorded and reported back by schema introspection. Changing a column's
+*type* isn't supported — that would mean converting every existing row's
+value, a real data migration this engine doesn't attempt, not just an
+oversight.
+
+```sql
+ALTER TABLE employees RENAME COLUMN dept TO department
+ALTER TABLE employees RENAME TO staff
+ALTER TABLE staff ALTER COLUMN email SET NOT NULL
+```
+
+Renaming a column or table that another one already has that name
+errors rather than silently colliding.
 
 **`WHERE`** supports `=`, `!=`/`<>`, `>`, `>=`, `<`, `<=`,
 `BETWEEN a AND b`, `IN (a, b, c)`, `IS [NOT] NULL`, `LIKE 'pat'`

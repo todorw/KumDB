@@ -1106,6 +1106,85 @@ KdbStatus kdb_drop_index(KumDB *db, const char *table_name, const char *col_name
     return kdb_table_drop_index(tbl, col_name);
 }
 
+KdbStatus kdb_rename_column(KumDB *db, const char *table_name, const char *old_col, const char *new_col) {
+    if (!db || !table_name || !old_col || !new_col) {
+        kdb_err_null_arg("db/table_name/old_col/new_col", "kdb_rename_column");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+    return kdb_table_rename_column(tbl, old_col, new_col);
+}
+
+KdbStatus kdb_alter_column_nullable(KumDB *db, const char *table_name, const char *col_name, int nullable) {
+    if (!db || !table_name || !col_name) {
+        kdb_err_null_arg("db/table_name/col_name", "kdb_alter_column_nullable");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+    return kdb_table_set_nullable(tbl, col_name, nullable);
+}
+
+/* Renames the table itself: evicts any cached handle (closing its fd --
+ * an already-open fd would otherwise keep referencing the old inode,
+ * same reasoning kdb__evict_table's own doc comment gives for every
+ * other file-replacing operation here), renames the .kdb file (and its
+ * .lock file, best-effort -- it may not exist) on disk, then reopens
+ * under the new name and updates the header's own stored table_name to
+ * match (kdb_storage_open doesn't actually validate that field against
+ * the filename it's given, so a stale value there wouldn't break
+ * anything functionally, but leaving it wrong would be a real
+ * consistency gap for anything that reads it later, e.g. dump tooling). */
+KdbStatus kdb_rename_table(KumDB *db, const char *old_name, const char *new_name) {
+    if (!db || !old_name || !new_name) {
+        kdb_err_null_arg("db/old_name/new_name", "kdb_rename_table");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(old_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    if (!kdb_storage_exists(db->data_dir, old_name)) {
+        kdb_err_table_not_found(old_name);
+        return KDB_ERR_NOT_FOUND;
+    }
+    if (kdb_storage_exists(db->data_dir, new_name)) {
+        kdb_err_table_exists(new_name);
+        return KDB_ERR_EXISTS;
+    }
+
+    kdb__evict_table(db, old_name);
+
+    char old_path[4096], new_path[4096];
+    char old_lock[4096 + 8], new_lock[4096 + 8];
+    kdb_storage_path(db->data_dir, old_name, old_path, sizeof(old_path));
+    kdb_storage_path(db->data_dir, new_name, new_path, sizeof(new_path));
+    snprintf(old_lock, sizeof(old_lock), "%s.lock", old_path);
+    snprintf(new_lock, sizeof(new_lock), "%s.lock", new_path);
+
+    if (rename(old_path, new_path) != 0) {
+        kdb_err_io(old_path, "rename table");
+        return KDB_ERR_IO;
+    }
+    rename(old_lock, new_lock); /* best-effort -- no lock file is the common case */
+
+    KdbTable *tbl = kdb__get_table(db, new_name);
+    if (!tbl) return kdb_last_status();
+
+    KDB_STRLCPY(tbl->header.table_name, new_name, KDB_MAX_NAME_LEN);
+    tbl->dirty = 1;
+    return kdb_storage_flush_header(tbl);
+}
+
 /* Closes and evicts a table's cached handle, if open. Needed anywhere a
  * table's file gets replaced/renamed out from under a live process --
  * without this, an already-open fd keeps referencing the old inode and the

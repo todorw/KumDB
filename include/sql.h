@@ -19,6 +19,9 @@ extern "C" {
  *   CREATE TABLE t (col TYPE [NOT NULL] [INDEX], ...)
  *   ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [INDEX]
  *   ALTER TABLE t DROP [COLUMN] col
+ *   ALTER TABLE t RENAME COLUMN col TO new_col
+ *   ALTER TABLE t ALTER [COLUMN] col SET NOT NULL | DROP NOT NULL
+ *   ALTER TABLE t RENAME [TO] new_name
  *   DROP TABLE t
  *   CREATE VIEW v AS SELECT ...
  *   DROP VIEW v
@@ -265,6 +268,18 @@ extern "C" {
  * combined-key composite index -- there's no multi-column index in the
  * storage layer to build one from. Indexing an already-indexed column, or
  * dropping an index that isn't there, both error.
+ *
+ * ALTER TABLE t RENAME COLUMN col TO new_col renames a column -- schema,
+ * its index if any, and every existing row's field, a full table
+ * rewrite same cost as ALTER TABLE ... DROP COLUMN. ALTER TABLE t RENAME
+ * [TO] new_name renames the table itself (the file on disk too, not just
+ * in-memory state) -- TO is optional. ALTER TABLE t ALTER [COLUMN] col
+ * SET NOT NULL / DROP NOT NULL toggles the nullable flag -- metadata
+ * only, not enforced anywhere, same as NOT NULL on a CREATE TABLE column
+ * definition. Changing a column's type isn't supported -- that would
+ * mean converting every existing row's value, a real data migration this
+ * engine doesn't attempt. Renaming a column or table to a name that's
+ * already taken errors rather than colliding silently.
  *
  * WHERE conditions: col = val, != / <>, >, >=, <, <=, BETWEEN a AND b,
  * IN (a, b, c), IS NULL, IS NOT NULL, LIKE 'pat' (standard SQL wildcards --

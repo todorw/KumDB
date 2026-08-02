@@ -269,6 +269,78 @@ KdbStatus kdb_table_drop_index(KdbTable *tbl, const char *col_name) {
 }
 
 
+typedef struct {
+    const char *old_name;
+    const char *new_name;
+} KdbRenameColCtx;
+
+static int kdb__rename_column_transform(KdbRecord *r, void *ud) {
+    const KdbRenameColCtx *ctx = (const KdbRenameColCtx *)ud;
+    if (!r || !ctx) return 1;
+    for (uint32_t i = 0; i < r->field_count; i++) {
+        if (strcmp(r->fields[i].col_name, ctx->old_name) == 0) {
+            KDB_STRLCPY(r->fields[i].col_name, ctx->new_name, KDB_MAX_NAME_LEN);
+            break;
+        }
+    }
+    return !r->deleted;
+}
+
+KdbStatus kdb_table_rename_column(KdbTable *tbl, const char *old_name, const char *new_name) {
+    if (!tbl || !old_name || !new_name) {
+        kdb_err_null_arg("tbl/old_name/new_name", "kdb_table_rename_column");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (!kdb_table_has_column(tbl, old_name)) {
+        kdb_err_field_not_found(old_name, tbl->name);
+        return KDB_ERR_NOT_FOUND;
+    }
+    if (kdb_table_has_column(tbl, new_name)) {
+        kdb_err_column_exists(new_name, tbl->name);
+        return KDB_ERR_EXISTS;
+    }
+
+    for (uint32_t i = 0; i < tbl->header.column_count; i++) {
+        if (strcmp(tbl->header.columns[i].name, old_name) == 0) {
+            KDB_STRLCPY(tbl->header.columns[i].name, new_name, KDB_MAX_NAME_LEN);
+            break;
+        }
+    }
+    for (uint32_t i = 0; i < tbl->index_count; i++) {
+        if (tbl->indices[i] && strcmp(tbl->indices[i]->col_name, old_name) == 0) {
+            KDB_STRLCPY(tbl->indices[i]->col_name, new_name, KDB_MAX_NAME_LEN);
+            break;
+        }
+    }
+
+    KdbRenameColCtx ctx = { old_name, new_name };
+    KdbStatus st = kdb_storage_rewrite(tbl, kdb__rename_column_transform, &ctx);
+    if (st != KDB_OK) return st;
+
+    tbl->dirty = 1;
+    return kdb_storage_flush_header(tbl);
+}
+
+KdbStatus kdb_table_set_nullable(KdbTable *tbl, const char *col_name, int nullable) {
+    if (!tbl || !col_name) {
+        kdb_err_null_arg("tbl/col_name", "kdb_table_set_nullable");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (!kdb_table_has_column(tbl, col_name)) {
+        kdb_err_field_not_found(col_name, tbl->name);
+        return KDB_ERR_NOT_FOUND;
+    }
+    for (uint32_t i = 0; i < tbl->header.column_count; i++) {
+        if (strcmp(tbl->header.columns[i].name, col_name) == 0) {
+            tbl->header.columns[i].nullable = nullable ? 1 : 0;
+            break;
+        }
+    }
+    tbl->dirty = 1;
+    return kdb_storage_flush_header(tbl);
+}
+
+
 const char *kdb__drop_col_name = NULL;
 
 int kdb__drop_column_transform(KdbRecord *r, void *ud) {

@@ -1386,7 +1386,83 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
         return kdb_drop_column(db, table_name, col_name);
     }
 
-    return sql__err("expected ADD [COLUMN] or DROP [COLUMN] after ALTER TABLE %s", table_name);
+    if (sql__kw_is(&p->cur, "RENAME")) {
+        sql__advance(p);
+
+        if (sql__kw_is(&p->cur, "COLUMN")) {
+            sql__advance(p);
+            const char *old_cname;
+            if (!sql__ident_text(&p->cur, &old_cname)) return sql__err("expected a column name after ALTER TABLE %s RENAME COLUMN", table_name);
+            char old_col[KDB_SQL_IDENT_BUF];
+            snprintf(old_col, sizeof(old_col), "%.255s", old_cname);
+            sql__advance(p);
+
+            if (!sql__kw_is(&p->cur, "TO")) return sql__err("expected TO after ALTER TABLE %s RENAME COLUMN %s", table_name, old_col);
+            sql__advance(p);
+
+            const char *new_cname;
+            if (!sql__ident_text(&p->cur, &new_cname)) return sql__err("expected a new column name after RENAME COLUMN %s TO", old_col);
+            char new_col[KDB_SQL_IDENT_BUF];
+            snprintf(new_col, sizeof(new_col), "%.255s", new_cname);
+            sql__advance(p);
+
+            if (sql__is_reserved_column(new_col))
+                return sql__err("'%s' is reserved -- KumDB already manages id/created_at/updated_at", new_col);
+
+            return kdb_rename_column(db, table_name, old_col, new_col);
+        }
+
+        /* RENAME [TO] new_table_name -- TO is optional, same "accept the
+         * common variant either way" spirit as ADD/DROP COLUMN's own
+         * optional COLUMN keyword. */
+        if (sql__kw_is(&p->cur, "TO")) sql__advance(p);
+
+        const char *new_tname;
+        if (!sql__ident_text(&p->cur, &new_tname)) return sql__err("expected a new table name after ALTER TABLE %s RENAME", table_name);
+        char new_table_name[KDB_SQL_IDENT_BUF];
+        snprintf(new_table_name, sizeof(new_table_name), "%.255s", new_tname);
+        sql__advance(p);
+
+        return kdb_rename_table(db, table_name, new_table_name);
+    }
+
+    if (sql__kw_is(&p->cur, "ALTER")) {
+        sql__advance(p);
+        if (sql__kw_is(&p->cur, "COLUMN")) sql__advance(p); /* optional, same as ADD/DROP */
+
+        const char *cname;
+        if (!sql__ident_text(&p->cur, &cname)) return sql__err("expected a column name after ALTER TABLE %s ALTER [COLUMN]", table_name);
+        char col_name[KDB_SQL_IDENT_BUF];
+        snprintf(col_name, sizeof(col_name), "%.255s", cname);
+        sql__advance(p);
+
+        /* Only the nullable flag can actually be changed here -- and even
+         * that's metadata-only, not enforced anywhere (see
+         * kdb_table_set_nullable). Changing a column's TYPE would mean
+         * converting every existing row's value, a real data migration
+         * this file doesn't attempt -- deliberately not supported, not
+         * just unimplemented, same "honest about scope" call as
+         * composite indexes and ROLLUP/CUBE elsewhere in this push. */
+        if (sql__kw_is(&p->cur, "SET")) {
+            sql__advance(p);
+            if (!sql__kw_is(&p->cur, "NOT")) return sql__err("expected NOT NULL after ALTER COLUMN %s SET", col_name);
+            sql__advance(p);
+            if (!sql__kw_is(&p->cur, "NULL")) return sql__err("expected NOT NULL after ALTER COLUMN %s SET", col_name);
+            sql__advance(p);
+            return kdb_alter_column_nullable(db, table_name, col_name, 0);
+        }
+        if (sql__kw_is(&p->cur, "DROP")) {
+            sql__advance(p);
+            if (!sql__kw_is(&p->cur, "NOT")) return sql__err("expected NOT NULL after ALTER COLUMN %s DROP", col_name);
+            sql__advance(p);
+            if (!sql__kw_is(&p->cur, "NULL")) return sql__err("expected NOT NULL after ALTER COLUMN %s DROP", col_name);
+            sql__advance(p);
+            return kdb_alter_column_nullable(db, table_name, col_name, 1);
+        }
+        return sql__err("ALTER COLUMN only supports SET NOT NULL or DROP NOT NULL -- changing a column's type isn't supported");
+    }
+
+    return sql__err("expected ADD [COLUMN], DROP [COLUMN], RENAME, or ALTER [COLUMN] after ALTER TABLE %s", table_name);
 }
 
 /* INSERT ... VALUES (...) ON CONFLICT (key_col, ...) DO NOTHING | DO UPDATE
