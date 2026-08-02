@@ -376,14 +376,35 @@ targets, not something to reach for on a huge table repeatedly.
 **Subqueries**: `=`/`!=`/`>`/`>=`/`<`/`<=` accept `(SELECT ...)` as a
 scalar right-hand side (must return exactly one row, one column), and `IN`
 accepts `(SELECT col FROM ...)` in place of a literal list (any number of
-rows, still exactly one column). Non-correlated only — the inner query
-can't reference the outer row, it just runs once, up front, like any other
-`SELECT`.
+rows, still exactly one column).
 
 ```sql
 SELECT name FROM employees WHERE salary = (SELECT MAX(salary) FROM employees)
 SELECT name FROM employees WHERE dept IN (SELECT dept FROM managers)
 ```
+
+These can also be **correlated** — the inner query can reference the outer
+row, qualified with the outer query's own alias (explicit `AS`, a bare
+alias, or just the table name), same as `EXISTS` below:
+
+```sql
+SELECT name FROM employees e
+    WHERE salary = (SELECT MAX(salary) FROM employees e2 WHERE e2.dept = e.dept)
+
+SELECT name FROM employees e
+    WHERE name IN (SELECT emp_name FROM orders o WHERE o.emp_name = e.name)
+```
+
+Whether a subquery is correlated is decided per-subquery, automatically,
+by whether its text actually references the outer alias — nothing new to
+write. A non-correlated one (like the first two examples above) keeps
+running once, up front, exactly as before; a correlated one re-runs once
+per outer row, the same real cost `EXISTS` already accepts (fine at this
+engine's target row counts, not something to reach for in a tight loop
+over a huge table). Correlated scalar/`IN` subqueries compose with
+`AND`/`OR`, nest in parens, and work in `UPDATE`/`DELETE`'s `WHERE` too,
+but — like `EXISTS` — aren't supported in `HAVING` (no real outer row
+there to correlate against) or inside a `CASE WHEN` condition.
 
 **`EXISTS`/`NOT EXISTS`** accept a correlated `(SELECT ...)` in `WHERE` —
 unlike the scalar/`IN` subqueries above, the inner query *can* reference

@@ -852,6 +852,104 @@ static void test_exists(void) {
     teardown(db);
 }
 
+static void test_correlated_subqueries(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE employees (name TEXT, dept TEXT, salary INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO employees (name, dept, salary) VALUES ('alice', 'eng', 100)"));
+    ASSERT_OK(sql(db, "INSERT INTO employees (name, dept, salary) VALUES ('bob', 'eng', 200)"));
+    ASSERT_OK(sql(db, "INSERT INTO employees (name, dept, salary) VALUES ('carol', 'sales', 50)"));
+    ASSERT_OK(sql(db, "INSERT INTO employees (name, dept, salary) VALUES ('dave', 'sales', 80)"));
+    ASSERT_OK(sql(db, "CREATE TABLE orders (emp_name TEXT, item TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO orders (emp_name, item) VALUES ('alice', 'pen')"));
+
+    KdbRows *rows = NULL;
+
+    /* correlated scalar subquery: top earner per department */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name FROM employees e WHERE salary = (SELECT MAX(salary) FROM employees e2 WHERE e2.dept = e.dept) ORDER BY name ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const char *n0 = NULL, *n1 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &n0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "name", &n1));
+        ASSERT_STR(n0, "bob");
+        ASSERT_STR(n1, "dave");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* correlated scalar subquery with a non-equality operator */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name FROM employees e WHERE salary > (SELECT AVG(salary) FROM employees e2 WHERE e2.dept = e.dept) ORDER BY name ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const char *n0 = NULL, *n1 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &n0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "name", &n1));
+        ASSERT_STR(n0, "bob");
+        ASSERT_STR(n1, "dave");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* correlated scalar subquery correlating against the bare (no-AS) outer alias */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name FROM employees WHERE salary = (SELECT MAX(salary) FROM employees e2 WHERE e2.dept = employees.dept) ORDER BY name ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* correlated scalar subquery composes with AND like any other condition */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name FROM employees e WHERE salary = (SELECT MAX(salary) FROM employees e2 WHERE e2.dept = e.dept) AND dept = 'sales'",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &name));
+        ASSERT_STR(name, "dave");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* correlated IN subquery */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name FROM employees e WHERE name IN (SELECT emp_name FROM orders o WHERE o.emp_name = e.name)",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &name));
+        ASSERT_STR(name, "alice");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* non-correlated scalar/IN subqueries still work (the pre-existing,
+     * run-once fast path -- a correlated subquery's raw text just happens
+     * not to reference the outer alias here) */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM employees WHERE salary = (SELECT MAX(salary) FROM employees)", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &name));
+        ASSERT_STR(name, "bob");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM employees WHERE name IN (SELECT emp_name FROM orders)", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* UPDATE/DELETE with a correlated scalar subquery in WHERE */
+    size_t affected = 0;
+    ASSERT_OK(kdb_exec_sql(db,
+        "UPDATE employees SET dept = 'lead' WHERE salary = (SELECT MAX(salary) FROM employees e2 WHERE e2.dept = employees.dept)",
+        NULL, &affected));
+    ASSERT_EQ(affected, 2u);
+
+    teardown(db);
+}
+
 static void test_case_when(void) {
     KumDB *db;
     setup(&db);
@@ -1674,6 +1772,7 @@ int main(void) {
     test_views();
     test_ctes();
     test_derived_tables();
+    test_correlated_subqueries();
     test_scalar_functions();
     test_window_functions();
     test_comments();

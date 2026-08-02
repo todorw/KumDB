@@ -128,16 +128,24 @@ extern "C" {
  *
  * (SELECT ...) works as a value in WHERE/HAVING: scalar form for
  * =/!=/>/>=/</<= (must return exactly one row, one column), or
- * "IN (SELECT col FROM ...)" in place of a literal list. Non-correlated
- * only -- the inner query can't see the outer row.
+ * "IN (SELECT col FROM ...)" in place of a literal list. Can be
+ * correlated -- the inner query may reference the outer row, qualified
+ * with the outer query's own alias, same as EXISTS below -- decided
+ * automatically per-subquery by whether its text actually references that
+ * alias; nothing new to write. A non-correlated one keeps running once,
+ * up front, like any other SELECT; a correlated one re-runs once per
+ * outer row (real correlated-subquery cost, same as EXISTS). Correlated
+ * scalar/IN subqueries combine with AND/OR and parens like any other
+ * condition, and work in UPDATE/DELETE's WHERE too; not supported in
+ * HAVING or inside a CASE WHEN condition (no real outer row there).
  *
- * EXISTS/NOT EXISTS (SELECT ...) in WHERE, unlike the above, IS
- * correlated -- the inner query can reference the outer row, qualified
- * with the outer query's own alias. Only row existence matters, not what
- * gets projected ("SELECT *" is the usual choice). Re-runs the inner
- * query once per outer row (real correlated-subquery cost); combines with
- * AND/OR and parens like any other condition; works in UPDATE/DELETE's
- * WHERE too; not supported in HAVING.
+ * EXISTS/NOT EXISTS (SELECT ...) in WHERE is always correlated -- the
+ * inner query can reference the outer row, qualified with the outer
+ * query's own alias. Only row existence matters, not what gets projected
+ * ("SELECT *" is the usual choice). Re-runs the inner query once per
+ * outer row (real correlated-subquery cost); combines with AND/OR and
+ * parens like any other condition; works in UPDATE/DELETE's WHERE too;
+ * not supported in HAVING.
  *
  * CREATE VIEW v AS SELECT ... stores a named query; SELECT ... FROM v
  * re-runs it fresh every time (not materialized/cached). Validates the
