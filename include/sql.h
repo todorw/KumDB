@@ -10,8 +10,7 @@ extern "C" {
 /*
  * A thin SQL front end over the exact same engine kdb_add/kdb_find/etc.
  * use underneath -- same storage, same query semantics, just a different
- * syntax on top. Single table only: no JOIN, no subqueries. One statement
- * per call.
+ * syntax on top. One statement per call.
  *
  * Supported:
  *   CREATE TABLE t (col TYPE [NOT NULL] [INDEX], ...)
@@ -19,8 +18,12 @@ extern "C" {
  *   ALTER TABLE t DROP [COLUMN] col
  *   DROP TABLE t
  *   INSERT INTO t (col, ...) VALUES (val, ...)
- *   SELECT * | item, ... FROM t [WHERE cond [AND|OR cond ...]]
+ *   SELECT [DISTINCT] * | item, ... FROM t [[AS] alias]
+ *                               [[INNER|LEFT [OUTER]] JOIN t2 [[AS] alias2] ON a.col = b.col [AND ...]]
+ *                               [WHERE cond [AND|OR cond ...]]
  *                               [GROUP BY col]
+ *                               [HAVING cond [AND|OR cond ...]]
+ *                               [UNION [ALL] SELECT ...]*
  *                               [ORDER BY col [ASC|DESC]]
  *                               [LIMIT n [OFFSET m]]
  *   UPDATE t SET col = val, ... [WHERE cond [AND|OR cond ...]]
@@ -38,8 +41,32 @@ extern "C" {
  * rule SQL uses -- a plain column that isn't the GROUP BY column is
  * rejected). "SELECT col FROM t GROUP BY col" with no aggregate at all
  * is a valid way to get distinct values. SUM/AVG always come back as
- * FLOAT regardless of the source column's type. No HAVING, no grouping
- * by more than one column, no window functions.
+ * FLOAT regardless of the source column's type. HAVING filters the
+ * aggregated output (needs GROUP BY or an aggregate item). No grouping by
+ * more than one column, no window functions.
+ *
+ * JOIN (INNER or LEFT, two tables) matches rows via a conjunction of
+ * col = col equalities in ON (no OR, no comparing to a literal there --
+ * that's what WHERE, applied after the join, is for). Every column
+ * reference anywhere after a JOIN -- SELECT list, ON, WHERE, ORDER BY --
+ * must be table-qualified ("alias.col" or "table.col"), including the
+ * synthetic "alias.id"/"alias.created_at"/"alias.updated_at"
+ * pseudo-columns each side gets for joining against (id/created_at/
+ * updated_at aren't ordinarily part of a row's field list, but they're
+ * common join keys, e.g. "ON orders.user_id = users.id"). LEFT JOIN pads
+ * an unmatched left-side row with NULL for every right-side column. JOIN
+ * doesn't support GROUP BY/aggregates yet.
+ *
+ * DISTINCT dedupes the result by the exact selected columns, after
+ * projection. UNION/UNION ALL chain multiple SELECTs (same column count
+ * required); UNION dedupes across every arm, UNION ALL doesn't; mixing the
+ * two operators in one chain isn't supported. ORDER BY/LIMIT, when a UNION
+ * is present, apply once to the combined result, not to an individual arm.
+ *
+ * (SELECT ...) works as a value in WHERE/HAVING: scalar form for
+ * =/!=/>/>=/</<= (must return exactly one row, one column), or
+ * "IN (SELECT col FROM ...)" in place of a literal list. Non-correlated
+ * only -- the inner query can't see the outer row.
  *
  * Types: INT/INTEGER, FLOAT/REAL/DOUBLE, BOOL/BOOLEAN, TEXT/STRING/VARCHAR,
  * BLOB. VARCHAR(n)/CHAR(n) length specs are accepted and ignored (KumDB

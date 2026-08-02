@@ -419,6 +419,74 @@ static void test_subqueries(void) {
     teardown(db);
 }
 
+static void test_join(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE users (name TEXT)"));
+    ASSERT_OK(sql(db, "CREATE TABLE orders (user_id INT, item TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO users (name) VALUES ('alice')"));  /* id 1 */
+    ASSERT_OK(sql(db, "INSERT INTO users (name) VALUES ('bob')"));    /* id 2, no orders */
+    ASSERT_OK(sql(db, "INSERT INTO orders (user_id, item) VALUES (1, 'widget')"));
+    ASSERT_OK(sql(db, "INSERT INTO orders (user_id, item) VALUES (1, 'gadget')"));
+
+    KdbRows *rows = NULL;
+
+    /* INNER JOIN */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT u.name, o.item FROM users AS u JOIN orders AS o ON u.id = o.user_id ORDER BY o.item ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const char *name = NULL, *item = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "u.name", &name));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "o.item", &item));
+        ASSERT_STR(name, "alice");
+        ASSERT_STR(item, "gadget");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* LEFT JOIN: unmatched left row (bob) still appears, right side NULL */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT u.name, o.item FROM users AS u LEFT JOIN orders AS o ON u.id = o.user_id ORDER BY u.name ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[2], "u.name", &name));
+        ASSERT_STR(name, "bob");
+        const KdbField *item_f = kdb_row_get(&rows->rows[2], "o.item");
+        ASSERT(item_f && item_f->type == KDB_TYPE_NULL);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* WHERE applies after the join, over qualified columns */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT u.name FROM users AS u JOIN orders AS o ON u.id = o.user_id WHERE o.item = 'gadget'",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* SELECT * exposes every qualified column from both sides, including
+     * the id/created_at/updated_at pseudo-columns */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT * FROM users AS u JOIN orders AS o ON u.id = o.user_id LIMIT 1", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        ASSERT_EQ(rows->rows[0].field_count, 9u); /* u.name + u.{id,created_at,updated_at} + o.{user_id,item} + o.{id,created_at,updated_at} */
+        ASSERT(kdb_row_get(&rows->rows[0], "u.id") != NULL);
+        ASSERT(kdb_row_get(&rows->rows[0], "o.id") != NULL);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* JOIN + GROUP BY/aggregate rejected */
+    ASSERT_ERR(sql(db, "SELECT u.name, COUNT(*) FROM users AS u JOIN orders AS o ON u.id = o.user_id GROUP BY u.name"));
+
+    /* duplicate alias on both sides rejected */
+    ASSERT_ERR(sql(db, "SELECT * FROM users AS u JOIN orders AS u ON u.id = u.user_id"));
+
+    teardown(db);
+}
+
 static void test_distinct(void) {
     KumDB *db;
     setup(&db);
@@ -622,6 +690,7 @@ int main(void) {
     test_having();
     test_union();
     test_subqueries();
+    test_join();
     test_distinct();
     test_alter_table();
     test_nested_values_through_sql();

@@ -310,7 +310,8 @@ DROP TABLE t
 
 INSERT INTO t (col, ...) VALUES (val, ...)
 
-SELECT [DISTINCT] * | item, ... FROM t
+SELECT [DISTINCT] * | item, ... FROM t [[AS] alias]
+    [[INNER|LEFT [OUTER]] JOIN t2 [[AS] alias2] ON a.col = b.col [AND ...]]
     [WHERE cond [AND|OR cond ...]]
     [GROUP BY col]
     [HAVING cond [AND|OR cond ...]]
@@ -349,6 +350,41 @@ can't reference the outer row, it just runs once, up front, like any other
 SELECT name FROM employees WHERE salary = (SELECT MAX(salary) FROM employees)
 SELECT name FROM employees WHERE dept IN (SELECT dept FROM managers)
 ```
+
+**`JOIN`** (`INNER`/`LEFT`, two tables) matches rows via `ON`, a
+conjunction of `col = col` equalities — no `OR`, no comparing to a literal
+in `ON` (that's what `WHERE`, applied after the join, is for):
+
+```sql
+SELECT u.name, o.item
+    FROM users AS u
+    JOIN orders AS o ON u.id = o.user_id
+    WHERE o.item = 'widget'
+
+SELECT u.name, o.item FROM users AS u LEFT JOIN orders AS o ON u.id = o.user_id
+```
+
+Every column reference anywhere after a `JOIN` — the `SELECT` list, `ON`,
+`WHERE`, `ORDER BY` — must be table-qualified: `alias.col` (or
+`table.col` if you didn't give it an alias). There's no unqualified
+fallback, on purpose: guessing which side a bare column name meant when
+both sides could have one is exactly the kind of silent ambiguity worth
+refusing outright. This includes three synthetic columns each side gets
+for joining against — `alias.id`, `alias.created_at`, `alias.updated_at`
+— since those normally aren't part of a row's field list but are common
+join keys (`ON orders.user_id = users.id`). `SELECT *` after a `JOIN`
+shows every qualified column from both sides, including those three.
+
+`LEFT JOIN` keeps every row from the left table; a left-side row with no
+`ON` match gets one output row with every right-side column set to `NULL`
+(including `alias.id`) instead of being dropped, same as real `LEFT JOIN`.
+`INNER JOIN` (or just `JOIN`) drops unmatched rows from both sides.
+
+`JOIN` doesn't support `GROUP BY`/aggregate functions yet, and both
+tables are always fetched in full — there's no filter pushed into the
+join itself, `WHERE` runs afterward over the combined rows. Fine for the
+row counts this engine targets, not something to reach for on huge
+tables.
 
 **`SELECT` items** can be a plain column, `*`, or an aggregate call —
 `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` —
