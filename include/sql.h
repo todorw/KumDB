@@ -158,6 +158,14 @@ extern "C" {
  * declaration order), never the reverse and never itself -- no RECURSIVE.
  * Only ever precedes a SELECT, not UPDATE/DELETE/INSERT.
  *
+ * FROM (SELECT ...) AS alias (a derived table) works the same way -- a
+ * subquery standing in for a real table, needing its own alias (nothing
+ * else identifies it). WHERE/ORDER BY/LIMIT/DISTINCT/aggregates all work
+ * on top same as CREATE VIEW; only valid as the primary FROM target, not
+ * a JOIN target. Unlike WITH, nothing gets registered anywhere even
+ * temporarily -- parsed and re-run inline every time, and (unlike CREATE
+ * VIEW) not validated until the moment it actually runs.
+ *
  * Types: INT/INTEGER, FLOAT/REAL/DOUBLE, BOOL/BOOLEAN, TEXT/STRING/VARCHAR,
  * BLOB. VARCHAR(n)/CHAR(n) length specs are accepted and ignored (KumDB
  * strings aren't fixed-width). "id", "created_at", "updated_at" are

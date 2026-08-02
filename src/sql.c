@@ -3412,21 +3412,71 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     if (!sql__kw_is(&p->cur, "FROM")) return sql__err("expected FROM after the SELECT column list");
     sql__advance(p);
 
-    const char *tname;
-    if (!sql__ident_text(&p->cur, &tname)) return sql__err("expected a table name after FROM");
     char table_name[KDB_SQL_IDENT_BUF];
-    snprintf(table_name, sizeof(table_name), "%.255s", tname);
-    sql__advance(p);
-
-    /* A view shadows nothing -- it's only even considered when no real
-     * table has this name. Fixed-size buffer, not a heap pointer: this
-     * function has a lot of early returns already, and a stack buffer
-     * unwinds for free on every one of them. Sized to
-     * KDB_MAX_STRING_LEN, the storage layer's own string-field cap, since
-     * that's the real bound on how long a stored view's query can be. */
+    /* Fixed-size buffer, not a heap pointer: this function has a lot of
+     * early returns already, and a stack buffer unwinds for free on every
+     * one of them. Sized to KDB_MAX_STRING_LEN, the storage layer's own
+     * string-field cap, since that's the real bound on how long a stored
+     * view's query (or a derived table's, below) can be. */
     char view_query[KDB_MAX_STRING_LEN];
-    int  from_is_view = !kdb_table_exists(db, table_name) &&
-                         sql__lookup_view(db, table_name, view_query, sizeof(view_query));
+    int  from_is_view = 0;
+
+    if (p->cur.type == SQLTOK_LPAREN) {
+        /* Derived table: FROM (SELECT ...) AS alias -- same "store raw
+         * text, re-run fresh every time" mechanism a view uses (see
+         * sql__lookup_view below), just scoped to this one FROM clause
+         * instead of persisted. Boundary-detection reuses
+         * sql__skip_parenthesized_select rather than actually running the
+         * subquery to find where it ends the way CREATE VIEW validates
+         * its body: a derived table gets re-parsed AND re-executed on
+         * every single call (there's no persistence to amortize the cost
+         * over, unlike a real view), so validating it twice per call
+         * would be pure waste -- errors surface naturally the first (and
+         * only) time it actually runs, same "not validated until used"
+         * latitude EXISTS's inner query already has for the same reason.
+         * table_name doubles as its mandatory alias -- there's no real
+         * table name to fall back on -- consumed here and fed into the
+         * existing alias1 logic below unchanged. Only valid as the
+         * primary FROM target, not a JOIN target (same restriction a real
+         * view already has). */
+        sql__advance(p);
+        if (!sql__kw_is(&p->cur, "SELECT")) return sql__err("expected a SELECT statement inside FROM (...)");
+        size_t dt_start = p->lx.pos - strlen(p->cur.text);
+        if (!sql__skip_parenthesized_select(p)) return kdb_last_status();
+        size_t dt_end = p->lx.pos - 1; /* p->cur is the ')' itself (empty token text, pos is 1 past it) */
+        while (dt_end > dt_start && isspace((unsigned char)p->lx.src[dt_end - 1])) dt_end--;
+        sql__advance(p); /* consume ')' */
+
+        size_t dt_len = dt_end - dt_start;
+        if (dt_len == 0) return sql__err("derived table's query is empty");
+        if (dt_len >= sizeof(view_query)) dt_len = sizeof(view_query) - 1;
+        memcpy(view_query, p->lx.src + dt_start, dt_len);
+        view_query[dt_len] = '\0';
+        from_is_view = 1;
+
+        if (sql__kw_is(&p->cur, "AS")) {
+            sql__advance(p);
+            const char *aname;
+            if (!sql__ident_text(&p->cur, &aname)) return sql__err("expected an alias after AS for the derived table");
+            snprintf(table_name, sizeof(table_name), "%.255s", aname);
+            sql__advance(p);
+        } else if (p->cur.type == SQLTOK_IDENT && !sql__is_clause_keyword(p->cur.text)) {
+            snprintf(table_name, sizeof(table_name), "%.255s", p->cur.text);
+            sql__advance(p);
+        } else {
+            return sql__err("a derived table (subquery in FROM) needs an alias -- FROM (SELECT ...) AS name");
+        }
+    } else {
+        const char *tname;
+        if (!sql__ident_text(&p->cur, &tname)) return sql__err("expected a table name after FROM");
+        snprintf(table_name, sizeof(table_name), "%.255s", tname);
+        sql__advance(p);
+
+        /* A view shadows nothing -- it's only even considered when no
+         * real table has this name. */
+        from_is_view = !kdb_table_exists(db, table_name) &&
+                       sql__lookup_view(db, table_name, view_query, sizeof(view_query));
+    }
 
     char alias1[KDB_SQL_IDENT_BUF];
     snprintf(alias1, sizeof(alias1), "%s", table_name);

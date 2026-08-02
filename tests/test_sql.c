@@ -1263,6 +1263,72 @@ static void test_ctes(void) {
     teardown(db);
 }
 
+static void test_derived_tables(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE sales (region TEXT, amount FLOAT)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount) VALUES ('east', 100.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount) VALUES ('east', 50.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount) VALUES ('west', 30.0)"));
+
+    KdbRows *rows = NULL;
+
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT region FROM (SELECT * FROM sales WHERE amount > 40) AS big ORDER BY region ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* derived table over an aggregate */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT region FROM (SELECT region, SUM(amount) AS total FROM sales GROUP BY region) AS totals WHERE total > 60",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *region = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "region", &region));
+        ASSERT_STR(region, "east");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* WHERE/ORDER BY/LIMIT apply on top of the derived table like a real
+     * table or view */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT * FROM (SELECT * FROM sales) AS s WHERE region = 'east' ORDER BY amount DESC LIMIT 1",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        double amount = 0;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "amount", &amount));
+        ASSERT(amount > 99.9 && amount < 100.1);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* bare alias (no AS) works, same as a real table */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT region FROM (SELECT * FROM sales WHERE amount > 40) big ORDER BY region ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* a scalar function over a derived table's column */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT UPPER(region) AS r FROM (SELECT * FROM sales) AS s WHERE amount = 100.0",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *r = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "r", &r));
+        ASSERT_STR(r, "EAST");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* a derived table needs an alias -- there's no name to fall back on */
+    ASSERT_ERR(sql(db, "SELECT * FROM (SELECT * FROM sales)"));
+
+    teardown(db);
+}
+
 static void test_scalar_functions(void) {
     KumDB *db;
     setup(&db);
@@ -1607,6 +1673,7 @@ int main(void) {
     test_drop_table();
     test_views();
     test_ctes();
+    test_derived_tables();
     test_scalar_functions();
     test_window_functions();
     test_comments();

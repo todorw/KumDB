@@ -321,7 +321,7 @@ DROP VIEW v
 INSERT INTO t (col, ...) VALUES (val, ...)
 
 [WITH name AS (SELECT ...) [, name2 AS (SELECT ...)]*]
-SELECT [DISTINCT] * | item, ... FROM t [[AS] alias]
+SELECT [DISTINCT] * | item, ... FROM t | (SELECT ...) [[AS] alias]
     [[INNER|LEFT [OUTER]] JOIN t2 [[AS] alias2] ON a.col = b.col [AND ...]]*
     [WHERE cond [AND|OR cond ...]]
     [GROUP BY col, ...]
@@ -636,6 +636,24 @@ SELECT region FROM totals WHERE total > 10000
 ```
 
 `WITH` only ever precedes a `SELECT` -- not `UPDATE`/`DELETE`/`INSERT`.
+
+**`FROM (SELECT ...) AS alias`** (a derived table) works the same way --
+a subquery standing in for a real table, needing its own alias (there's
+no table name to fall back on) since that's the only thing identifying
+it:
+
+```sql
+SELECT region FROM (SELECT region, SUM(amount) AS total FROM sales GROUP BY region) AS totals
+    WHERE total > 10000
+```
+
+`WHERE`/`ORDER BY`/`LIMIT`/`DISTINCT`/aggregates all work on top of a
+derived table same as a real table, same as `CREATE VIEW`. Only valid as
+the primary `FROM` target, not a `JOIN` target -- same restriction a real
+view has. Unlike a `WITH` CTE, nothing gets registered anywhere even
+temporarily; it's parsed and re-run inline every time, which also means
+(unlike `CREATE VIEW`) it isn't validated until the moment it actually
+runs, not a moment earlier.
 
 ```sql
 CREATE TABLE sales (region TEXT, amount FLOAT)
