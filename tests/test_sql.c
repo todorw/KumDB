@@ -1211,6 +1211,124 @@ static void test_ctes(void) {
     teardown(db);
 }
 
+static void test_window_functions(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE sales (region TEXT, rep TEXT, amount FLOAT)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, rep, amount) VALUES ('east', 'alice', 100.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, rep, amount) VALUES ('east', 'bob', 150.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, rep, amount) VALUES ('east', 'carol', 150.0)")); /* ties bob */
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, rep, amount) VALUES ('west', 'dave', 50.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, rep, amount) VALUES ('west', 'erin', 200.0)"));
+
+    KdbRows *rows = NULL;
+
+    /* ROW_NUMBER: no ties, strictly 1..n per partition. Top-level ORDER BY
+     * is single-column only (a separate, pre-existing limitation), so
+     * WHERE narrows to one partition instead of sorting on two columns. */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT rep, ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rn "
+        "FROM sales WHERE region = 'east' ORDER BY rn ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        const char *r0 = NULL, *r1 = NULL, *r2 = NULL;
+        int64_t n0 = 0, n1 = 0, n2 = 0;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "rep", &r0)); ASSERT_OK(kdb_row_get_int(&rows->rows[0], "rn", &n0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "rep", &r1)); ASSERT_OK(kdb_row_get_int(&rows->rows[1], "rn", &n1));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[2], "rep", &r2)); ASSERT_OK(kdb_row_get_int(&rows->rows[2], "rn", &n2));
+        ASSERT_STR(r0, "bob");   ASSERT_EQ(n0, 1); /* 150, first inserted among the tie */
+        ASSERT_STR(r1, "carol"); ASSERT_EQ(n1, 2); /* 150, tied with bob */
+        ASSERT_STR(r2, "alice"); ASSERT_EQ(n2, 3); /* 100 */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* RANK: ties share a rank, with a gap afterward (1,1,3 not 1,1,2) */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT rep, RANK() OVER (PARTITION BY region ORDER BY amount DESC) AS r "
+        "FROM sales WHERE region = 'east' ORDER BY r ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        int64_t r0 = 0, r1 = 0, r2 = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "r", &r0));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[1], "r", &r1));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[2], "r", &r2));
+        ASSERT_EQ(r0, 1); ASSERT_EQ(r1, 1); ASSERT_EQ(r2, 3);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* DENSE_RANK: ties share a rank, no gap (1,1,2) */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT rep, DENSE_RANK() OVER (PARTITION BY region ORDER BY amount DESC) AS dr "
+        "FROM sales WHERE region = 'east' ORDER BY dr ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        int64_t d0 = 0, d1 = 0, d2 = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "dr", &d0));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[1], "dr", &d1));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[2], "dr", &d2));
+        ASSERT_EQ(d0, 1); ASSERT_EQ(d1, 1); ASSERT_EQ(d2, 2);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* windowed SUM/COUNT: whole-partition value, same on every row, rows
+     * NOT collapsed (unlike GROUP BY) */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT rep, SUM(amount) OVER (PARTITION BY region) AS total, "
+        "COUNT(*) OVER (PARTITION BY region) AS n FROM sales WHERE region = 'east' ORDER BY rep ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 3u); /* still 3 rows, not collapsed to 1 */
+    if (rows && rows->count == 3) {
+        double t0 = 0, t1 = 0;
+        int64_t n0 = 0;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "total", &t0));
+        ASSERT_OK(kdb_row_get_float(&rows->rows[1], "total", &t1));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "n", &n0));
+        ASSERT(t0 > 399.9 && t0 < 400.1); /* 100+150+150 */
+        ASSERT(t1 > 399.9 && t1 < 400.1);
+        ASSERT_EQ(n0, 3);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* no PARTITION BY at all -- whole result set is one partition */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT MAX(amount) OVER () AS m FROM sales", &rows, NULL));
+    ASSERT(rows && rows->count == 5u);
+    if (rows && rows->count == 5) {
+        double m = 0;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "m", &m));
+        ASSERT(m > 199.9 && m < 200.1);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* a plain column freely coexists with a window function -- no
+     * GROUP BY-style "must be in the partition" restriction */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT rep, region, RANK() OVER (PARTITION BY region ORDER BY amount DESC) AS r FROM sales",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 5u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* window function after a JOIN, on qualified columns */
+    ASSERT_OK(sql(db, "CREATE TABLE reps (name TEXT, tier TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO reps (name, tier) VALUES ('alice', 'gold')"));
+    ASSERT_OK(sql(db, "INSERT INTO reps (name, tier) VALUES ('bob', 'gold')"));
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT s.rep, RANK() OVER (PARTITION BY r.tier ORDER BY s.amount DESC) AS rk "
+        "FROM sales AS s JOIN reps AS r ON s.rep = r.name", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* ROW_NUMBER()/RANK()/DENSE_RANK() require OVER */
+    ASSERT_ERR(sql(db, "SELECT ROW_NUMBER() FROM sales"));
+    ASSERT_ERR(sql(db, "SELECT RANK() FROM sales"));
+
+    /* a window function can't combine with GROUP BY/a plain aggregate in
+     * the same SELECT */
+    ASSERT_ERR(sql(db, "SELECT region, COUNT(*), ROW_NUMBER() OVER (ORDER BY region) FROM sales GROUP BY region"));
+
+    teardown(db);
+}
+
 static void test_syntax_errors(void) {
     KumDB *db;
     setup(&db);
@@ -1259,6 +1377,7 @@ int main(void) {
     test_drop_table();
     test_views();
     test_ctes();
+    test_window_functions();
     test_syntax_errors();
 
     printf("passed=%d  failed=%d\n", passed, failed);

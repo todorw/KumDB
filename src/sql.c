@@ -1299,7 +1299,13 @@ static void sql__free_row_fields(KdbRow *row) {
     row->field_count = 0;
 }
 
-typedef enum { SQL_AGG_NONE, SQL_AGG_COUNT, SQL_AGG_SUM, SQL_AGG_AVG, SQL_AGG_MIN, SQL_AGG_MAX } SqlAggFn;
+typedef enum {
+    SQL_AGG_NONE, SQL_AGG_COUNT, SQL_AGG_SUM, SQL_AGG_AVG, SQL_AGG_MIN, SQL_AGG_MAX,
+    SQL_AGG_ROW_NUMBER, SQL_AGG_RANK, SQL_AGG_DENSE_RANK
+} SqlAggFn;
+
+#define KDB_SQL_MAX_WINDOW_PARTITION_COLS 4
+#define KDB_SQL_MAX_WINDOW_ORDER_COLS     4
 
 #define KDB_SQL_MAX_CASE_BRANCHES  4
 #define KDB_SQL_CASE_VAL_BUF       512
@@ -1339,6 +1345,19 @@ typedef struct {
     double        else_float;
     int           else_bool;
     char          else_string[KDB_SQL_CASE_VAL_BUF];
+
+    /* fn(...) OVER ([PARTITION BY ...] [ORDER BY ...]) -- is_window==0 for
+     * everything else (plain column, CASE, or a GROUP BY-collapsing
+     * aggregate with no OVER). ROW_NUMBER/RANK/DENSE_RANK are only ever
+     * window functions (always is_window==1, enforced at parse time);
+     * COUNT/SUM/AVG/MIN/MAX can be either, OVER is what decides. All POD,
+     * same reasoning as SqlCaseBranch above. */
+    int      is_window;
+    char     partition_cols[KDB_SQL_MAX_WINDOW_PARTITION_COLS][KDB_SQL_IDENT_BUF];
+    int      n_partition_cols;
+    char     window_order_cols[KDB_SQL_MAX_WINDOW_ORDER_COLS][KDB_SQL_IDENT_BUF];
+    int      window_order_asc[KDB_SQL_MAX_WINDOW_ORDER_COLS];
+    int      n_window_order_cols;
 } SqlSelectItem;
 
 static int sql__agg_fn_from_ident(const char *s, SqlAggFn *out) {
@@ -1348,6 +1367,72 @@ static int sql__agg_fn_from_ident(const char *s, SqlAggFn *out) {
     if (strcasecmp(s, "MIN")   == 0) { *out = SQL_AGG_MIN;   return 1; }
     if (strcasecmp(s, "MAX")   == 0) { *out = SQL_AGG_MAX;   return 1; }
     return 0;
+}
+
+/* ROW_NUMBER/RANK/DENSE_RANK take no arguments and only ever exist as
+ * window functions (an OVER clause is mandatory for them, checked by the
+ * caller right after this) -- unlike COUNT/SUM/AVG/MIN/MAX, which can be
+ * either a window function (with OVER) or a GROUP BY-collapsing aggregate
+ * (without), so they aren't in this list. */
+static int sql__window_only_fn_from_ident(const char *s, SqlAggFn *out) {
+    if (strcasecmp(s, "ROW_NUMBER") == 0) { *out = SQL_AGG_ROW_NUMBER; return 1; }
+    if (strcasecmp(s, "RANK")       == 0) { *out = SQL_AGG_RANK;       return 1; }
+    if (strcasecmp(s, "DENSE_RANK") == 0) { *out = SQL_AGG_DENSE_RANK; return 1; }
+    return 0;
+}
+
+/* OVER ([PARTITION BY col, ...] [ORDER BY col [ASC|DESC], ...]). p is
+ * positioned at "OVER" (not yet consumed). Returns 0 on error (error
+ * already set), 1 on success. */
+static int sql__parse_window_over(SqlParser *p, SqlSelectItem *item) {
+    sql__advance(p); /* OVER */
+    if (p->cur.type != SQLTOK_LPAREN) { sql__err("expected '(' after OVER"); return 0; }
+    sql__advance(p);
+
+    if (sql__kw_is(&p->cur, "PARTITION")) {
+        sql__advance(p);
+        if (!sql__kw_is(&p->cur, "BY")) { sql__err("expected BY after PARTITION"); return 0; }
+        sql__advance(p);
+        for (;;) {
+            const char *col;
+            if (!sql__ident_text(&p->cur, &col)) { sql__err("expected a column name after PARTITION BY"); return 0; }
+            if (item->n_partition_cols >= KDB_SQL_MAX_WINDOW_PARTITION_COLS) {
+                sql__err("too many PARTITION BY columns in OVER (max %d)", KDB_SQL_MAX_WINDOW_PARTITION_COLS);
+                return 0;
+            }
+            snprintf(item->partition_cols[item->n_partition_cols++], sizeof(item->partition_cols[0]), "%.255s", col);
+            sql__advance(p);
+            if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+            break;
+        }
+    }
+
+    if (sql__kw_is(&p->cur, "ORDER")) {
+        sql__advance(p);
+        if (!sql__kw_is(&p->cur, "BY")) { sql__err("expected BY after ORDER"); return 0; }
+        sql__advance(p);
+        for (;;) {
+            const char *col;
+            if (!sql__ident_text(&p->cur, &col)) { sql__err("expected a column name after ORDER BY"); return 0; }
+            if (item->n_window_order_cols >= KDB_SQL_MAX_WINDOW_ORDER_COLS) {
+                sql__err("too many ORDER BY columns in OVER (max %d)", KDB_SQL_MAX_WINDOW_ORDER_COLS);
+                return 0;
+            }
+            int idx = item->n_window_order_cols;
+            snprintf(item->window_order_cols[idx], sizeof(item->window_order_cols[0]), "%.255s", col);
+            sql__advance(p);
+            item->window_order_asc[idx] = 1;
+            if (sql__kw_is(&p->cur, "ASC"))       sql__advance(p);
+            else if (sql__kw_is(&p->cur, "DESC")) { item->window_order_asc[idx] = 0; sql__advance(p); }
+            item->n_window_order_cols++;
+            if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+            break;
+        }
+    }
+
+    if (p->cur.type != SQLTOK_RPAREN) { sql__err("expected ')' closing OVER (...)"); return 0; }
+    sql__advance(p);
+    return 1;
 }
 
 /* Resolves a literal token (number/string/true/false/null) into a typed
@@ -2038,6 +2123,16 @@ static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uin
                     if (g->max_ref[it]) { of->type = g->max_ref[it]->type; copy_ok = sql__copy_field_value(of, g->max_ref[it]); }
                     else                { of->type = KDB_TYPE_NULL; }
                     break;
+                case SQL_AGG_ROW_NUMBER:
+                case SQL_AGG_RANK:
+                case SQL_AGG_DENSE_RANK:
+                    /* unreachable: these are always is_window, and a window
+                     * item is rejected up front if GROUP BY/aggregates are
+                     * also present -- never routed through this GROUP BY-
+                     * collapsing path. Handled only so the switch stays
+                     * exhaustive under -Wswitch. */
+                    of->type = KDB_TYPE_NULL;
+                    break;
             }
             if (!copy_ok) {
                 for (uint32_t k = 0; k <= it; k++) sql__free_field(&fields[k]);
@@ -2196,6 +2291,220 @@ static KdbStatus sql__project_rows(KdbRows *rows, SqlSelectItem *items, uint32_t
         row->field_count = kept;
     }
     return KDB_OK;
+}
+
+/* Appends one deep-copied field to row (realloc + grow by one), same
+ * ownership convention sql__copy_field_value's other callers already use.
+ * Returns 0 on OOM (row is left with whatever fields it already had,
+ * still safe to free). */
+static int sql__row_add_field(KdbRow *row, const char *name, const KdbField *value) {
+    KdbField *grown = (KdbField *)realloc(row->fields, (row->field_count + 1) * sizeof(KdbField));
+    if (!grown) return 0;
+    row->fields = grown;
+    KdbField *dst = &row->fields[row->field_count];
+    memset(dst, 0, sizeof(*dst));
+    dst->name = strdup(name);
+    if (!dst->name) return 0;
+    dst->type = value->type;
+    if (!sql__copy_field_value(dst, value)) { free((void *)dst->name); dst->name = NULL; return 0; }
+    row->field_count++;
+    return 1;
+}
+
+/* sql__field_cmp requires non-NULL fields; a window function's PARTITION
+ * BY/ORDER BY column might not exist on every row (e.g. a LEFT JOIN's
+ * NULL-padded columns), so every lookup here goes through this NULL-safe
+ * wrapper instead of calling it directly. Missing sorts before present,
+ * consistent either side. */
+static int sql__win_field_cmp(const KdbField *a, const KdbField *b) {
+    if (!a && !b) return 0;
+    if (!a) return -1;
+    if (!b) return 1;
+    return sql__field_cmp(a, b);
+}
+
+static int sql__win_partition_equal(const SqlSelectItem *item, const KdbRow *ra, const KdbRow *rb) {
+    for (int k = 0; k < item->n_partition_cols; k++) {
+        const KdbField *fa = kdb_row_get(ra, item->partition_cols[k]);
+        const KdbField *fb = kdb_row_get(rb, item->partition_cols[k]);
+        if (sql__win_field_cmp(fa, fb) != 0) return 0;
+    }
+    return 1;
+}
+
+static int sql__win_order_equal(const SqlSelectItem *item, const KdbRow *ra, const KdbRow *rb) {
+    for (int k = 0; k < item->n_window_order_cols; k++) {
+        const KdbField *fa = kdb_row_get(ra, item->window_order_cols[k]);
+        const KdbField *fb = kdb_row_get(rb, item->window_order_cols[k]);
+        if (sql__win_field_cmp(fa, fb) != 0) return 0;
+    }
+    return 1;
+}
+
+/* qsort callback context -- single-threaded, one window-function sort in
+ * flight at a time, same pattern sql__sort_col/sql__row_cmp already use
+ * for top-level ORDER BY. */
+static const SqlSelectItem *sql__win_item = NULL;
+static KdbRow               *sql__win_rows = NULL;
+
+/* Orders by PARTITION BY columns first (so a partition's rows end up
+ * contiguous -- order among partitions themselves doesn't matter), then
+ * ORDER BY columns (with direction), then the original row index as a
+ * final tiebreaker so the sort is a deterministic total order regardless
+ * of qsort's own (unspecified) stability. */
+static int sql__win_cmp(const void *a, const void *b) {
+    size_t ia = *(const size_t *)a, ib = *(const size_t *)b;
+    const KdbRow *ra = &sql__win_rows[ia];
+    const KdbRow *rb = &sql__win_rows[ib];
+    const SqlSelectItem *item = sql__win_item;
+
+    for (int k = 0; k < item->n_partition_cols; k++) {
+        const KdbField *fa = kdb_row_get(ra, item->partition_cols[k]);
+        const KdbField *fb = kdb_row_get(rb, item->partition_cols[k]);
+        int c = sql__win_field_cmp(fa, fb);
+        if (c != 0) return c;
+    }
+    for (int k = 0; k < item->n_window_order_cols; k++) {
+        const KdbField *fa = kdb_row_get(ra, item->window_order_cols[k]);
+        const KdbField *fb = kdb_row_get(rb, item->window_order_cols[k]);
+        int c = sql__win_field_cmp(fa, fb);
+        if (!item->window_order_asc[k]) c = -c;
+        if (c != 0) return c;
+    }
+    if (ia < ib) return -1;
+    if (ia > ib) return 1;
+    return 0;
+}
+
+/* Computes every is_window item's per-row value and injects it into each
+ * row under a unique internal field name ("__kdb_win_<item index>"),
+ * repointing that item's arg_col at the injected field so
+ * sql__project_rows's existing plain-column path (kdb_row_get(row,
+ * arg_col)) picks it up with no changes of its own -- a window function
+ * becomes, from projection's point of view, just another column that
+ * happens to have been computed rather than stored.
+ *
+ * Mechanically: sort a row-index array by PARTITION BY then ORDER BY (see
+ * sql__win_cmp), which makes each partition's rows contiguous and, within
+ * a partition, correctly ordered; then a single pass over that sorted
+ * order computes ROW_NUMBER/RANK/DENSE_RANK directly, or (for COUNT/SUM/
+ * AVG/MIN/MAX) accumulates over each partition and backfills every row in
+ * it once the partition's end is found -- there's no running/cumulative
+ * frame clause (ROWS/RANGE BETWEEN), every aggregate window function
+ * covers the whole partition, same value on every row in it. */
+static KdbStatus sql__compute_window_functions(KdbRows *rows, SqlSelectItem *items, uint32_t nitems) {
+    if (rows->count == 0) return KDB_OK;
+
+    size_t *order_idx = (size_t *)malloc(rows->count * sizeof(size_t));
+    if (!order_idx) { kdb_err_oom("window function row order"); return KDB_ERR_OOM; }
+
+    KdbField *computed = (KdbField *)calloc(rows->count, sizeof(KdbField));
+    if (!computed) { free(order_idx); kdb_err_oom("window function values"); return KDB_ERR_OOM; }
+
+    KdbStatus st = KDB_OK;
+
+    for (uint32_t it = 0; it < nitems && st == KDB_OK; it++) {
+        if (!items[it].is_window) continue;
+        SqlSelectItem *item = &items[it];
+
+        for (size_t i = 0; i < rows->count; i++) order_idx[i] = i;
+        sql__win_item = item;
+        sql__win_rows = rows->rows;
+        qsort(order_idx, rows->count, sizeof(size_t), sql__win_cmp);
+
+        for (size_t i = 0; i < rows->count; i++) memset(&computed[i], 0, sizeof(computed[i]));
+
+        int64_t row_num = 0, rank = 0, dense_rank = 0;
+        double  agg_sum = 0.0;
+        int64_t agg_count = 0;
+        const KdbField *agg_min = NULL, *agg_max = NULL;
+        size_t  part_start = 0;
+
+        for (size_t si = 0; si <= rows->count && st == KDB_OK; si++) {
+            int at_boundary = (si == rows->count) ||
+                               (si > part_start && !sql__win_partition_equal(item, &rows->rows[order_idx[si]], &rows->rows[order_idx[si - 1]]));
+
+            if (at_boundary && si > part_start) {
+                if (item->fn == SQL_AGG_COUNT || item->fn == SQL_AGG_SUM || item->fn == SQL_AGG_AVG ||
+                    item->fn == SQL_AGG_MIN   || item->fn == SQL_AGG_MAX) {
+                    KdbField val;
+                    memset(&val, 0, sizeof(val));
+                    switch (item->fn) {
+                        case SQL_AGG_COUNT: val.type = KDB_TYPE_INT;   val.v.as_int   = agg_count; break;
+                        case SQL_AGG_SUM:   val.type = KDB_TYPE_FLOAT; val.v.as_float = agg_sum;   break;
+                        case SQL_AGG_AVG:   val.type = KDB_TYPE_FLOAT; val.v.as_float = agg_count > 0 ? agg_sum / (double)agg_count : 0.0; break;
+                        case SQL_AGG_MIN:
+                            if (agg_min) { val.type = agg_min->type; if (!sql__copy_field_value(&val, agg_min)) st = KDB_ERR_OOM; }
+                            else           val.type = KDB_TYPE_NULL;
+                            break;
+                        case SQL_AGG_MAX:
+                            if (agg_max) { val.type = agg_max->type; if (!sql__copy_field_value(&val, agg_max)) st = KDB_ERR_OOM; }
+                            else           val.type = KDB_TYPE_NULL;
+                            break;
+                        default: break;
+                    }
+                    for (size_t k = part_start; k < si && st == KDB_OK; k++) {
+                        computed[order_idx[k]].type = val.type;
+                        if (!sql__copy_field_value(&computed[order_idx[k]], &val)) st = KDB_ERR_OOM;
+                    }
+                    sql__free_field(&val);
+                }
+                agg_sum = 0.0; agg_count = 0; agg_min = NULL; agg_max = NULL;
+                row_num = 0; rank = 0; dense_rank = 0;
+                part_start = si;
+            }
+            if (si == rows->count) break;
+
+            size_t ridx = order_idx[si];
+            KdbRow *row = &rows->rows[ridx];
+
+            if (item->fn == SQL_AGG_ROW_NUMBER || item->fn == SQL_AGG_RANK || item->fn == SQL_AGG_DENSE_RANK) {
+                row_num++;
+                /* si == part_start (first row of the partition) is never
+                 * "tied with previous" -- there's no previous row in this
+                 * partition yet -- so rank/dense_rank always get set on a
+                 * partition's first row, then only change again on a real
+                 * order-by change, exactly RANK/DENSE_RANK's tie rule. */
+                int tied_with_prev = si > part_start && sql__win_order_equal(item, row, &rows->rows[order_idx[si - 1]]);
+                if (!tied_with_prev) { rank = row_num; dense_rank++; }
+
+                computed[ridx].type = KDB_TYPE_INT;
+                computed[ridx].v.as_int = (item->fn == SQL_AGG_ROW_NUMBER) ? row_num
+                                          : (item->fn == SQL_AGG_RANK)     ? rank
+                                                                            : dense_rank;
+            } else {
+                const KdbField *f = (strcmp(item->arg_col, "*") == 0) ? NULL : kdb_row_get(row, item->arg_col);
+                if (item->fn == SQL_AGG_COUNT) {
+                    if (strcmp(item->arg_col, "*") == 0 || f) agg_count++;
+                } else if (f) {
+                    double v;
+                    if ((item->fn == SQL_AGG_SUM || item->fn == SQL_AGG_AVG) && sql__field_to_double(f, &v)) {
+                        agg_sum += v;
+                        agg_count++;
+                    } else if (item->fn == SQL_AGG_MIN) {
+                        if (!agg_min || sql__field_cmp(f, agg_min) < 0) agg_min = f;
+                    } else if (item->fn == SQL_AGG_MAX) {
+                        if (!agg_max || sql__field_cmp(f, agg_max) > 0) agg_max = f;
+                    }
+                }
+            }
+        }
+
+        if (st == KDB_OK) {
+            char internal_name[40];
+            snprintf(internal_name, sizeof(internal_name), "__kdb_win_%u", (unsigned)it);
+            for (size_t r = 0; r < rows->count && st == KDB_OK; r++) {
+                if (!sql__row_add_field(&rows->rows[r], internal_name, &computed[r])) st = KDB_ERR_OOM;
+            }
+            if (st == KDB_OK) snprintf(item->arg_col, sizeof(item->arg_col), "%s", internal_name);
+        }
+        for (size_t r = 0; r < rows->count; r++) sql__free_field(&computed[r]);
+    }
+
+    free(computed);
+    free(order_idx);
+    if (st != KDB_OK) kdb_err_oom("window function computation");
+    return st;
 }
 
 #define KDB_SQL_MAX_JOIN_COND 8
@@ -2529,6 +2838,7 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     uint32_t nitems = 0;
     int has_aggregate = 0;
     int has_case = 0;
+    int has_window = 0;
 
     if (p->cur.type == SQLTOK_STAR) {
         project_all = 1;
@@ -2550,24 +2860,38 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
                 sql__advance(p);
 
                 SqlAggFn fn;
-                if (sql__agg_fn_from_ident(first_ident, &fn) && p->cur.type == SQLTOK_LPAREN) {
+                int is_window_only_fn = sql__window_only_fn_from_ident(first_ident, &fn);
+                if ((is_window_only_fn || sql__agg_fn_from_ident(first_ident, &fn)) && p->cur.type == SQLTOK_LPAREN) {
                     sql__advance(p);
-                    if (p->cur.type == SQLTOK_STAR) {
+                    if (is_window_only_fn) {
+                        if (p->cur.type != SQLTOK_RPAREN) return sql__err("%s() takes no arguments", first_ident);
+                        snprintf(item.alias, sizeof(item.alias), "%.100s()", first_ident);
+                    } else if (p->cur.type == SQLTOK_STAR) {
                         if (fn != SQL_AGG_COUNT) return sql__err("only COUNT(*) is supported, not %s(*)", first_ident);
                         snprintf(item.arg_col, sizeof(item.arg_col), "*");
                         sql__advance(p);
+                        snprintf(item.alias, sizeof(item.alias), "%.100s(%.100s)", first_ident, item.arg_col);
                     } else {
                         const char *acol;
                         if (!sql__ident_text(&p->cur, &acol))
                             return sql__err("expected a column name or '*' inside %s(...)", first_ident);
                         snprintf(item.arg_col, sizeof(item.arg_col), "%.255s", acol);
                         sql__advance(p);
+                        snprintf(item.alias, sizeof(item.alias), "%.100s(%.100s)", first_ident, item.arg_col);
                     }
                     if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing %s(...)", first_ident);
                     sql__advance(p);
                     item.fn = fn;
-                    has_aggregate = 1;
-                    snprintf(item.alias, sizeof(item.alias), "%.100s(%.100s)", first_ident, item.arg_col);
+
+                    if (sql__kw_is(&p->cur, "OVER")) {
+                        item.is_window = 1;
+                        if (!sql__parse_window_over(p, &item)) return kdb_last_status();
+                        has_window = 1;
+                    } else if (is_window_only_fn) {
+                        return sql__err("%s() requires an OVER (...) clause", first_ident);
+                    } else {
+                        has_aggregate = 1;
+                    }
                 } else {
                     item.fn = SQL_AGG_NONE;
                     snprintf(item.arg_col, sizeof(item.arg_col), "%s", first_ident);
@@ -2713,6 +3037,11 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
         return sql__err("CASE doesn't support GROUP BY or aggregate functions yet");
     }
 
+    if (has_window && (has_aggregate || has_group_by)) {
+        sql__free_cond_node(where_tree);
+        return sql__err("a window function (OVER (...)) can't be combined with GROUP BY or a plain aggregate in the same SELECT");
+    }
+
     if (project_all && has_group_by) {
         sql__free_cond_node(where_tree);
         return sql__err("can't use '*' with GROUP BY -- list the columns/aggregates you want");
@@ -2799,6 +3128,11 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
         if (fst != KDB_OK) { sql__free_cond_node(where_tree); return fst; }
         if (needs_filtering) sql__filter_rows_tree(db, alias1, rows, where_tree);
         sql__free_cond_node(where_tree);
+    }
+
+    if (has_window) {
+        KdbStatus wst = sql__compute_window_functions(rows, items, nitems);
+        if (wst != KDB_OK) { kdb_rows_free(rows); return wst; }
     }
 
     if (!project_all) {

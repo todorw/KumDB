@@ -471,7 +471,34 @@ distinct combination of values across all of them; every other selected
 item must be an aggregate call — same rule real SQL uses. `SELECT col FROM
 t GROUP BY col` with no aggregate at all is a valid way to get distinct
 values. `SUM`/`AVG` always come back as `FLOAT` regardless of the source
-column's type. No window functions.
+column's type.
+
+**Window functions**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, and
+`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` all work as window functions with
+`OVER ([PARTITION BY col, ...] [ORDER BY col [ASC|DESC], ...])` — unlike
+`GROUP BY`, rows aren't collapsed; every row keeps its own value alongside
+whatever else is selected:
+
+```sql
+SELECT region, rep, amount,
+       RANK() OVER (PARTITION BY region ORDER BY amount DESC) AS rank_in_region,
+       SUM(amount) OVER (PARTITION BY region) AS region_total
+    FROM sales
+```
+
+`RANK`/`DENSE_RANK` give tied rows (equal `ORDER BY` values within a
+partition) the same rank; `RANK` leaves a gap afterward (`1, 1, 3`),
+`DENSE_RANK` doesn't (`1, 1, 2`). A windowed aggregate covers the whole
+partition, not a running/cumulative total — no `ROWS`/`RANGE BETWEEN`
+frame clause. `PARTITION BY`/`ORDER BY` are both optional (omit
+`PARTITION BY` and the whole result set is one partition); omitting
+`ORDER BY` inside `OVER` for `RANK`/`DENSE_RANK` means everything ties
+(rank 1 for every row in the partition) — same as real SQL. `ROW_NUMBER`/
+`RANK`/`DENSE_RANK` always need `OVER` (there's no non-window use of
+them); `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` use `OVER` to switch from their
+`GROUP BY`-collapsing form to this one — a `SELECT` can't mix a window
+function with `GROUP BY` or a plain (non-window) aggregate. Works fine
+after a `JOIN`, on qualified columns, same as anything else there.
 
 **`CASE`** as a `SELECT` item: `CASE WHEN cond THEN val [WHEN cond THEN
 val ...] [ELSE val] END`. First matching `WHEN` wins; with no `ELSE` and

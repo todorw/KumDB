@@ -51,7 +51,20 @@ extern "C" {
  * "SELECT col FROM t GROUP BY col" with no aggregate at all is a valid way
  * to get distinct values. SUM/AVG always come back as FLOAT regardless of
  * the source column's type. HAVING filters the aggregated output (needs
- * GROUP BY or an aggregate item). No window functions.
+ * GROUP BY or an aggregate item).
+ *
+ * Window functions: ROW_NUMBER()/RANK()/DENSE_RANK() and COUNT/SUM/AVG/
+ * MIN/MAX all work with OVER ([PARTITION BY col,...] [ORDER BY col
+ * [ASC|DESC],...]) -- unlike GROUP BY, rows aren't collapsed, every row
+ * keeps its own computed value. RANK/DENSE_RANK give tied rows (equal
+ * ORDER BY values within a partition) the same rank, RANK leaving a gap
+ * afterward (1,1,3), DENSE_RANK not (1,1,2). A windowed aggregate covers
+ * the whole partition (no running/cumulative ROWS/RANGE BETWEEN frame
+ * clause). PARTITION BY/ORDER BY are both optional. ROW_NUMBER/RANK/
+ * DENSE_RANK always need OVER; COUNT/SUM/AVG/MIN/MAX use OVER to switch
+ * from their GROUP BY-collapsing form to this one -- a SELECT can't mix a
+ * window function with GROUP BY or a plain aggregate. Works after a JOIN,
+ * on qualified columns, same as anything else there.
  *
  * JOIN (INNER or LEFT) matches rows via a conjunction of col = col
  * equalities in ON (no OR, no comparing to a literal there -- that's what
