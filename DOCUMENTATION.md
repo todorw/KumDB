@@ -308,6 +308,9 @@ ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [INDEX]
 ALTER TABLE t DROP [COLUMN] col
 DROP TABLE t
 
+CREATE VIEW v AS SELECT ...
+DROP VIEW v
+
 INSERT INTO t (col, ...) VALUES (val, ...)
 
 SELECT [DISTINCT] * | item, ... FROM t [[AS] alias]
@@ -447,6 +450,26 @@ alone, not the whole row). `id`/`created_at`/`updated_at` aren't part of
 what `*` projects (same as plain `SELECT *`), so `SELECT DISTINCT *` on a
 table with repeated column values still collapses them. Works with `GROUP
 BY` too (dedupes the aggregated output, rarely useful but not rejected).
+
+**`CREATE VIEW v AS SELECT ...`** stores a named query; `SELECT ... FROM
+v` re-runs it fresh every time (not materialized/cached). `CREATE VIEW`
+validates the underlying query immediately -- a typo or a reference to a
+table that doesn't exist yet fails at creation, not at first use.
+`WHERE`/`ORDER BY`/`LIMIT`/`DISTINCT`/aggregates all work on top of a view
+same as a real table:
+
+```sql
+CREATE VIEW eng_staff AS SELECT name, salary FROM employees WHERE dept = 'eng'
+SELECT name FROM eng_staff WHERE salary > 130000 ORDER BY name
+SELECT COUNT(*), SUM(salary) FROM eng_staff
+DROP VIEW eng_staff
+```
+
+A view can't be `JOIN`ed (either as the left side or a `JOIN` target) --
+not supported yet. Views are stored as rows in a reserved internal table,
+`__kumdb_views__`; it'll show up in `kdb_list_tables()`/the CLI's `tables`
+command like any other table (querying it directly works fine, it's just
+not hidden), so don't name a real table that.
 
 ```sql
 CREATE TABLE sales (region TEXT, amount FLOAT)

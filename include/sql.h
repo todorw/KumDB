@@ -17,6 +17,8 @@ extern "C" {
  *   ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [INDEX]
  *   ALTER TABLE t DROP [COLUMN] col
  *   DROP TABLE t
+ *   CREATE VIEW v AS SELECT ...
+ *   DROP VIEW v
  *   INSERT INTO t (col, ...) VALUES (val, ...)
  *   SELECT [DISTINCT] * | item, ... FROM t [[AS] alias]
  *                               [[INNER|LEFT [OUTER]] JOIN t2 [[AS] alias2] ON a.col = b.col [AND ...]]*
@@ -79,6 +81,17 @@ extern "C" {
  * =/!=/>/>=/</<= (must return exactly one row, one column), or
  * "IN (SELECT col FROM ...)" in place of a literal list. Non-correlated
  * only -- the inner query can't see the outer row.
+ *
+ * CREATE VIEW v AS SELECT ... stores a named query; SELECT ... FROM v
+ * re-runs it fresh every time (not materialized/cached). Validates the
+ * underlying query immediately (fails at creation, not first use, if it
+ * references something that doesn't exist). WHERE/ORDER BY/LIMIT/DISTINCT/
+ * aggregates all work on top of a view same as a real table; a view can't
+ * be JOINed (either side) yet. Views are stored as rows in a reserved
+ * internal table, "__kumdb_views__" -- it'll show up in
+ * kdb_list_tables()/the CLI's "tables" command like any other table
+ * (querying it directly works fine, it's just not hidden), so don't name
+ * a real table that.
  *
  * Types: INT/INTEGER, FLOAT/REAL/DOUBLE, BOOL/BOOLEAN, TEXT/STRING/VARCHAR,
  * BLOB. VARCHAR(n)/CHAR(n) length specs are accepted and ignored (KumDB

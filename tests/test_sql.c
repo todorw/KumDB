@@ -822,6 +822,68 @@ static void test_drop_table(void) {
     teardown(db);
 }
 
+static void test_views(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE employees (name TEXT, dept TEXT, salary FLOAT)"));
+    ASSERT_OK(sql(db, "INSERT INTO employees (name, dept, salary) VALUES ('alice', 'eng', 120.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO employees (name, dept, salary) VALUES ('bob', 'sales', 80.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO employees (name, dept, salary) VALUES ('carol', 'eng', 150.0)"));
+
+    ASSERT_OK(sql(db, "CREATE VIEW eng_staff AS SELECT name, salary FROM employees WHERE dept = 'eng'"));
+
+    KdbRows *rows = NULL;
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM eng_staff ORDER BY name ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const char *n0 = NULL, *n1 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &n0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "name", &n1));
+        ASSERT_STR(n0, "alice");
+        ASSERT_STR(n1, "carol");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* WHERE applies on top of the view's own filter */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM eng_staff WHERE salary > 130", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* aggregates work over a view */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT COUNT(*) AS n, SUM(salary) AS total FROM eng_staff", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        int64_t cnt = 0;
+        double total = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "n", &cnt));
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "total", &total));
+        ASSERT_EQ(cnt, 2);
+        ASSERT(total > 269.9 && total < 270.1);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* DROP VIEW removes it */
+    ASSERT_OK(sql(db, "DROP VIEW eng_staff"));
+    ASSERT_ERR(sql(db, "SELECT * FROM eng_staff"));
+    ASSERT_ERR(sql(db, "DROP VIEW eng_staff")); /* already gone */
+
+    /* a view can't be JOINed (either side) */
+    ASSERT_OK(sql(db, "CREATE VIEW v2 AS SELECT name FROM employees"));
+    ASSERT_OK(sql(db, "CREATE TABLE t2 (x TEXT)"));
+    ASSERT_ERR(sql(db, "SELECT * FROM v2 JOIN t2 AS t ON v2.name = t.x"));
+    ASSERT_ERR(sql(db, "SELECT * FROM t2 AS t JOIN v2 ON t.x = v2.name"));
+
+    /* CREATE VIEW validates its query immediately */
+    ASSERT_ERR(sql(db, "CREATE VIEW bad_view AS SELECT * FROM nonexistent_table"));
+
+    /* can't shadow an existing table, or redefine an existing view */
+    ASSERT_ERR(sql(db, "CREATE VIEW employees AS SELECT name FROM employees"));
+    ASSERT_ERR(sql(db, "CREATE VIEW v2 AS SELECT name FROM employees"));
+
+    teardown(db);
+}
+
 static void test_syntax_errors(void) {
     KumDB *db;
     setup(&db);
@@ -865,6 +927,7 @@ int main(void) {
     test_nested_values_through_sql();
     test_reserved_columns_skipped();
     test_drop_table();
+    test_views();
     test_syntax_errors();
 
     printf("passed=%d  failed=%d\n", passed, failed);

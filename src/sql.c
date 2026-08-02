@@ -573,9 +573,125 @@ static KdbStatus sql__parse_column_modifiers(SqlParser *p, const char *col_name,
     return KDB_OK;
 }
 
+/* Views are stored as rows in a reserved internal table -- reuses the
+ * engine's existing durability/atomicity for free instead of inventing a
+ * second on-disk format just for view definitions. Not meant to be a real
+ * user table name; don't create one. */
+#define KDB_VIEWS_TABLE "__kumdb_views__"
+
+/* True if a view named 'name' is registered -- doesn't distinguish "no
+ * views table yet" from "views table exists but no matching row", both
+ * just mean "not a view". */
+static int sql__view_exists(KumDB *db, const char *name) {
+    if (!kdb_table_exists(db, KDB_VIEWS_TABLE)) return 0;
+    char filter_buf[KDB_SQL_IDENT_BUF + 8];
+    snprintf(filter_buf, sizeof(filter_buf), "name=%s", name);
+    const char *filters[] = { filter_buf, NULL };
+    return kdb_count(db, KDB_VIEWS_TABLE, filters) > 0;
+}
+
+/* Copies a view's stored SELECT text into out. out_size is expected to be
+ * KDB_MAX_STRING_LEN (the storage layer's own string-field cap, so a
+ * stored view's query can never legitimately be longer than that anyway)
+ * -- a fixed caller-owned buffer instead of a heap pointer, on purpose:
+ * sql__exec_select_core has a lot of early-return paths already, and this
+ * way there's nothing to free on any of them. Returns 1 if 'name' is a
+ * registered view, 0 otherwise (not an error either way). */
+static int sql__lookup_view(KumDB *db, const char *name, char *out, size_t out_size) {
+    if (!kdb_table_exists(db, KDB_VIEWS_TABLE)) return 0;
+    char filter_buf[KDB_SQL_IDENT_BUF + 8];
+    snprintf(filter_buf, sizeof(filter_buf), "name=%s", name);
+    const char *filters[] = { filter_buf, NULL };
+    KdbRow *row = kdb_find_one(db, KDB_VIEWS_TABLE, filters);
+    if (!row) return 0;
+    const char *query = NULL;
+    int found = 0;
+    if (kdb_row_get_string(row, "query", &query) == KDB_OK && query) {
+        snprintf(out, out_size, "%s", query);
+        found = 1;
+    }
+    kdb_row_free(row);
+    return found;
+}
+
+/* CREATE VIEW name AS SELECT ... -- validates the underlying SELECT by
+ * actually running it (so a typo or a reference to a table that doesn't
+ * exist yet fails at CREATE VIEW time, not at first use), then stores its
+ * raw source text (not a parsed/serialized form -- just remembers where
+ * "SELECT" started in the original string and re-parses fresh on every
+ * use). p is positioned right after "CREATE VIEW" (both already
+ * consumed by the caller). */
+static KdbStatus sql__exec_create_view(SqlParser *p, KumDB *db) {
+    const char *vname;
+    if (!sql__ident_text(&p->cur, &vname)) return sql__err("expected a view name after CREATE VIEW");
+    char view_name[KDB_SQL_IDENT_BUF];
+    snprintf(view_name, sizeof(view_name), "%.255s", vname);
+    sql__advance(p);
+
+    if (strcmp(view_name, KDB_VIEWS_TABLE) == 0)
+        return sql__err("'%s' is reserved for KumDB's internal view registry", view_name);
+    if (kdb_table_exists(db, view_name))
+        return sql__err("'%s' is already a table -- can't create a view with the same name", view_name);
+    if (sql__view_exists(db, view_name))
+        return sql__err("view '%s' already exists -- DROP VIEW it first", view_name);
+
+    if (!sql__kw_is(&p->cur, "AS")) return sql__err("expected AS after CREATE VIEW %s", view_name);
+    sql__advance(p);
+
+    if (!sql__kw_is(&p->cur, "SELECT"))
+        return sql__err("expected a SELECT statement after CREATE VIEW %s AS", view_name);
+
+    size_t select_start = p->lx.pos - strlen(p->cur.text);
+
+    KdbStatus vst = sql__exec_select_stmt(p, db, NULL);
+    if (vst != KDB_OK) return vst;
+
+    if (p->cur.type != SQLTOK_SEMI && p->cur.type != SQLTOK_EOF)
+        return sql__err("unexpected trailing content after CREATE VIEW %s's SELECT", view_name);
+
+    size_t select_end = (p->cur.type == SQLTOK_SEMI) ? (p->lx.pos - 1) : p->lx.pos;
+    size_t len = select_end > select_start ? select_end - select_start : 0;
+    while (len > 0 && isspace((unsigned char)p->lx.src[select_start + len - 1])) len--;
+    if (len == 0) return sql__err("CREATE VIEW %s's query is empty", view_name);
+
+    char query_text[KDB_MAX_STRING_LEN];
+    if (len >= sizeof(query_text)) len = sizeof(query_text) - 1;
+    memcpy(query_text, p->lx.src + select_start, len);
+    query_text[len] = '\0';
+
+    KdbField fields[] = {
+        kdb_field_string("name",  view_name),
+        kdb_field_string("query", query_text),
+        kdb_field_end()
+    };
+    return kdb_add(db, KDB_VIEWS_TABLE, fields);
+}
+
+/* DROP VIEW name. p is positioned right after "DROP VIEW" (both already
+ * consumed by the caller). */
+static KdbStatus sql__exec_drop_view(SqlParser *p, KumDB *db) {
+    const char *vname;
+    if (!sql__ident_text(&p->cur, &vname)) return sql__err("expected a view name after DROP VIEW");
+    char view_name[KDB_SQL_IDENT_BUF];
+    snprintf(view_name, sizeof(view_name), "%.255s", vname);
+    sql__advance(p);
+
+    if (!sql__view_exists(db, view_name)) return sql__err("no such view '%s'", view_name);
+
+    char filter_buf[KDB_SQL_IDENT_BUF + 8];
+    snprintf(filter_buf, sizeof(filter_buf), "name=%s", view_name);
+    const char *filters[] = { filter_buf, NULL };
+    size_t deleted = 0;
+    return kdb_delete(db, KDB_VIEWS_TABLE, filters, &deleted);
+}
+
 static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
     sql__advance(p); /* CREATE */
-    if (!sql__kw_is(&p->cur, "TABLE")) return sql__err("expected TABLE after CREATE");
+    if (sql__kw_is(&p->cur, "VIEW")) {
+        sql__advance(p); /* VIEW */
+        return sql__exec_create_view(p, db);
+    }
+    if (!sql__kw_is(&p->cur, "TABLE")) return sql__err("expected TABLE or VIEW after CREATE");
     sql__advance(p);
 
     const char *tname;
@@ -640,7 +756,11 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
 
 static KdbStatus sql__exec_drop_table(SqlParser *p, KumDB *db) {
     sql__advance(p); /* DROP */
-    if (!sql__kw_is(&p->cur, "TABLE")) return sql__err("expected TABLE after DROP");
+    if (sql__kw_is(&p->cur, "VIEW")) {
+        sql__advance(p); /* VIEW */
+        return sql__exec_drop_view(p, db);
+    }
+    if (!sql__kw_is(&p->cur, "TABLE")) return sql__err("expected TABLE or VIEW after DROP");
     sql__advance(p);
     const char *tname;
     if (!sql__ident_text(&p->cur, &tname)) return sql__err("expected a table name after DROP TABLE");
@@ -1849,6 +1969,35 @@ static KdbStatus sql__build_joined_rows_multi(KumDB *db, const char *table1, con
     return KDB_OK;
 }
 
+/* Fetches the FROM target's rows before WHERE is applied -- from a real
+ * table (the common case: filters get pushed straight into kdb_find_ex,
+ * *needs_filtering comes back 0), a JOIN chain, or a view (executing its
+ * stored SELECT as a subquery). The latter two have no stored table to
+ * push a filter into, so they come back fully materialized and
+ * *needs_filtering is set -- the caller applies WHERE itself afterward via
+ * sql__filter_rows, same pattern either way. */
+static KdbStatus sql__fetch_base_rows(KumDB *db, const char *table_name, const char *alias1,
+                                      int has_join, const SqlJoinClause *joins, int njoins,
+                                      int from_is_view, const char *view_query,
+                                      const char **filter_ptrs, int nfilt,
+                                      KdbRows **out, int *needs_filtering) {
+    if (has_join) {
+        *needs_filtering = 1;
+        return sql__build_joined_rows_multi(db, table_name, alias1, joins, njoins, out);
+    }
+    if (from_is_view) {
+        *needs_filtering = 1;
+        SqlParser vp;
+        sql__init(&vp, view_query);
+        return sql__exec_select_stmt(&vp, db, out);
+    }
+    *needs_filtering = 0;
+    KdbRows *r = kdb_find_ex(db, table_name, nfilt > 0 ? filter_ptrs : NULL, NULL);
+    if (!r) return kdb_last_status();
+    *out = r;
+    return KDB_OK;
+}
+
 /* Parses and executes one SELECT's core -- everything from the column list
  * through HAVING -- and returns raw rows with no ORDER BY/LIMIT applied
  * (DISTINCT, if present, still runs: it's part of this SELECT's own
@@ -1938,6 +2087,16 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     snprintf(table_name, sizeof(table_name), "%.255s", tname);
     sql__advance(p);
 
+    /* A view shadows nothing -- it's only even considered when no real
+     * table has this name. Fixed-size buffer, not a heap pointer: this
+     * function has a lot of early returns already, and a stack buffer
+     * unwinds for free on every one of them. Sized to
+     * KDB_MAX_STRING_LEN, the storage layer's own string-field cap, since
+     * that's the real bound on how long a stored view's query can be. */
+    char view_query[KDB_MAX_STRING_LEN];
+    int  from_is_view = !kdb_table_exists(db, table_name) &&
+                         sql__lookup_view(db, table_name, view_query, sizeof(view_query));
+
     char alias1[KDB_SQL_IDENT_BUF];
     snprintf(alias1, sizeof(alias1), "%s", table_name);
     if (sql__kw_is(&p->cur, "AS")) {
@@ -1980,6 +2139,9 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
         snprintf(jc->alias, sizeof(jc->alias), "%.255s", tNname);
         sql__advance(p);
 
+        if (!kdb_table_exists(db, jc->table) && sql__view_exists(db, jc->table))
+            return sql__err("'%s' is a view -- using a view as a JOIN target isn't supported yet", jc->table);
+
         if (sql__kw_is(&p->cur, "AS")) {
             sql__advance(p);
             const char *aname;
@@ -2001,6 +2163,9 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
         njoins++;
     }
     int has_join = njoins > 0;
+
+    if (from_is_view && has_join)
+        return sql__err("'%s' is a view -- JOINing a view isn't supported yet", table_name);
 
     char *filters[KDB_SQL_MAX_COND];
     int   nfilt = 0;
@@ -2068,9 +2233,14 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     filter_ptrs[nfilt] = NULL;
 
     if (has_aggregate || has_group_by) {
-        KdbRows *all = kdb_find_ex(db, table_name, nfilt > 0 ? filter_ptrs : NULL, NULL);
+        KdbRows *all = NULL;
+        int needs_filtering = 0;
+        KdbStatus fst = sql__fetch_base_rows(db, table_name, alias1, has_join, joins, njoins,
+                                             from_is_view, view_query, filter_ptrs, nfilt,
+                                             &all, &needs_filtering);
+        if (fst != KDB_OK) { sql__free_filters(filters, nfilt); sql__free_filters(having_filters, nhaving); return fst; }
+        if (needs_filtering && nfilt > 0) sql__filter_rows(all, filters, nfilt);
         sql__free_filters(filters, nfilt);
-        if (!all) { sql__free_filters(having_filters, nhaving); return kdb_last_status(); }
 
         KdbRows *agg = NULL;
         KdbStatus ast = sql__compute_aggregates(all, items, nitems, group_cols, ngroup_cols, &agg);
@@ -2087,15 +2257,14 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     }
 
     KdbRows *rows = NULL;
-    if (has_join) {
-        KdbStatus jst = sql__build_joined_rows_multi(db, table_name, alias1, joins, njoins, &rows);
-        if (jst != KDB_OK) { sql__free_filters(filters, nfilt); return jst; }
-        if (nfilt > 0) sql__filter_rows(rows, filters, nfilt);
+    {
+        int needs_filtering = 0;
+        KdbStatus fst = sql__fetch_base_rows(db, table_name, alias1, has_join, joins, njoins,
+                                             from_is_view, view_query, filter_ptrs, nfilt,
+                                             &rows, &needs_filtering);
+        if (fst != KDB_OK) { sql__free_filters(filters, nfilt); return fst; }
+        if (needs_filtering && nfilt > 0) sql__filter_rows(rows, filters, nfilt);
         sql__free_filters(filters, nfilt);
-    } else {
-        rows = kdb_find_ex(db, table_name, nfilt > 0 ? filter_ptrs : NULL, NULL);
-        sql__free_filters(filters, nfilt);
-        if (!rows) return kdb_last_status();
     }
 
     if (!project_all) {
