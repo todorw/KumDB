@@ -3482,6 +3482,63 @@ static int sql__copy_row(KdbRow *dst, const KdbRow *src) {
     return 1;
 }
 
+/* Fetches a JOIN operand's rows -- straight from storage for a real
+ * table, or by re-running its stored query fresh for a view/CTE (same
+ * "no caching" philosophy every other view-consuming path in this file
+ * uses -- CTEs are just temporary rows in the same views table, so this
+ * covers both with no extra code). Returns NULL on error (error already
+ * set, including "no such table or view"). */
+static KdbRows *sql__fetch_table_or_view(KumDB *db, const char *name) {
+    if (kdb_table_exists(db, name)) return kdb_find_ex(db, name, NULL, NULL);
+
+    char view_query[KDB_MAX_STRING_LEN];
+    if (sql__lookup_view(db, name, view_query, sizeof(view_query))) {
+        SqlParser vp;
+        sql__init(&vp, view_query);
+        KdbRows *rows = NULL;
+        if (sql__exec_select_stmt(&vp, db, &rows) != KDB_OK) return NULL;
+        return rows;
+    }
+
+    sql__err("no such table or view '%s'", name);
+    return NULL;
+}
+
+/* "Schema" (just qualified NULL-padding column names, the same
+ * KdbColumnInfo shape kdb_get_schema uses) for a JOIN operand that might
+ * be a real table or a view/CTE. A real table's schema is structural --
+ * kdb_get_schema works regardless of how many rows it currently has, so
+ * that's used directly. A view/CTE has no such structural schema of its
+ * own, only whatever its already-fetched rows happen to have, so this
+ * derives column names from rows->rows[0] instead -- which only works
+ * when rows is non-empty. Returns 1 with *count_out set (possibly to 0,
+ * a legitimately columnless real table) on success; 0 if a view/CTE's
+ * rows came back empty and there's genuinely no way to know its column
+ * names for padding (error already set) -- only reached when a LEFT/
+ * RIGHT/FULL step actually needs padding for this operand, so an empty
+ * INNER/CROSS-joined view never hits this at all. */
+static int sql__schema_for_padding(KumDB *db, const char *name, const KdbRows *rows,
+                                    KdbColumnInfo *out, uint32_t max_columns, uint32_t *count_out) {
+    if (kdb_table_exists(db, name))
+        return kdb_get_schema(db, name, out, max_columns, count_out) == KDB_OK;
+
+    if (rows->count == 0) {
+        sql__err("can't LEFT/RIGHT/FULL JOIN '%s' when its view/CTE query returns zero rows -- "
+                 "column names for NULL-padding can't be determined", name);
+        return 0;
+    }
+    uint32_t n = rows->rows[0].field_count;
+    if (n > max_columns) n = max_columns;
+    for (uint32_t i = 0; i < n; i++) {
+        snprintf(out[i].name, sizeof(out[i].name), "%s", rows->rows[0].fields[i].name);
+        out[i].type = rows->rows[0].fields[i].type;
+        out[i].nullable = 1;
+        out[i].indexed = 0;
+    }
+    *count_out = n;
+    return 1;
+}
+
 /* Joins table1 against a chain of JOIN clauses (JOIN t2 ON ... JOIN t3
  * ON ..., etc), each one matched against the accumulated combined rows
  * from everything before it -- so "JOIN t3 ON t1.x = t3.y" and
@@ -3508,25 +3565,38 @@ static int sql__copy_row(KdbRow *dst, const KdbRow *src) {
  * below -- vacuously true with zero conditions -- already treats every
  * pair as a match without any special-casing. Fetches every table in
  * full (no filter pushdown into the join itself) -- WHERE is applied by
- * the caller afterward, over the final combined rows. */
+ * the caller afterward, over the final combined rows. table1 and every
+ * jc->table may be a real table OR a view/CTE (sql__fetch_table_or_view);
+ * a view/CTE with LEFT/RIGHT/FULL padding needed against it must return
+ * at least one row on this particular run so its column names are
+ * knowable (sql__schema_for_padding) -- an empty view/CTE only matters
+ * when the chain actually needs to pad against it, so a plain INNER/
+ * CROSS join against one works regardless of row count. */
 static KdbStatus sql__build_joined_rows_multi(KumDB *db, const char *table1, const char *alias1,
                                               const SqlJoinClause *joins, int njoins, KdbRows **rows_out) {
-    KdbRows *r1 = kdb_find_ex(db, table1, NULL, NULL);
+    int any_right_or_full = 0;
+    for (int ji = 0; ji < njoins; ji++) {
+        if (joins[ji].kind == SQL_JOIN_RIGHT || joins[ji].kind == SQL_JOIN_FULL) { any_right_or_full = 1; break; }
+    }
+
+    KdbRows *r1 = sql__fetch_table_or_view(db, table1);
     if (!r1) return kdb_last_status();
 
-    KdbColumnInfo schema1[KDB_MAX_COLUMNS];
-    uint32_t schema1_count = 0;
-    if (kdb_get_schema(db, table1, schema1, KDB_MAX_COLUMNS, &schema1_count) != KDB_OK) {
-        kdb_rows_free(r1);
-        return kdb_last_status();
-    }
     KdbRow left_null_template;
     memset(&left_null_template, 0, sizeof(left_null_template));
-    if (!sql__append_qualified_nulls(&left_null_template, schema1, schema1_count, alias1)) {
-        sql__free_row_fields(&left_null_template);
-        kdb_rows_free(r1);
-        kdb_err_oom("join null template");
-        return KDB_ERR_OOM;
+    if (any_right_or_full) {
+        KdbColumnInfo schema1[KDB_MAX_COLUMNS];
+        uint32_t schema1_count = 0;
+        if (!sql__schema_for_padding(db, table1, r1, schema1, KDB_MAX_COLUMNS, &schema1_count)) {
+            kdb_rows_free(r1);
+            return kdb_last_status();
+        }
+        if (!sql__append_qualified_nulls(&left_null_template, schema1, schema1_count, alias1)) {
+            sql__free_row_fields(&left_null_template);
+            kdb_rows_free(r1);
+            kdb_err_oom("join null template");
+            return KDB_ERR_OOM;
+        }
     }
 
     KdbRows *combined = (KdbRows *)calloc(1, sizeof(KdbRows));
@@ -3553,12 +3623,14 @@ static KdbStatus sql__build_joined_rows_multi(KumDB *db, const char *table1, con
     for (int ji = 0; ji < njoins; ji++) {
         const SqlJoinClause *jc = &joins[ji];
 
-        KdbRows *rN = kdb_find_ex(db, jc->table, NULL, NULL);
+        KdbRows *rN = sql__fetch_table_or_view(db, jc->table);
         if (!rN) { sql__free_row_fields(&left_null_template); kdb_rows_free(combined); return kdb_last_status(); }
 
+        int need_left_pad = (jc->kind == SQL_JOIN_LEFT || jc->kind == SQL_JOIN_FULL);
         KdbColumnInfo schemaN[KDB_MAX_COLUMNS];
         uint32_t schemaN_count = 0;
-        if (kdb_get_schema(db, jc->table, schemaN, KDB_MAX_COLUMNS, &schemaN_count) != KDB_OK) {
+        if ((need_left_pad || any_right_or_full) &&
+            !sql__schema_for_padding(db, jc->table, rN, schemaN, KDB_MAX_COLUMNS, &schemaN_count)) {
             kdb_rows_free(rN);
             sql__free_row_fields(&left_null_template);
             kdb_rows_free(combined);
@@ -3655,7 +3727,7 @@ static KdbStatus sql__build_joined_rows_multi(KumDB *db, const char *table1, con
         kdb_rows_free(combined);
         combined = next;
 
-        if (!sql__append_qualified_nulls(&left_null_template, schemaN, schemaN_count, jc->alias)) {
+        if (any_right_or_full && !sql__append_qualified_nulls(&left_null_template, schemaN, schemaN_count, jc->alias)) {
             sql__free_row_fields(&left_null_template);
             kdb_rows_free(combined);
             kdb_err_oom("join null template");
@@ -3960,9 +4032,6 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
         snprintf(jc->alias, sizeof(jc->alias), "%.255s", tNname);
         sql__advance(p);
 
-        if (!kdb_table_exists(db, jc->table) && sql__view_exists(db, jc->table))
-            return sql__err("'%s' is a view -- using a view as a JOIN target isn't supported yet", jc->table);
-
         if (sql__kw_is(&p->cur, "AS")) {
             sql__advance(p);
             const char *aname;
@@ -3992,9 +4061,6 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
         njoins++;
     }
     int has_join = njoins > 0;
-
-    if (from_is_view && has_join)
-        return sql__err("'%s' is a view -- JOINing a view isn't supported yet", table_name);
 
     SqlCondNode *where_tree = NULL;
     int where_used_parens = 0;

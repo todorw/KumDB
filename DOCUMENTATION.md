@@ -668,16 +668,29 @@ SELECT COUNT(*), SUM(salary) FROM eng_staff
 DROP VIEW eng_staff
 ```
 
-A view can't be `JOIN`ed (either as the left side or a `JOIN` target) --
-not supported yet. Views are stored as rows in a reserved internal table,
-`__kumdb_views__`; it'll show up in `kdb_list_tables()`/the CLI's `tables`
-command like any other table (querying it directly works fine, it's just
-not hidden), so don't name a real table that.
+A view can be `JOIN`ed too, either as the `FROM` target or a `JOIN`
+target, mixed freely with real tables in the same chain:
+
+```sql
+SELECT au.name, o.item FROM active_users AS au JOIN orders AS o ON au.id = o.user_id
+```
+
+`LEFT`/`RIGHT`/`FULL` padding against a view needs to know its column
+names, and a view has no fixed schema the way a real table does -- only
+whatever rows its query happens to return -- so those three kinds need
+the view to return at least one row on that particular run; a view that
+returns zero rows works fine as an `INNER`/`CROSS` target (no padding
+ever needed there) but errors clearly if `LEFT`/`RIGHT`/`FULL` needed to
+pad against it and came up with nothing to derive column names from.
+Views are stored as rows in a reserved internal table, `__kumdb_views__`;
+it'll show up in `kdb_list_tables()`/the CLI's `tables` command like any
+other table (querying it directly works fine, it's just not hidden), so
+don't name a real table that.
 
 **`WITH name AS (SELECT ...) SELECT ... FROM name`** (a CTE) is a view
-scoped to one statement instead of persisted -- same validate-immediately
-and re-run-fresh-every-time behavior as `CREATE VIEW`, same `JOIN`
-restriction, gone the moment the statement finishes (success or error):
+scoped to one statement instead of persisted -- same validate-immediately,
+re-run-fresh-every-time, and `JOIN`-target behavior as `CREATE VIEW`,
+gone the moment the statement finishes (success or error):
 
 ```sql
 WITH big_orders AS (SELECT * FROM orders WHERE amount > 1000)

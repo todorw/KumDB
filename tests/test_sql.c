@@ -1513,11 +1513,12 @@ static void test_views(void) {
     ASSERT_ERR(sql(db, "SELECT * FROM eng_staff"));
     ASSERT_ERR(sql(db, "DROP VIEW eng_staff")); /* already gone */
 
-    /* a view can't be JOINed (either side) */
+    /* a view can be JOINed on either side -- see test_view_cte_join_targets
+     * for the detailed coverage */
     ASSERT_OK(sql(db, "CREATE VIEW v2 AS SELECT name FROM employees"));
     ASSERT_OK(sql(db, "CREATE TABLE t2 (x TEXT)"));
-    ASSERT_ERR(sql(db, "SELECT * FROM v2 JOIN t2 AS t ON v2.name = t.x"));
-    ASSERT_ERR(sql(db, "SELECT * FROM t2 AS t JOIN v2 ON t.x = v2.name"));
+    ASSERT_OK(sql(db, "SELECT * FROM v2 JOIN t2 AS t ON v2.name = t.x"));
+    ASSERT_OK(sql(db, "SELECT * FROM t2 AS t JOIN v2 ON t.x = v2.name"));
 
     /* CREATE VIEW validates its query immediately */
     ASSERT_ERR(sql(db, "CREATE VIEW bad_view AS SELECT * FROM nonexistent_table"));
@@ -1525,6 +1526,80 @@ static void test_views(void) {
     /* can't shadow an existing table, or redefine an existing view */
     ASSERT_ERR(sql(db, "CREATE VIEW employees AS SELECT name FROM employees"));
     ASSERT_ERR(sql(db, "CREATE VIEW v2 AS SELECT name FROM employees"));
+
+    teardown(db);
+}
+
+static void test_view_cte_join_targets(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE users (name TEXT, active BOOL)"));
+    ASSERT_OK(sql(db, "CREATE TABLE orders (user_id INT, item TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO users (name, active) VALUES ('alice', true)"));  /* id 1 */
+    ASSERT_OK(sql(db, "INSERT INTO users (name, active) VALUES ('bob', false)"));   /* id 2 */
+    ASSERT_OK(sql(db, "INSERT INTO orders (user_id, item) VALUES (1, 'widget')"));
+    ASSERT_OK(sql(db, "INSERT INTO orders (user_id, item) VALUES (2, 'gizmo')"));
+
+    ASSERT_OK(sql(db, "CREATE VIEW active_users AS SELECT * FROM users WHERE active = true"));
+
+    KdbRows *rows = NULL;
+
+    /* view as a JOIN target (not table1) */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT au.name, o.item FROM active_users au JOIN orders o ON au.id = o.user_id",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "au.name", &name));
+        ASSERT_STR(name, "alice");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* view as table1 (the FROM target) with a JOIN on top -- already
+     * filtered by the view's own WHERE before the join runs at all */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT au.name, o.item FROM active_users au LEFT JOIN orders o ON au.id = o.user_id",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* RIGHT JOIN with a view as table1 -- left_null_template has to be
+     * derived from the view's own returned rows, not a real schema */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT au.name, o.item FROM active_users au RIGHT JOIN orders o ON au.id = o.user_id ORDER BY o.item ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const KdbField *name_f = kdb_row_get(&rows->rows[0], "au.name");
+        ASSERT(name_f && name_f->type == KDB_TYPE_NULL); /* gizmo's user (bob) isn't in the view */
+        const char *name1 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "au.name", &name1));
+        ASSERT_STR(name1, "alice");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* CTE as a JOIN target */
+    ASSERT_OK(kdb_exec_sql(db,
+        "WITH au AS (SELECT * FROM users WHERE active = true) "
+        "SELECT au.name, o.item FROM orders o JOIN au ON o.user_id = au.id",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* LEFT/RIGHT/FULL JOIN against a view that returns zero rows on this
+     * particular run fails clearly -- there's no schema to derive NULL
+     * column names from, only whatever rows it happened to return */
+    ASSERT_OK(sql(db, "CREATE VIEW nobody AS SELECT * FROM users WHERE name = 'zzz_nomatch'"));
+    ASSERT_ERR(sql(db, "SELECT u.name, n.name FROM users u LEFT JOIN nobody n ON u.name = n.name"));
+
+    /* but INNER/CROSS against that same empty view works fine -- no
+     * padding is ever needed for those kinds */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT u.name, n.name FROM users u JOIN nobody n ON u.name = n.name",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 0u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
 
     teardown(db);
 }
@@ -2004,6 +2079,7 @@ int main(void) {
     test_reserved_columns_skipped();
     test_drop_table();
     test_views();
+    test_view_cte_join_targets();
     test_ctes();
     test_derived_tables();
     test_correlated_subqueries();

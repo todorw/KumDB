@@ -165,18 +165,25 @@ extern "C" {
  * re-runs it fresh every time (not materialized/cached). Validates the
  * underlying query immediately (fails at creation, not first use, if it
  * references something that doesn't exist). WHERE/ORDER BY/LIMIT/DISTINCT/
- * aggregates all work on top of a view same as a real table; a view can't
- * be JOINed (either side) yet. Views are stored as rows in a reserved
- * internal table, "__kumdb_views__" -- it'll show up in
- * kdb_list_tables()/the CLI's "tables" command like any other table
- * (querying it directly works fine, it's just not hidden), so don't name
- * a real table that.
+ * aggregates all work on top of a view same as a real table, and a view
+ * can be JOINed too (either as the FROM target or a JOIN target, mixed
+ * freely with real tables). LEFT/RIGHT/FULL padding against a view needs
+ * to know its column names, and a view has no fixed schema of its own the
+ * way a real table does -- only whatever rows its query happens to
+ * return -- so those three kinds need the view to return at least one row
+ * on that particular run; a zero-row view works fine as an INNER/CROSS
+ * target (no padding ever needed there) but errors clearly if LEFT/RIGHT/
+ * FULL needed to pad against it and had nothing to derive names from.
+ * Views are stored as rows in a reserved internal table,
+ * "__kumdb_views__" -- it'll show up in kdb_list_tables()/the CLI's
+ * "tables" command like any other table (querying it directly works
+ * fine, it's just not hidden), so don't name a real table that.
  *
  * WITH name AS (SELECT ...) SELECT ... FROM name (a CTE) is a view scoped
- * to one statement instead of persisted -- same validate-immediately/
- * re-run-fresh/no-JOIN behavior as CREATE VIEW, gone the moment the
- * statement finishes either way. Chain more with a comma; a later one can
- * reference an earlier one (each validated and made visible in
+ * to one statement instead of persisted -- same validate-immediately,
+ * re-run-fresh, and JOIN-target behavior as CREATE VIEW, gone the moment
+ * the statement finishes either way. Chain more with a comma; a later one
+ * can reference an earlier one (each validated and made visible in
  * declaration order), never the reverse and never itself -- no RECURSIVE.
  * Only ever precedes a SELECT, not UPDATE/DELETE/INSERT.
  *
