@@ -31,6 +31,16 @@ KdbStatus kdb_table_add_column(KdbTable       *tbl,
 KdbStatus kdb_table_drop_column(KdbTable   *tbl,
                                 const char *col_name);
 
+/* Indexes an already-existing column (KDB_ERR_EXISTS if it's already
+ * indexed) -- unlike the indexed flag on CREATE TABLE/ALTER TABLE ADD
+ * COLUMN, which only ever takes effect at column-creation time. Rebuilds
+ * the index from every row already in the table before returning. */
+KdbStatus kdb_table_create_index(KdbTable *tbl, const char *col_name);
+
+/* Removes an existing column's index (KDB_ERR_NOT_FOUND if it isn't
+ * indexed). The column and its data are untouched -- only the index. */
+KdbStatus kdb_table_drop_index(KdbTable *tbl, const char *col_name);
+
 const KdbColumn *kdb_table_get_column(const KdbTable *tbl,
                                       const char     *col_name);
 

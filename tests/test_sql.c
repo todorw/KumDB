@@ -1796,6 +1796,65 @@ static void test_alter_table(void) {
     teardown(db);
 }
 
+static void test_create_drop_index(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (name TEXT, dept TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, dept) VALUES ('alice', 'eng')"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, dept) VALUES ('bob', 'sales')"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, dept) VALUES ('carol', 'eng')"));
+
+    KdbRows *rows = NULL;
+
+    /* CREATE INDEX on an existing column with data already present --
+     * rebuilds from the existing rows, not just future ones */
+    ASSERT_OK(sql(db, "CREATE INDEX ON t (dept)"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM t WHERE dept = 'eng' ORDER BY name ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const char *n0 = NULL, *n1 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &n0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "name", &n1));
+        ASSERT_STR(n0, "alice");
+        ASSERT_STR(n1, "carol");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* indexing an already-indexed column is rejected */
+    ASSERT_ERR(sql(db, "CREATE INDEX ON t (dept)"));
+
+    /* an index name is accepted and ignored -- KumDB's indexes aren't named */
+    ASSERT_OK(sql(db, "CREATE INDEX idx_name ON t (name)"));
+
+    /* a multi-column CREATE INDEX creates independent single-column
+     * indexes, not one combined-key composite index */
+    ASSERT_OK(sql(db, "CREATE TABLE t2 (a TEXT, b TEXT)"));
+    ASSERT_OK(sql(db, "CREATE INDEX ON t2 (a, b)"));
+    ASSERT_OK(sql(db, "INSERT INTO t2 (a, b) VALUES ('x', 'y')"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT a FROM t2 WHERE a = 'x'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+    ASSERT_OK(kdb_exec_sql(db, "SELECT b FROM t2 WHERE b = 'y'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* nonexistent column/table both error cleanly */
+    ASSERT_ERR(sql(db, "CREATE INDEX ON t (nonexistent)"));
+    ASSERT_ERR(sql(db, "CREATE INDEX ON nonexistent_table (x)"));
+
+    /* DROP INDEX removes it; filtering still works correctly (unindexed
+     * full scan), just without the index */
+    ASSERT_OK(sql(db, "DROP INDEX ON t (dept)"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM t WHERE dept = 'eng' ORDER BY name ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* dropping an index that isn't there is rejected */
+    ASSERT_ERR(sql(db, "DROP INDEX ON t (dept)"));
+
+    teardown(db);
+}
+
 static void test_nested_values_through_sql(void) {
     /* no SQL literal syntax for arrays/objects -- build via the C API,
        then confirm SQL's SELECT/projection/GROUP BY-MIN paths carry them
@@ -2496,6 +2555,7 @@ int main(void) {
     test_case_when();
     test_distinct();
     test_alter_table();
+    test_create_drop_index();
     test_nested_values_through_sql();
     test_reserved_columns_skipped();
     test_drop_table();

@@ -1151,13 +1151,63 @@ done:
     return st;
 }
 
+/* CREATE INDEX [name] ON t (col [, col2, ...]) -- the index name, when
+ * given, is accepted and ignored (best-effort SQL DDL compatibility,
+ * same as DEFAULT elsewhere in this file): KumDB's indexes aren't named,
+ * only per-column. More than one column creates that many independent
+ * single-column indexes, not one combined-key composite index -- there's
+ * no multi-column index in the storage layer to build (see
+ * kdb_table_create_index), so this is an honest generalization rather
+ * than pretending a true composite index exists. Each column is indexed
+ * one at a time; if a later one fails (already indexed, say), whichever
+ * earlier ones already succeeded stay indexed rather than rolling back
+ * -- same no-implicit-transaction convention every other multi-step DDL
+ * statement in this file follows. */
+static KdbStatus sql__exec_create_index(SqlParser *p, KumDB *db) {
+    if (p->cur.type == SQLTOK_IDENT && !sql__kw_is(&p->cur, "ON")) sql__advance(p); /* optional index name, ignored */
+
+    if (!sql__kw_is(&p->cur, "ON")) return sql__err("expected ON after CREATE INDEX");
+    sql__advance(p);
+
+    const char *tname;
+    if (!sql__ident_text(&p->cur, &tname)) return sql__err("expected a table name after CREATE INDEX ... ON");
+    char table_name[KDB_SQL_IDENT_BUF];
+    snprintf(table_name, sizeof(table_name), "%.255s", tname);
+    sql__advance(p);
+
+    if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after CREATE INDEX ON %s", table_name);
+    sql__advance(p);
+
+    for (;;) {
+        const char *cname;
+        if (!sql__ident_text(&p->cur, &cname)) return sql__err("expected a column name in CREATE INDEX's column list");
+        char col_name[KDB_SQL_IDENT_BUF];
+        snprintf(col_name, sizeof(col_name), "%.255s", cname);
+        sql__advance(p);
+
+        KdbStatus st = kdb_create_index(db, table_name, col_name);
+        if (st != KDB_OK) return st;
+
+        if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+        break;
+    }
+    if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing CREATE INDEX's column list");
+    sql__advance(p);
+
+    return KDB_OK;
+}
+
 static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
     sql__advance(p); /* CREATE */
     if (sql__kw_is(&p->cur, "VIEW")) {
         sql__advance(p); /* VIEW */
         return sql__exec_create_view(p, db);
     }
-    if (!sql__kw_is(&p->cur, "TABLE")) return sql__err("expected TABLE or VIEW after CREATE");
+    if (sql__kw_is(&p->cur, "INDEX")) {
+        sql__advance(p); /* INDEX */
+        return sql__exec_create_index(p, db);
+    }
+    if (!sql__kw_is(&p->cur, "TABLE")) return sql__err("expected TABLE, VIEW, or INDEX after CREATE");
     sql__advance(p);
 
     const char *tname;
@@ -1220,13 +1270,54 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
     return kdb_create_table(db, table_name, cols, n);
 }
 
+/* DROP INDEX [name] ON t (col [, col2, ...]) -- mirrors CREATE INDEX's
+ * shape exactly, including the accepted-and-ignored optional name and
+ * the "each column is its own independent index" semantics. */
+static KdbStatus sql__exec_drop_index(SqlParser *p, KumDB *db) {
+    if (p->cur.type == SQLTOK_IDENT && !sql__kw_is(&p->cur, "ON")) sql__advance(p); /* optional index name, ignored */
+
+    if (!sql__kw_is(&p->cur, "ON")) return sql__err("expected ON after DROP INDEX");
+    sql__advance(p);
+
+    const char *tname;
+    if (!sql__ident_text(&p->cur, &tname)) return sql__err("expected a table name after DROP INDEX ... ON");
+    char table_name[KDB_SQL_IDENT_BUF];
+    snprintf(table_name, sizeof(table_name), "%.255s", tname);
+    sql__advance(p);
+
+    if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after DROP INDEX ON %s", table_name);
+    sql__advance(p);
+
+    for (;;) {
+        const char *cname;
+        if (!sql__ident_text(&p->cur, &cname)) return sql__err("expected a column name in DROP INDEX's column list");
+        char col_name[KDB_SQL_IDENT_BUF];
+        snprintf(col_name, sizeof(col_name), "%.255s", cname);
+        sql__advance(p);
+
+        KdbStatus st = kdb_drop_index(db, table_name, col_name);
+        if (st != KDB_OK) return st;
+
+        if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+        break;
+    }
+    if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing DROP INDEX's column list");
+    sql__advance(p);
+
+    return KDB_OK;
+}
+
 static KdbStatus sql__exec_drop_table(SqlParser *p, KumDB *db) {
     sql__advance(p); /* DROP */
     if (sql__kw_is(&p->cur, "VIEW")) {
         sql__advance(p); /* VIEW */
         return sql__exec_drop_view(p, db);
     }
-    if (!sql__kw_is(&p->cur, "TABLE")) return sql__err("expected TABLE or VIEW after DROP");
+    if (sql__kw_is(&p->cur, "INDEX")) {
+        sql__advance(p); /* INDEX */
+        return sql__exec_drop_index(p, db);
+    }
+    if (!sql__kw_is(&p->cur, "TABLE")) return sql__err("expected TABLE, VIEW, or INDEX after DROP");
     sql__advance(p);
     const char *tname;
     if (!sql__ident_text(&p->cur, &tname)) return sql__err("expected a table name after DROP TABLE");

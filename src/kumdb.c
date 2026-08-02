@@ -1078,6 +1078,34 @@ KdbStatus kdb_drop_column(KumDB *db, const char *table_name, const char *col_nam
     return kdb_table_drop_column(tbl, col_name);
 }
 
+KdbStatus kdb_create_index(KumDB *db, const char *table_name, const char *col_name) {
+    if (!db || !table_name || !col_name) {
+        kdb_err_null_arg("db/table_name/col_name", "kdb_create_index");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+    return kdb_table_create_index(tbl, col_name);
+}
+
+KdbStatus kdb_drop_index(KumDB *db, const char *table_name, const char *col_name) {
+    if (!db || !table_name || !col_name) {
+        kdb_err_null_arg("db/table_name/col_name", "kdb_drop_index");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+    return kdb_table_drop_index(tbl, col_name);
+}
+
 /* Closes and evicts a table's cached handle, if open. Needed anywhere a
  * table's file gets replaced/renamed out from under a live process --
  * without this, an already-open fd keeps referencing the old inode and the

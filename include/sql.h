@@ -22,6 +22,8 @@ extern "C" {
  *   DROP TABLE t
  *   CREATE VIEW v AS SELECT ...
  *   DROP VIEW v
+ *   CREATE INDEX [name] ON t (col, ...)
+ *   DROP INDEX [name] ON t (col, ...)
  *   INSERT INTO t (col, ...) VALUES (val, ...) [, (val, ...)]* [RETURNING * | col, ...]
  *   INSERT INTO t (col, ...) SELECT ... [RETURNING * | col, ...]
  *   INSERT INTO t (col, ...) VALUES (val, ...) ON CONFLICT (col, ...) DO NOTHING | DO UPDATE SET col = val, ... [RETURNING * | col, ...]
@@ -251,6 +253,18 @@ extern "C" {
  * new column's value until you UPDATE them, same as any other missing
  * field. ALTER TABLE DROP rewrites the whole table file to strip that
  * field from every row, same cost as kdb_compact().
+ *
+ * CREATE INDEX [name] ON t (cols)/DROP INDEX [name] ON t (cols) index or
+ * un-index a column *after* the table already exists -- unlike INDEX/
+ * UNIQUE/PRIMARY KEY on a column definition, which only ever takes effect
+ * at that column's creation moment. CREATE INDEX rebuilds from every
+ * existing row; DROP INDEX just removes it, leaving the column and its
+ * data untouched. The name, if given, is accepted and ignored -- KumDB's
+ * indexes aren't named, only per-column. Naming more than one column
+ * creates that many independent single-column indexes, not one
+ * combined-key composite index -- there's no multi-column index in the
+ * storage layer to build one from. Indexing an already-indexed column, or
+ * dropping an index that isn't there, both error.
  *
  * WHERE conditions: col = val, != / <>, >, >=, <, <=, BETWEEN a AND b,
  * IN (a, b, c), IS NULL, IS NOT NULL, LIKE 'pat' (standard SQL wildcards --

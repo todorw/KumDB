@@ -198,6 +198,77 @@ KdbStatus kdb_table_drop_column(KdbTable   *tbl,
 }
 
 
+KdbStatus kdb_table_create_index(KdbTable *tbl, const char *col_name) {
+    if (!tbl || !col_name) {
+        kdb_err_null_arg("tbl/col_name", "kdb_table_create_index");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (!kdb_table_has_column(tbl, col_name)) {
+        kdb_err_field_not_found(col_name, tbl->name);
+        return KDB_ERR_NOT_FOUND;
+    }
+
+    KdbColumn *col = NULL;
+    for (uint32_t i = 0; i < tbl->header.column_count; i++) {
+        if (strcmp(tbl->header.columns[i].name, col_name) == 0) { col = &tbl->header.columns[i]; break; }
+    }
+    if (col->indexed) {
+        kdb_err_column_exists(col_name, tbl->name);
+        return KDB_ERR_EXISTS;
+    }
+
+    KdbIndex *idx = kdb_index_new(col_name);
+    if (!idx) return KDB_ERR_OOM;
+    KdbIndex **new_indices = realloc(tbl->indices, (tbl->index_count + 1) * sizeof(KdbIndex *));
+    if (!new_indices) {
+        kdb_index_free(idx);
+        kdb_err_oom("index array grow");
+        return KDB_ERR_OOM;
+    }
+    new_indices[tbl->index_count] = idx;
+    tbl->indices = new_indices;
+    tbl->index_count++;
+    kdb_index_rebuild(idx, tbl);
+
+    col->indexed = 1;
+    tbl->dirty = 1;
+    return kdb_storage_flush_header(tbl);
+}
+
+KdbStatus kdb_table_drop_index(KdbTable *tbl, const char *col_name) {
+    if (!tbl || !col_name) {
+        kdb_err_null_arg("tbl/col_name", "kdb_table_drop_index");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (!kdb_table_has_column(tbl, col_name)) {
+        kdb_err_field_not_found(col_name, tbl->name);
+        return KDB_ERR_NOT_FOUND;
+    }
+
+    KdbColumn *col = NULL;
+    for (uint32_t i = 0; i < tbl->header.column_count; i++) {
+        if (strcmp(tbl->header.columns[i].name, col_name) == 0) { col = &tbl->header.columns[i]; break; }
+    }
+    if (!col->indexed) {
+        kdb_set_error(KDB_ERR_NOT_FOUND, "column '%s' on table '%s' isn't indexed", col_name, tbl->name);
+        return KDB_ERR_NOT_FOUND;
+    }
+
+    for (uint32_t i = 0; i < tbl->index_count; i++) {
+        if (tbl->indices[i] && strcmp(tbl->indices[i]->col_name, col_name) == 0) {
+            kdb_index_free(tbl->indices[i]);
+            memmove(&tbl->indices[i], &tbl->indices[i + 1], (tbl->index_count - i - 1) * sizeof(KdbIndex *));
+            tbl->index_count--;
+            break;
+        }
+    }
+
+    col->indexed = 0;
+    tbl->dirty = 1;
+    return kdb_storage_flush_header(tbl);
+}
+
+
 const char *kdb__drop_col_name = NULL;
 
 int kdb__drop_column_transform(KdbRecord *r, void *ud) {

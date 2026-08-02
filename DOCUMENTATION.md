@@ -318,6 +318,9 @@ DROP TABLE t
 CREATE VIEW v AS SELECT ...
 DROP VIEW v
 
+CREATE INDEX [name] ON t (col, ...)
+DROP INDEX [name] ON t (col, ...)
+
 INSERT INTO t (col, ...) VALUES (val, ...) [, (val, ...)]* [RETURNING * | col, ...]
 INSERT INTO t (col, ...) SELECT ... [RETURNING * | col, ...]
 INSERT INTO t (col, ...) VALUES (val, ...) ON CONFLICT (col, ...) DO NOTHING | DO UPDATE SET col = val, ... [RETURNING * | col, ...]
@@ -428,6 +431,29 @@ accepted and ignored — KumDB strings aren't fixed-width), `BLOB`.
 engine. Declaring them in `CREATE TABLE`/`ALTER TABLE ADD` is silently
 skipped (or rejected for `ADD`) rather than erroring, so a copy-pasted
 `id INTEGER PRIMARY KEY` doesn't blow up on you.
+
+**`CREATE INDEX [name] ON t (col, ...)`**/**`DROP INDEX [name] ON t (col,
+...)`** index (or un-index) a column *after* the table already exists —
+`INDEX`/`UNIQUE`/`PRIMARY KEY` on a `CREATE TABLE`/`ALTER TABLE ADD
+COLUMN` column definition only ever takes effect at that column's
+creation moment; these two work on a column that's already there,
+rebuilding the index from every existing row (`CREATE INDEX`) or just
+removing it (`DROP INDEX`, leaving the column and its data untouched).
+The index name is accepted and ignored if you give one — KumDB's indexes
+aren't named, only per-column. Naming more than one column creates that
+many independent single-column indexes, **not** one combined-key
+composite index — there's no multi-column index in the storage layer to
+build one from, so this is an honest per-column generalization rather
+than a real composite index wearing the syntax:
+
+```sql
+CREATE INDEX ON employees (department)
+CREATE INDEX ON employees (department, role)  -- two independent indexes, not one composite key
+DROP INDEX ON employees (department)
+```
+
+Indexing an already-indexed column, or dropping an index from a column
+that doesn't have one, both error rather than silently no-opping.
 
 **`WHERE`** supports `=`, `!=`/`<>`, `>`, `>=`, `<`, `<=`,
 `BETWEEN a AND b`, `IN (a, b, c)`, `IS [NOT] NULL`, `LIKE 'pat'`

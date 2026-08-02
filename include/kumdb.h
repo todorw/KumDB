@@ -187,6 +187,17 @@ KdbStatus kdb_add_column(KumDB *db, const char *table_name, const char *col_name
  * strip that field. Like kdb_compact(), this touches the whole table file. */
 KdbStatus kdb_drop_column(KumDB *db, const char *table_name, const char *col_name);
 
+/* Indexes an already-existing column (fails with KDB_ERR_EXISTS if it's
+ * already indexed) -- unlike the indexed flag on kdb_create_table/
+ * kdb_add_column, which only ever takes effect for a column at the
+ * moment it's created. Rebuilds the index from every row already in the
+ * table before returning. */
+KdbStatus kdb_create_index(KumDB *db, const char *table_name, const char *col_name);
+
+/* Removes an existing column's index (KDB_ERR_NOT_FOUND if it isn't
+ * indexed). The column and its data are untouched -- only the index. */
+KdbStatus kdb_drop_index(KumDB *db, const char *table_name, const char *col_name);
+
 /* names_out entries point into thread-local storage owned by KumDB and are
  * valid until the next call to kdb_list_tables() on this thread. Copy them
  * if you need to keep them around longer. */
