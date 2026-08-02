@@ -1235,7 +1235,14 @@ static KdbStatus sql__project_rows(KdbRows *rows, char proj_cols[][KDB_SQL_IDENT
     return KDB_OK;
 }
 
-static KdbStatus sql__exec_select(SqlParser *p, KumDB *db, KdbRows **rows_out) {
+/* Parses and executes one SELECT's core -- everything from the column list
+ * through HAVING -- and returns raw rows with no ORDER BY/LIMIT applied
+ * (DISTINCT, if present, still runs: it's part of this SELECT's own
+ * projection, not something a later UNION could reorder around). Used both
+ * standalone (a plain SELECT) and as one arm of a UNION chain, where
+ * ORDER BY/LIMIT can only meaningfully apply once, to the combined result,
+ * not to an individual arm -- so parsing them is the caller's job. */
+static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_out) {
     sql__advance(p); /* SELECT */
 
     int distinct = 0;
@@ -1353,46 +1360,11 @@ static KdbStatus sql__exec_select(SqlParser *p, KumDB *db, KdbRows **rows_out) {
         if (!sql__parse_having(p, having_filters, &nhaving)) { sql__free_filters(filters, nfilt); return kdb_last_status(); }
     }
 
-    KdbFindOpts opts;
-    memset(&opts, 0, sizeof(opts));
-    opts.ascending = 1;
-    char order_col[KDB_SQL_IDENT_BUF];
-    order_col[0] = '\0';
-
-    if (sql__kw_is(&p->cur, "ORDER")) {
-        sql__advance(p);
-        if (!sql__kw_is(&p->cur, "BY")) { sql__free_filters(filters, nfilt); sql__free_filters(having_filters, nhaving); return sql__err("expected BY after ORDER"); }
-        sql__advance(p);
-        const char *ocol;
-        if (!sql__ident_text(&p->cur, &ocol)) { sql__free_filters(filters, nfilt); sql__free_filters(having_filters, nhaving); return sql__err("expected a column name after ORDER BY"); }
-        snprintf(order_col, sizeof(order_col), "%.255s", ocol);
-        opts.order_by = order_col;
-        sql__advance(p);
-        if (sql__kw_is(&p->cur, "ASC"))       { sql__advance(p); opts.ascending = 1; }
-        else if (sql__kw_is(&p->cur, "DESC")) { sql__advance(p); opts.ascending = 0; }
-    }
-
-    if (sql__kw_is(&p->cur, "LIMIT")) {
-        sql__advance(p);
-        if (p->cur.type != SQLTOK_NUMBER) { sql__free_filters(filters, nfilt); sql__free_filters(having_filters, nhaving); return sql__err("expected a number after LIMIT"); }
-        opts.limit = (size_t)atoll(p->cur.text);
-        sql__advance(p);
-        if (sql__kw_is(&p->cur, "OFFSET")) {
-            sql__advance(p);
-            if (p->cur.type != SQLTOK_NUMBER) { sql__free_filters(filters, nfilt); sql__free_filters(having_filters, nhaving); return sql__err("expected a number after OFFSET"); }
-            opts.offset = (size_t)atoll(p->cur.text);
-            sql__advance(p);
-        }
-    }
-
     const char *filter_ptrs[KDB_SQL_MAX_COND + 1];
     for (int i = 0; i < nfilt; i++) filter_ptrs[i] = filters[i];
     filter_ptrs[nfilt] = NULL;
 
     if (has_aggregate || has_group_by) {
-        /* aggregation needs every matching row up front -- sort/limit apply
-         * to the aggregated output, not the raw input, so they're not
-         * passed to the fetch. */
         KdbRows *all = kdb_find_ex(db, table_name, nfilt > 0 ? filter_ptrs : NULL, NULL);
         sql__free_filters(filters, nfilt);
         if (!all) { sql__free_filters(having_filters, nhaving); return kdb_last_status(); }
@@ -1405,23 +1377,15 @@ static KdbStatus sql__exec_select(SqlParser *p, KumDB *db, KdbRows **rows_out) {
         if (nhaving > 0) sql__filter_rows(agg, having_filters, nhaving);
         sql__free_filters(having_filters, nhaving);
         if (distinct) sql__dedupe_rows(agg);
-        if (opts.order_by) sql__sort_rows(agg, opts.order_by, opts.ascending);
-        if (opts.offset > 0 || opts.limit > 0) sql__limit_rows(agg, opts.offset, opts.limit);
 
         if (rows_out) *rows_out = agg;
         else           kdb_rows_free(agg);
         return KDB_OK;
     }
 
-    /* DISTINCT can drop rows a plain kdb_find_ex() LIMIT would've kept, so
-     * when both are in play, dedupe before limiting rather than asking the
-     * storage layer to limit for us. */
-    KdbFindOpts *fetch_opts = distinct ? NULL : &opts;
-    KdbRows *rows = kdb_find_ex(db, table_name, nfilt > 0 ? filter_ptrs : NULL, fetch_opts);
+    KdbRows *rows = kdb_find_ex(db, table_name, nfilt > 0 ? filter_ptrs : NULL, NULL);
     sql__free_filters(filters, nfilt);
     if (!rows) return kdb_last_status();
-
-    if (distinct && opts.order_by) sql__sort_rows(rows, opts.order_by, opts.ascending);
 
     if (!project_all) {
         char proj_cols[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
@@ -1431,13 +1395,145 @@ static KdbStatus sql__exec_select(SqlParser *p, KumDB *db, KdbRows **rows_out) {
         if (pst != KDB_OK) { kdb_rows_free(rows); return pst; }
     }
 
-    if (distinct) {
-        sql__dedupe_rows(rows);
-        if (opts.offset > 0 || opts.limit > 0) sql__limit_rows(rows, opts.offset, opts.limit);
-    }
+    if (distinct) sql__dedupe_rows(rows);
 
     if (rows_out) *rows_out = rows;
     else           kdb_rows_free(rows);
+    return KDB_OK;
+}
+
+/* Renames every row's fields to match tmpl's names positionally (frees the
+ * row's own name strings first). Used so a UNION's combined output has one
+ * consistent set of column names regardless of which arm's alias a given
+ * row actually came from -- same as real SQL, which names a UNION's output
+ * columns after its first SELECT. Caller has already checked field counts
+ * match. Returns 0 on OOM (rows may be left partially renamed either way,
+ * safe to free). */
+static int sql__rename_rows_like(KdbRows *rows, const KdbRow *tmpl) {
+    for (size_t r = 0; r < rows->count; r++) {
+        KdbRow *row = &rows->rows[r];
+        for (uint32_t i = 0; i < row->field_count; i++) {
+            char *new_name = strdup(tmpl->fields[i].name);
+            if (!new_name) return 0;
+            free((void *)row->fields[i].name);
+            row->fields[i].name = new_name;
+        }
+    }
+    return 1;
+}
+
+/* Appends every row of src into dst (dst takes ownership, src's row array
+ * is freed but individual rows are not -- they now live in dst). Returns
+ * 0 on OOM (dst is left with whatever prefix it already had, still safe to
+ * use/free; src is left untouched so the caller can still free it). */
+static int sql__append_rows(KdbRows *dst, KdbRows *src) {
+    if (src->count == 0) { free(src->rows); return 1; }
+    KdbRow *grown = (KdbRow *)realloc(dst->rows, (dst->count + src->count) * sizeof(KdbRow));
+    if (!grown) return 0;
+    dst->rows = grown;
+    memcpy(dst->rows + dst->count, src->rows, src->count * sizeof(KdbRow));
+    dst->count += src->count;
+    free(src->rows);
+    return 1;
+}
+
+/* SELECT, plus an optional chain of UNION/UNION ALL SELECT arms, plus one
+ * final ORDER BY/LIMIT applying to the combined result -- same grammar
+ * real SQL uses (ORDER BY/LIMIT can only appear once, after the last arm).
+ * Mixing UNION and UNION ALL in the same chain isn't supported (which one
+ * binds first is a real ambiguity without parenthesized subqueries); pick
+ * one for the whole statement. Column names in the output come from the
+ * first arm that returned at least one row. */
+static KdbStatus sql__exec_select_stmt(SqlParser *p, KumDB *db, KdbRows **rows_out) {
+    KdbRows *acc = NULL;
+    KdbStatus st = sql__exec_select_core(p, db, &acc);
+    if (st != KDB_OK) return st;
+
+    int seen_all = -1; /* -1 = no UNION yet, 0 = plain UNION seen, 1 = UNION ALL seen */
+    long acc_shape = acc->count > 0 ? (long)acc->rows[0].field_count : -1;
+
+    while (sql__kw_is(&p->cur, "UNION")) {
+        sql__advance(p);
+        int is_all = 0;
+        if (sql__kw_is(&p->cur, "ALL")) { is_all = 1; sql__advance(p); }
+
+        if (seen_all != -1 && seen_all != is_all) {
+            kdb_rows_free(acc);
+            return sql__err("can't mix UNION and UNION ALL in the same statement");
+        }
+        seen_all = is_all;
+
+        if (!sql__kw_is(&p->cur, "SELECT")) { kdb_rows_free(acc); return sql__err("expected SELECT after UNION [ALL]"); }
+
+        KdbRows *next = NULL;
+        st = sql__exec_select_core(p, db, &next);
+        if (st != KDB_OK) { kdb_rows_free(acc); return st; }
+
+        if (next->count > 0) {
+            long next_shape = (long)next->rows[0].field_count;
+            if (acc_shape != -1 && next_shape != acc_shape) {
+                kdb_rows_free(acc);
+                kdb_rows_free(next);
+                return sql__err("UNION arms must select the same number of columns");
+            }
+            if (acc_shape == -1) {
+                acc_shape = next_shape;
+            } else if (!sql__rename_rows_like(next, &acc->rows[0])) {
+                kdb_rows_free(acc);
+                kdb_rows_free(next);
+                kdb_err_oom("UNION row rename");
+                return KDB_ERR_OOM;
+            }
+        }
+
+        if (!sql__append_rows(acc, next)) {
+            kdb_rows_free(acc);
+            free(next);
+            kdb_err_oom("UNION row append");
+            return KDB_ERR_OOM;
+        }
+        free(next);
+
+        if (!is_all) sql__dedupe_rows(acc);
+    }
+
+    KdbFindOpts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.ascending = 1;
+    char order_col[KDB_SQL_IDENT_BUF];
+    order_col[0] = '\0';
+
+    if (sql__kw_is(&p->cur, "ORDER")) {
+        sql__advance(p);
+        if (!sql__kw_is(&p->cur, "BY")) { kdb_rows_free(acc); return sql__err("expected BY after ORDER"); }
+        sql__advance(p);
+        const char *ocol;
+        if (!sql__ident_text(&p->cur, &ocol)) { kdb_rows_free(acc); return sql__err("expected a column name after ORDER BY"); }
+        snprintf(order_col, sizeof(order_col), "%.255s", ocol);
+        opts.order_by = order_col;
+        sql__advance(p);
+        if (sql__kw_is(&p->cur, "ASC"))       { sql__advance(p); opts.ascending = 1; }
+        else if (sql__kw_is(&p->cur, "DESC")) { sql__advance(p); opts.ascending = 0; }
+    }
+
+    if (sql__kw_is(&p->cur, "LIMIT")) {
+        sql__advance(p);
+        if (p->cur.type != SQLTOK_NUMBER) { kdb_rows_free(acc); return sql__err("expected a number after LIMIT"); }
+        opts.limit = (size_t)atoll(p->cur.text);
+        sql__advance(p);
+        if (sql__kw_is(&p->cur, "OFFSET")) {
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_NUMBER) { kdb_rows_free(acc); return sql__err("expected a number after OFFSET"); }
+            opts.offset = (size_t)atoll(p->cur.text);
+            sql__advance(p);
+        }
+    }
+
+    if (opts.order_by) sql__sort_rows(acc, opts.order_by, opts.ascending);
+    if (opts.offset > 0 || opts.limit > 0) sql__limit_rows(acc, opts.offset, opts.limit);
+
+    if (rows_out) *rows_out = acc;
+    else           kdb_rows_free(acc);
     return KDB_OK;
 }
 
@@ -1537,7 +1633,7 @@ KdbStatus kdb_exec_sql(KumDB *db, const char *sql, KdbRows **rows_out, size_t *a
     else if (sql__kw_is(&p.cur, "ALTER"))  st = sql__exec_alter_table(&p, db);
     else if (sql__kw_is(&p.cur, "DROP"))   st = sql__exec_drop_table(&p, db);
     else if (sql__kw_is(&p.cur, "INSERT")) st = sql__exec_insert(&p, db, affected_out);
-    else if (sql__kw_is(&p.cur, "SELECT")) st = sql__exec_select(&p, db, rows_out);
+    else if (sql__kw_is(&p.cur, "SELECT")) st = sql__exec_select_stmt(&p, db, rows_out);
     else if (sql__kw_is(&p.cur, "UPDATE")) st = sql__exec_update(&p, db, affected_out);
     else if (sql__kw_is(&p.cur, "DELETE")) st = sql__exec_delete(&p, db, affected_out);
     else return sql__err("unrecognized statement -- expected CREATE, ALTER, DROP, INSERT, SELECT, UPDATE, or DELETE");

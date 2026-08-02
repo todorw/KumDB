@@ -320,6 +320,58 @@ static void test_having(void) {
     teardown(db);
 }
 
+static void test_union(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t1 (name TEXT)"));
+    ASSERT_OK(sql(db, "CREATE TABLE t2 (name TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t1 (name) VALUES ('alice')"));
+    ASSERT_OK(sql(db, "INSERT INTO t1 (name) VALUES ('bob')"));
+    ASSERT_OK(sql(db, "INSERT INTO t2 (name) VALUES ('bob')"));
+    ASSERT_OK(sql(db, "INSERT INTO t2 (name) VALUES ('carol')"));
+
+    KdbRows *rows = NULL;
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM t1 UNION SELECT name FROM t2 ORDER BY name ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        const char *n0 = NULL, *n1 = NULL, *n2 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &n0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "name", &n1));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[2], "name", &n2));
+        ASSERT_STR(n0, "alice");
+        ASSERT_STR(n1, "bob");
+        ASSERT_STR(n2, "carol");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM t1 UNION ALL SELECT name FROM t2", &rows, NULL));
+    ASSERT(rows && rows->count == 4u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* 3-way chain with ORDER BY + LIMIT applying to the combined result */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name FROM t1 UNION SELECT name FROM t2 UNION SELECT name FROM t1 ORDER BY name DESC LIMIT 1",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *n0 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &n0));
+        ASSERT_STR(n0, "carol");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* column-count mismatch is rejected */
+    ASSERT_OK(sql(db, "CREATE TABLE t3 (name TEXT, age INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t3 (name, age) VALUES ('dan', 5)"));
+    ASSERT_ERR(sql(db, "SELECT name FROM t1 UNION SELECT name, age FROM t3"));
+
+    /* mixing UNION and UNION ALL in one chain is rejected */
+    ASSERT_ERR(sql(db, "SELECT name FROM t1 UNION SELECT name FROM t2 UNION ALL SELECT name FROM t1"));
+
+    teardown(db);
+}
+
 static void test_distinct(void) {
     KumDB *db;
     setup(&db);
@@ -521,6 +573,7 @@ int main(void) {
     test_or();
     test_group_by_and_aggregates();
     test_having();
+    test_union();
     test_distinct();
     test_alter_table();
     test_nested_values_through_sql();

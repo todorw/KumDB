@@ -314,6 +314,7 @@ SELECT [DISTINCT] * | item, ... FROM t
     [WHERE cond [AND|OR cond ...]]
     [GROUP BY col]
     [HAVING cond [AND|OR cond ...]]
+    [UNION [ALL] SELECT ...]*
     [ORDER BY col [ASC|DESC]]
     [LIMIT n [OFFSET m]]
 
@@ -354,6 +355,16 @@ valid with `GROUP BY` or an aggregate function; requiring it without either
 is a syntax error, same as real SQL. Runs after grouping and before
 `ORDER BY`/`LIMIT`, so `HAVING ... ORDER BY ... LIMIT ...` limits the
 already-`HAVING`-filtered set.
+
+**`UNION`/`UNION ALL`** chains multiple `SELECT`s into one result: `UNION`
+dedupes across all arms (same rules as `DISTINCT`), `UNION ALL` keeps every
+row including duplicates. Every arm must select the same number of
+columns; output column names come from the first arm that returned at
+least one row. `ORDER BY`/`LIMIT` can only appear once, after the last
+arm, and apply to the combined result, not to any one arm. Mixing `UNION`
+and `UNION ALL` in the same chain isn't supported -- pick one for the
+whole statement (which one binds first is a real ambiguity without
+parenthesized subqueries, which KumDB's SQL doesn't have).
 
 **`SELECT DISTINCT`** dedupes the result by the exact set of selected
 columns (after projection, so `SELECT DISTINCT col` dedupes on `col`
