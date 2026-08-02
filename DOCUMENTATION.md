@@ -334,6 +334,12 @@ UPDATE t SET col = val, ... [WHERE cond [AND|OR cond ...]]
 DELETE FROM t [WHERE cond [AND|OR cond ...]]
 ```
 
+**Comments:** `-- to end of line` and `/* block, can span lines */` are
+both stripped like whitespace, anywhere a token could otherwise start. An
+unterminated `/*` just eats to the end of the string rather than erroring
+on the comment itself — you'll get whatever "ran out of input mid-
+statement" error the missing content after it would've caused anyway.
+
 **Types:** `INT`/`INTEGER`, `FLOAT`/`REAL`/`DOUBLE`, `BOOL`/`BOOLEAN`,
 `TEXT`/`STRING`/`VARCHAR`/`CHAR` (length specs like `VARCHAR(50)` are
 accepted and ignored — KumDB strings aren't fixed-width), `BLOB`.

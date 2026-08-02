@@ -1329,6 +1329,25 @@ static void test_window_functions(void) {
     teardown(db);
 }
 
+static void test_comments(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (n INT) -- trailing line comment"));
+    ASSERT_OK(sql(db, "-- leading line comment\nINSERT INTO t (n) VALUES (1)"));
+    ASSERT_OK(sql(db, "INSERT /* inline block */ INTO t (n) VALUES (2)"));
+
+    KdbRows *rows = NULL;
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t /* multi\nline\ncomment */ WHERE n > 0", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) kdb_rows_free(rows);
+
+    /* an unterminated block comment doesn't hang or crash -- it just eats
+     * to EOF, same as running out of input mid-statement any other way */
+    ASSERT_ERR(sql(db, "SELECT * FROM t WHERE n /* unterminated"));
+
+    teardown(db);
+}
+
 static void test_syntax_errors(void) {
     KumDB *db;
     setup(&db);
@@ -1378,6 +1397,7 @@ int main(void) {
     test_views();
     test_ctes();
     test_window_functions();
+    test_comments();
     test_syntax_errors();
 
     printf("passed=%d  failed=%d\n", passed, failed);

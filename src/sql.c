@@ -58,6 +58,19 @@ static void sql__skip_ws(SqlLexer *lx) {
             while (lx->src[lx->pos] && lx->src[lx->pos] != '\n') lx->pos++;
             continue;
         }
+        if (lx->src[lx->pos] == '/' && lx->src[lx->pos + 1] == '*') {
+            lx->pos += 2;
+            /* an unterminated block comment is silently treated as ending
+             * at EOF rather than erroring here -- the lexer has no error-
+             * reporting path of its own (SQLTOK_ERROR is the only signal,
+             * and every caller already treats "nothing left to parse" the
+             * same as "ran out of input mid-statement"), so this just
+             * lands on whatever comes next (nothing), consistent with
+             * that. */
+            while (lx->src[lx->pos] && !(lx->src[lx->pos] == '*' && lx->src[lx->pos + 1] == '/')) lx->pos++;
+            if (lx->src[lx->pos]) lx->pos += 2;
+            continue;
+        }
         break;
     }
 }

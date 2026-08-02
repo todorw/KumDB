@@ -12,6 +12,9 @@ extern "C" {
  * use underneath -- same storage, same query semantics, just a different
  * syntax on top. One statement per call.
  *
+ * "-- to end of line" comments and C-style block comments (can span
+ * lines) are both stripped like whitespace anywhere a token could start.
+ *
  * Supported:
  *   CREATE TABLE t (col TYPE [NOT NULL] [INDEX], ...)
  *   ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [INDEX]
