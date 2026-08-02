@@ -170,13 +170,59 @@ KdbStatus kdb_record_update_field(KdbRecord      *r,
 }
 
 
-const KdbRecordField *kdb_record_get_field(const KdbRecord *r, const char *col_name) {
-    if (!r || !col_name) return NULL;
-    for (uint32_t i = 0; i < r->field_count; i++) {
-        if (strcmp(r->fields[i].col_name, col_name) == 0)
-            return &r->fields[i];
+/* Finds a field by exact name in a flat field list first (the fast,
+ * common case, and the only one that makes sense for a JOIN-qualified
+ * name like "u.name" -- that's a literal field name at the SQL layer, not
+ * a nested lookup, and dots there must never be reinterpreted). Only if
+ * that fails, and col_name still has a '.' left in it, does it try
+ * resolving the first segment as a real field and recursing into it *as
+ * a nested OBJECT* for the rest of the path ("address.city" -> field
+ * "address", must be KDB_TYPE_OBJECT, then find "city" among its own
+ * fields, same rule all the way down). No dot-path into an ARRAY --
+ * elements there are unnamed/count-based, there's no name to path
+ * through; pull the array out and inspect it yourself, same as always. */
+static const KdbRecordField *kdb__find_field(const KdbRecordField *fields, uint32_t count, const char *name) {
+    for (uint32_t i = 0; i < count; i++) {
+        if (strcmp(fields[i].col_name, name) == 0) return &fields[i];
     }
     return NULL;
+}
+
+const KdbRecordField *kdb_record_get_field(const KdbRecord *r, const char *col_name) {
+    if (!r || !col_name) return NULL;
+
+    const KdbRecordField *exact = kdb__find_field(r->fields, r->field_count, col_name);
+    if (exact) return exact;
+
+    const char *dot = strchr(col_name, '.');
+    if (!dot) return NULL;
+
+    char head[KDB_MAX_NAME_LEN];
+    size_t head_len = (size_t)(dot - col_name);
+    if (head_len == 0 || head_len >= sizeof(head)) return NULL;
+    memcpy(head, col_name, head_len);
+    head[head_len] = '\0';
+
+    const KdbRecordField *fields = r->fields;
+    uint32_t count = r->field_count;
+    const char *rest = dot + 1;
+
+    for (;;) {
+        const KdbRecordField *f = kdb__find_field(fields, count, head);
+        if (!f || f->value.type != KDB_TYPE_OBJECT) return NULL;
+
+        const char *next_dot = strchr(rest, '.');
+        if (!next_dot) return kdb__find_field(f->value.v.as_object.fields, f->value.v.as_object.count, rest);
+
+        head_len = (size_t)(next_dot - rest);
+        if (head_len == 0 || head_len >= sizeof(head)) return NULL;
+        memcpy(head, rest, head_len);
+        head[head_len] = '\0';
+
+        fields = f->value.v.as_object.fields;
+        count  = f->value.v.as_object.count;
+        rest   = next_dot + 1;
+    }
 }
 
 KdbStatus kdb_record_get_int(const KdbRecord *r, const char *col, int64_t *out) {

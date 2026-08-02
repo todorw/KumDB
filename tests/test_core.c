@@ -696,6 +696,42 @@ static void test_nested_array_object(void) {
     teardown(db);
 }
 
+static void test_nested_dot_path_filter(void) {
+    KumDB *db;
+    setup(&db);
+
+    KdbField addr1[] = { kdb_field_string("city", "NYC"), kdb_field_int("zip", 10001), kdb_field_end() };
+    KdbField f1[] = { kdb_field_string("name", "alice"), kdb_field_object("address", addr1), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, TABLE, f1));
+
+    KdbField addr2[] = { kdb_field_string("city", "LA"), kdb_field_int("zip", 90001), kdb_field_end() };
+    KdbField f2[] = { kdb_field_string("name", "bob"), kdb_field_object("address", addr2), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, TABLE, f2));
+
+    /* no address at all -- dot-path just doesn't match, doesn't crash */
+    KdbField f3[] = { kdb_field_string("name", "carol"), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, TABLE, f3));
+
+    const char *by_city[] = { "address.city=NYC", NULL };
+    ASSERT_EQ(kdb_count(db, TABLE, by_city), 1);
+
+    const char *by_zip[] = { "address.zip__gt=50000", NULL };
+    ASSERT_EQ(kdb_count(db, TABLE, by_zip), 1);
+
+    const char *missing_addr[] = { "address.city__isnull", NULL };
+    ASSERT_EQ(kdb_count(db, TABLE, missing_addr), 1); /* carol */
+
+    /* a path into a field that isn't there, or isn't an OBJECT -- neither
+     * crashes, both just resolve to "not found" */
+    const char *no_such_path[] = { "address.country=US", NULL };
+    ASSERT_EQ(kdb_count(db, TABLE, no_such_path), 0);
+
+    const char *not_an_object[] = { "name.first=alice", NULL };
+    ASSERT_EQ(kdb_count(db, TABLE, not_an_object), 0);
+
+    teardown(db);
+}
+
 static void test_nested_survives_reopen(void) {
     system("rm -rf " TEST_DIR);
     mkdir(TEST_DIR, 0755);
@@ -783,6 +819,7 @@ int main(void) {
     test_numeric_literal_edge_cases();
     test_blob_field();
     test_nested_array_object();
+    test_nested_dot_path_filter();
     test_nested_survives_reopen();
     test_list_tables_repeated();
 

@@ -239,13 +239,19 @@ arrays...), capped at 16 levels and 64 elements per level — generous limits
 that exist to stop a corrupt file from making the engine allocate or
 recurse without bound, not limits you'll hit in normal use.
 
-`EQ`/`NEQ` compare arrays/objects by deep value equality. There's no
-dot-path querying (`WHERE address.city = 'NYC'`) — match/filter on the
-whole field, or pull it out and inspect it yourself. There's no SQL literal
-syntax for constructing arrays/objects either (no sane one-line syntax for
-it); build nested values through the C API. SQL can still `SELECT`,
-project, and aggregate the resulting columns fine, it just can't construct
-new ones from a literal.
+`EQ`/`NEQ` compare arrays/objects by deep value equality. Fields inside a
+nested `OBJECT` are reachable by dot-path, both as a NoSQL filter
+(`"address.city=NYC"`, any operator — `"address.zip__gt=50000"` works
+too) and in SQL `WHERE` (`WHERE address.city = 'NYC'`), arbitrarily deep
+(`a.b.c`). A path that doesn't resolve — the field's missing, or isn't an
+`OBJECT` at some point along the way — just doesn't match, same as a
+missing top-level field; it's never an error. No dot-path *into* an
+`ARRAY`, only through `OBJECT`s — array elements are unnamed, there's no
+name to path through; pull the array out and inspect it yourself for
+that. There's no SQL literal syntax for constructing arrays/objects
+either (no sane one-line syntax for it); build nested values through the
+C API. SQL can still `SELECT`, project, and aggregate the resulting
+columns fine, it just can't construct new ones from a literal.
 
 Old data files (format 1.0, written before nested values existed) open
 exactly as before — nested values only appear starting at format 1.1, and

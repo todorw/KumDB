@@ -1168,13 +1168,59 @@ void kdb_row_free_internal(KdbRow *row) {
     row->field_count = 0;
 }
 
-const KdbField *kdb_row_get(const KdbRow *row, const char *col_name) {
-    if (!row || !col_name) return NULL;
-    for (uint32_t i = 0; i < row->field_count; i++) {
-        if (row->fields[i].name && strcmp(row->fields[i].name, col_name) == 0)
-            return &row->fields[i];
+static const KdbField *kdb__find_field(const KdbField *fields, uint32_t count, const char *name) {
+    for (uint32_t i = 0; i < count; i++) {
+        if (fields[i].name && strcmp(fields[i].name, name) == 0) return &fields[i];
     }
     return NULL;
+}
+
+static const KdbField *kdb__find_field_in_object(const KdbField *obj, const char *name) {
+    for (const KdbField *f = obj; f && f->name; f++) {
+        if (strcmp(f->name, name) == 0) return f;
+    }
+    return NULL;
+}
+
+/* Same dot-path rule as kdb_record_get_field (record.c): try an exact
+ * field-name match first (the fast common case, and the only sane
+ * interpretation of a JOIN-qualified name like "u.name" -- a literal
+ * field name at the SQL layer, never a nested lookup), and only fall back
+ * to resolving "address.city" as field "address" (must be KDB_TYPE_OBJECT)
+ * then "city" among its own fields if no exact match exists. No dot-path
+ * into an ARRAY -- elements there are unnamed. */
+const KdbField *kdb_row_get(const KdbRow *row, const char *col_name) {
+    if (!row || !col_name) return NULL;
+
+    const KdbField *exact = kdb__find_field(row->fields, row->field_count, col_name);
+    if (exact) return exact;
+
+    const char *dot = strchr(col_name, '.');
+    if (!dot) return NULL;
+
+    char head[KDB_MAX_NAME_LEN];
+    size_t head_len = (size_t)(dot - col_name);
+    if (head_len == 0 || head_len >= sizeof(head)) return NULL;
+    memcpy(head, col_name, head_len);
+    head[head_len] = '\0';
+
+    const KdbField *f = kdb__find_field(row->fields, row->field_count, head);
+    const char *rest = dot + 1;
+
+    for (;;) {
+        if (!f || f->type != KDB_TYPE_OBJECT) return NULL;
+
+        const char *next_dot = strchr(rest, '.');
+        if (!next_dot) return kdb__find_field_in_object(f->v.as_object, rest);
+
+        head_len = (size_t)(next_dot - rest);
+        if (head_len == 0 || head_len >= sizeof(head)) return NULL;
+        memcpy(head, rest, head_len);
+        head[head_len] = '\0';
+
+        f = kdb__find_field_in_object(f->v.as_object, head);
+        rest = next_dot + 1;
+    }
 }
 
 KdbStatus kdb_row_get_int(const KdbRow *row, const char *col, int64_t *out) {

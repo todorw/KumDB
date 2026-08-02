@@ -994,6 +994,16 @@ static void test_nested_values_through_sql(void) {
     ASSERT(rows && rows->count == 2u);
     if (rows) kdb_rows_free(rows);
 
+    /* dot-path WHERE into the nested object -- "address.city" */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM t WHERE address.city = 'NYC'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &name));
+        ASSERT_STR(name, "Alice");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
     teardown(db);
 }
 
