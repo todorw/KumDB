@@ -30,10 +30,15 @@ extern "C" {
  *                               [GROUP BY col, ...]
  *                               [HAVING cond [AND|OR cond ...]]
  *                               [UNION [ALL] SELECT ...]*
- *                               [ORDER BY col [ASC|DESC]]
+ *                               [ORDER BY col [ASC|DESC], ...]
  *                               [LIMIT n [OFFSET m]]
  *   UPDATE t SET col = val, ... [WHERE cond [AND|OR cond ...]]
  *   DELETE FROM t [WHERE cond [AND|OR cond ...]]
+ *
+ * ORDER BY (top-level, not OVER's own) takes one or more comma-separated
+ * columns, each with its own optional ASC/DESC, ties broken left to right
+ * -- max 4 columns. Applies once, after everything else (GROUP BY/HAVING/
+ * UNION), same as before.
  *
  * AND binds tighter than OR, standard SQL precedence: "a=1 AND b=2 OR c=3"
  * means "(a=1 AND b=2) OR (c=3)" -- parenthesize to override, nested up to

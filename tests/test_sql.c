@@ -127,6 +127,58 @@ static void test_limit_offset(void) {
     teardown(db);
 }
 
+static void test_multi_column_order_by(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (region TEXT, amount INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (region, amount) VALUES ('east', 100)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (region, amount) VALUES ('east', 50)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (region, amount) VALUES ('west', 200)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (region, amount) VALUES ('west', 10)"));
+
+    KdbRows *rows = NULL;
+    ASSERT_OK(kdb_exec_sql(db, "SELECT region, amount FROM t ORDER BY region ASC, amount DESC", &rows, NULL));
+    ASSERT(rows && rows->count == 4u);
+    if (rows && rows->count == 4) {
+        int64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        const char *r0 = NULL, *r2 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "region", &r0));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "amount", &a0));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[1], "amount", &a1));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[2], "region", &r2));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[2], "amount", &a2));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[3], "amount", &a3));
+        ASSERT_STR(r0, "east"); ASSERT_EQ(a0, 100); /* east, amount desc: 100 then 50 */
+        ASSERT_EQ(a1, 50);
+        ASSERT_STR(r2, "west"); ASSERT_EQ(a2, 200); /* west, amount desc: 200 then 10 */
+        ASSERT_EQ(a3, 10);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* mixed directions per column */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT region, amount FROM t ORDER BY region DESC, amount ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 4u);
+    if (rows && rows->count == 4) {
+        const char *r0 = NULL; int64_t a0 = 0, a1 = 0;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "region", &r0));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "amount", &a0));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[1], "amount", &a1));
+        ASSERT_STR(r0, "west"); ASSERT_EQ(a0, 10); /* west, amount asc: 10 then 200 */
+        ASSERT_EQ(a1, 200);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* combined with LIMIT */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT region, amount FROM t ORDER BY region ASC, amount DESC LIMIT 2", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* too many ORDER BY columns is rejected, not silently truncated */
+    ASSERT_ERR(sql(db, "SELECT * FROM t ORDER BY region, amount, region, amount, region"));
+
+    teardown(db);
+}
+
 static void test_update_delete(void) {
     KumDB *db;
     setup(&db);
@@ -1375,6 +1427,7 @@ int main(void) {
     test_create_insert_select();
     test_projection();
     test_limit_offset();
+    test_multi_column_order_by();
     test_update_delete();
     test_where_operators();
     test_or();

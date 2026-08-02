@@ -327,7 +327,7 @@ SELECT [DISTINCT] * | item, ... FROM t [[AS] alias]
     [GROUP BY col, ...]
     [HAVING cond [AND|OR cond ...]]
     [UNION [ALL] SELECT ...]*
-    [ORDER BY col [ASC|DESC]]
+    [ORDER BY col [ASC|DESC], ...]
     [LIMIT n [OFFSET m]]
 
 UPDATE t SET col = val, ... [WHERE cond [AND|OR cond ...]]
@@ -339,6 +339,14 @@ both stripped like whitespace, anywhere a token could otherwise start. An
 unterminated `/*` just eats to the end of the string rather than erroring
 on the comment itself — you'll get whatever "ran out of input mid-
 statement" error the missing content after it would've caused anyway.
+
+**`ORDER BY`** (the top-level clause, after `GROUP BY`/`UNION`/etc, not
+`OVER`'s own `ORDER BY`) takes one or more comma-separated columns, each
+with its own optional `ASC`/`DESC` — `ORDER BY region ASC, amount DESC`
+sorts by `region` first, breaking ties with `amount`, same as real SQL.
+Capped at 4 columns. Applies once, after everything else (`GROUP BY`,
+`HAVING`, `UNION`) — sorting a `UNION`'s arm individually isn't possible,
+same as before.
 
 **Types:** `INT`/`INTEGER`, `FLOAT`/`REAL`/`DOUBLE`, `BOOL`/`BOOLEAN`,
 `TEXT`/`STRING`/`VARCHAR`/`CHAR` (length specs like `VARCHAR(50)` are

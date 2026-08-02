@@ -2166,25 +2166,38 @@ static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uin
     return KDB_OK;
 }
 
-static const char *sql__sort_col = NULL;
-static int         sql__sort_asc = 1;
+#define KDB_SQL_MAX_ORDER_COLS 4
 
+typedef struct { const char *col; int ascending; } SqlOrderKey;
+
+static const SqlOrderKey *sql__sort_keys = NULL;
+static int                sql__sort_nkeys = 0;
+
+/* Compares by the first key; ties fall through to the next key, and so on
+ * -- standard multi-column ORDER BY tiebreak semantics. A row missing a
+ * key column sorts before/after everything else on that key (same
+ * direction-aware placement a single-column sort always used), rather
+ * than being treated as equal to a present value. */
 static int sql__row_cmp(const void *a, const void *b) {
     const KdbRow *ra = (const KdbRow *)a;
     const KdbRow *rb = (const KdbRow *)b;
-    const KdbField *fa = kdb_row_get(ra, sql__sort_col);
-    const KdbField *fb = kdb_row_get(rb, sql__sort_col);
-    if (!fa && !fb) return 0;
-    if (!fa) return sql__sort_asc ? -1 : 1;
-    if (!fb) return sql__sort_asc ? 1 : -1;
-    int cmp = sql__field_cmp(fa, fb);
-    return sql__sort_asc ? cmp : -cmp;
+    for (int i = 0; i < sql__sort_nkeys; i++) {
+        const KdbField *fa = kdb_row_get(ra, sql__sort_keys[i].col);
+        const KdbField *fb = kdb_row_get(rb, sql__sort_keys[i].col);
+        int cmp;
+        if (!fa && !fb)   cmp = 0;
+        else if (!fa)     cmp = sql__sort_keys[i].ascending ? -1 : 1;
+        else if (!fb)     cmp = sql__sort_keys[i].ascending ? 1 : -1;
+        else { cmp = sql__field_cmp(fa, fb); if (!sql__sort_keys[i].ascending) cmp = -cmp; }
+        if (cmp != 0) return cmp;
+    }
+    return 0;
 }
 
-static void sql__sort_rows(KdbRows *rows, const char *col, int ascending) {
-    if (!rows || !col || rows->count == 0) return;
-    sql__sort_col = col;
-    sql__sort_asc = ascending;
+static void sql__sort_rows(KdbRows *rows, const SqlOrderKey *keys, int nkeys) {
+    if (!rows || !keys || nkeys == 0 || rows->count == 0) return;
+    sql__sort_keys = keys;
+    sql__sort_nkeys = nkeys;
     qsort(rows->rows, rows->count, sizeof(KdbRow), sql__row_cmp);
 }
 
@@ -2355,7 +2368,7 @@ static int sql__win_order_equal(const SqlSelectItem *item, const KdbRow *ra, con
 }
 
 /* qsort callback context -- single-threaded, one window-function sort in
- * flight at a time, same pattern sql__sort_col/sql__row_cmp already use
+ * flight at a time, same pattern sql__sort_keys/sql__row_cmp already use
  * for top-level ORDER BY. */
 static const SqlSelectItem *sql__win_item = NULL;
 static KdbRow               *sql__win_rows = NULL;
@@ -3255,40 +3268,49 @@ static KdbStatus sql__exec_select_stmt(SqlParser *p, KumDB *db, KdbRows **rows_o
         if (!is_all) sql__dedupe_rows(acc);
     }
 
-    KdbFindOpts opts;
-    memset(&opts, 0, sizeof(opts));
-    opts.ascending = 1;
-    char order_col[KDB_SQL_IDENT_BUF];
-    order_col[0] = '\0';
+    char order_col_bufs[KDB_SQL_MAX_ORDER_COLS][KDB_SQL_IDENT_BUF];
+    SqlOrderKey order_keys[KDB_SQL_MAX_ORDER_COLS];
+    int n_order_keys = 0;
+    size_t limit = 0, offset = 0;
 
     if (sql__kw_is(&p->cur, "ORDER")) {
         sql__advance(p);
         if (!sql__kw_is(&p->cur, "BY")) { kdb_rows_free(acc); return sql__err("expected BY after ORDER"); }
         sql__advance(p);
-        const char *ocol;
-        if (!sql__ident_text(&p->cur, &ocol)) { kdb_rows_free(acc); return sql__err("expected a column name after ORDER BY"); }
-        snprintf(order_col, sizeof(order_col), "%.255s", ocol);
-        opts.order_by = order_col;
-        sql__advance(p);
-        if (sql__kw_is(&p->cur, "ASC"))       { sql__advance(p); opts.ascending = 1; }
-        else if (sql__kw_is(&p->cur, "DESC")) { sql__advance(p); opts.ascending = 0; }
+        for (;;) {
+            const char *ocol;
+            if (!sql__ident_text(&p->cur, &ocol)) { kdb_rows_free(acc); return sql__err("expected a column name after ORDER BY"); }
+            if (n_order_keys >= KDB_SQL_MAX_ORDER_COLS) {
+                kdb_rows_free(acc);
+                return sql__err("too many ORDER BY columns (max %d)", KDB_SQL_MAX_ORDER_COLS);
+            }
+            snprintf(order_col_bufs[n_order_keys], sizeof(order_col_bufs[0]), "%.255s", ocol);
+            order_keys[n_order_keys].col = order_col_bufs[n_order_keys];
+            order_keys[n_order_keys].ascending = 1;
+            sql__advance(p);
+            if (sql__kw_is(&p->cur, "ASC"))       sql__advance(p);
+            else if (sql__kw_is(&p->cur, "DESC")) { order_keys[n_order_keys].ascending = 0; sql__advance(p); }
+            n_order_keys++;
+            if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+            break;
+        }
     }
 
     if (sql__kw_is(&p->cur, "LIMIT")) {
         sql__advance(p);
         if (p->cur.type != SQLTOK_NUMBER) { kdb_rows_free(acc); return sql__err("expected a number after LIMIT"); }
-        opts.limit = (size_t)atoll(p->cur.text);
+        limit = (size_t)atoll(p->cur.text);
         sql__advance(p);
         if (sql__kw_is(&p->cur, "OFFSET")) {
             sql__advance(p);
             if (p->cur.type != SQLTOK_NUMBER) { kdb_rows_free(acc); return sql__err("expected a number after OFFSET"); }
-            opts.offset = (size_t)atoll(p->cur.text);
+            offset = (size_t)atoll(p->cur.text);
             sql__advance(p);
         }
     }
 
-    if (opts.order_by) sql__sort_rows(acc, opts.order_by, opts.ascending);
-    if (opts.offset > 0 || opts.limit > 0) sql__limit_rows(acc, opts.offset, opts.limit);
+    sql__sort_rows(acc, order_keys, n_order_keys);
+    if (offset > 0 || limit > 0) sql__limit_rows(acc, offset, limit);
 
     if (rows_out) *rows_out = acc;
     else           kdb_rows_free(acc);
