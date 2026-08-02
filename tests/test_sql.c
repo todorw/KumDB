@@ -372,6 +372,53 @@ static void test_union(void) {
     teardown(db);
 }
 
+static void test_subqueries(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE employees (name TEXT, dept TEXT, salary FLOAT)"));
+    ASSERT_OK(sql(db, "CREATE TABLE managers (dept TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO employees (name, dept, salary) VALUES ('alice', 'eng', 100.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO employees (name, dept, salary) VALUES ('bob', 'sales', 80.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO employees (name, dept, salary) VALUES ('carol', 'eng', 120.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO managers (dept) VALUES ('eng')"));
+
+    KdbRows *rows = NULL;
+
+    /* scalar subquery */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name FROM employees WHERE salary = (SELECT MAX(salary) FROM employees)", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *n0 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &n0));
+        ASSERT_STR(n0, "carol");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* IN subquery */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name FROM employees WHERE dept IN (SELECT dept FROM managers) ORDER BY name ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* scalar subquery returning more than one row is rejected */
+    ASSERT_ERR(sql(db, "SELECT name FROM employees WHERE dept = (SELECT dept FROM employees)"));
+
+    /* IN subquery with more than one column is rejected */
+    ASSERT_ERR(sql(db, "SELECT name FROM employees WHERE dept IN (SELECT dept, salary FROM employees)"));
+
+    /* subqueries work in UPDATE/DELETE WHERE too, since they share sql__parse_where */
+    size_t updated = 0;
+    ASSERT_OK(kdb_exec_sql(db, "UPDATE employees SET salary = 999 WHERE dept IN (SELECT dept FROM managers)", NULL, &updated));
+    ASSERT_EQ(updated, 2u);
+
+    size_t deleted = 0;
+    ASSERT_OK(kdb_exec_sql(db, "DELETE FROM employees WHERE dept IN (SELECT dept FROM managers)", NULL, &deleted));
+    ASSERT_EQ(deleted, 2u);
+
+    teardown(db);
+}
+
 static void test_distinct(void) {
     KumDB *db;
     setup(&db);
@@ -574,6 +621,7 @@ int main(void) {
     test_group_by_and_aggregates();
     test_having();
     test_union();
+    test_subqueries();
     test_distinct();
     test_alter_table();
     test_nested_values_through_sql();

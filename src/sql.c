@@ -34,6 +34,12 @@ typedef struct {
     SqlToken cur;
 } SqlParser;
 
+/* Forward declaration: WHERE/HAVING condition parsing needs to be able to
+ * run a full SELECT for scalar/IN subqueries, but SELECT parsing (further
+ * down this file) needs WHERE/HAVING parsing first -- there's no way to
+ * order these top-to-bottom without one forward declaration somewhere. */
+static KdbStatus sql__exec_select_stmt(SqlParser *p, KumDB *db, KdbRows **rows_out);
+
 static KdbStatus sql__err(const char *fmt, ...) {
     char buf[512];
     va_list args;
@@ -182,7 +188,111 @@ static void sql__free_filters(char **filters, int count) {
     for (int i = 0; i < count; i++) free(filters[i]);
 }
 
-static char *sql__parse_condition(SqlParser *p) {
+/* Renders a field's value as plain filter-value text, the same shape a
+ * literal token would produce (no quotes, "%g" for floats -- matches
+ * kdb_value_to_str's own float format elsewhere in the engine). NULL/BLOB/
+ * ARRAY/OBJECT aren't meaningful scalar filter values, so those return 0. */
+static int sql__field_to_filter_text(const KdbField *f, char *buf, size_t buf_size) {
+    switch (f->type) {
+        case KDB_TYPE_INT:    snprintf(buf, buf_size, "%lld", (long long)f->v.as_int); return 1;
+        case KDB_TYPE_FLOAT:  snprintf(buf, buf_size, "%g", f->v.as_float); return 1;
+        case KDB_TYPE_BOOL:   snprintf(buf, buf_size, "%s", f->v.as_bool ? "true" : "false"); return 1;
+        case KDB_TYPE_STRING: snprintf(buf, buf_size, "%s", f->v.as_string ? f->v.as_string : ""); return 1;
+        default: return 0;
+    }
+}
+
+/* Executes "(SELECT ...)" as a scalar subquery -- p must be positioned
+ * right after the '('. Non-correlated only: the inner query can't see the
+ * outer row, it just runs once, up front, same as any other SELECT. Must
+ * return exactly one row with exactly one column; that value becomes the
+ * comparison's right-hand side, same text shape as a literal. Leaves the
+ * parser positioned right after the closing ')'. Returns NULL on error
+ * (error already set). */
+static char *sql__parse_scalar_subquery(SqlParser *p, KumDB *db, const char *col_ctx) {
+    if (!sql__kw_is(&p->cur, "SELECT")) { sql__err("expected SELECT after '(' for '%s'", col_ctx); return NULL; }
+
+    KdbRows *sub = NULL;
+    if (sql__exec_select_stmt(p, db, &sub) != KDB_OK) return NULL;
+
+    if (p->cur.type != SQLTOK_RPAREN) {
+        kdb_rows_free(sub);
+        sql__err("expected ')' closing the subquery for '%s'", col_ctx);
+        return NULL;
+    }
+    sql__advance(p);
+
+    if (sub->count != 1 || sub->rows[0].field_count != 1) {
+        size_t rc = sub->count;
+        size_t fc = sub->count > 0 ? sub->rows[0].field_count : 0;
+        kdb_rows_free(sub);
+        sql__err("scalar subquery for '%s' must return exactly one row and one column (got %zu row(s), %zu column(s))",
+                 col_ctx, rc, fc);
+        return NULL;
+    }
+
+    char valbuf[KDB_SQL_IDENT_BUF];
+    if (!sql__field_to_filter_text(&sub->rows[0].fields[0], valbuf, sizeof(valbuf))) {
+        kdb_rows_free(sub);
+        sql__err("scalar subquery for '%s' returned a value that can't be used in a comparison", col_ctx);
+        return NULL;
+    }
+    kdb_rows_free(sub);
+    return strdup(valbuf);
+}
+
+/* Executes "(SELECT ...)" as the right-hand side of IN -- p must be
+ * positioned right after the '('. Same non-correlated rule as the scalar
+ * case, but any number of rows, each contributing one value to the IN
+ * list; still exactly one column per row. Leaves the parser positioned
+ * right after the closing ')'. Returns NULL on error (error already set). */
+static char *sql__parse_in_subquery(SqlParser *p, KumDB *db, const char *col_ctx) {
+    if (!sql__kw_is(&p->cur, "SELECT")) { sql__err("expected SELECT after '(' for '%s'", col_ctx); return NULL; }
+
+    KdbRows *sub = NULL;
+    if (sql__exec_select_stmt(p, db, &sub) != KDB_OK) return NULL;
+
+    if (p->cur.type != SQLTOK_RPAREN) {
+        kdb_rows_free(sub);
+        sql__err("expected ')' closing the subquery for '%s'", col_ctx);
+        return NULL;
+    }
+    sql__advance(p);
+
+    char list[KDB_SQL_TOK_MAX];
+    size_t list_len = 0;
+    list[0] = '\0';
+
+    for (size_t i = 0; i < sub->count; i++) {
+        if (sub->rows[i].field_count != 1) {
+            size_t fc = sub->rows[i].field_count;
+            kdb_rows_free(sub);
+            sql__err("IN subquery for '%s' must return exactly one column (got %zu)", col_ctx, fc);
+            return NULL;
+        }
+        char valbuf[KDB_SQL_IDENT_BUF];
+        if (!sql__field_to_filter_text(&sub->rows[i].fields[0], valbuf, sizeof(valbuf))) {
+            kdb_rows_free(sub);
+            sql__err("IN subquery for '%s' returned a value that can't be used in a comparison", col_ctx);
+            return NULL;
+        }
+        size_t vlen = strlen(valbuf);
+        size_t need = list_len + (i > 0 ? 1 : 0) + vlen;
+        if (need >= sizeof(list)) {
+            kdb_rows_free(sub);
+            sql__err("IN subquery result too long for '%s'", col_ctx);
+            return NULL;
+        }
+        if (i > 0) list[list_len++] = ',';
+        memcpy(list + list_len, valbuf, vlen);
+        list_len += vlen;
+        list[list_len] = '\0';
+    }
+    kdb_rows_free(sub);
+    return strdup(list);
+}
+
+static char *sql__parse_condition(SqlParser *p, KumDB *db) {
     const char *col;
     if (!sql__ident_text(&p->cur, &col)) { sql__err("expected a column name in WHERE clause"); return NULL; }
     char col_buf[KDB_SQL_IDENT_BUF];
@@ -230,6 +340,16 @@ static char *sql__parse_condition(SqlParser *p) {
         sql__advance(p);
         if (p->cur.type != SQLTOK_LPAREN) { sql__err("expected '(' after IN on '%s'", col_buf); return NULL; }
         sql__advance(p);
+
+        if (sql__kw_is(&p->cur, "SELECT")) {
+            char *list_text = sql__parse_in_subquery(p, db, col_buf);
+            if (!list_text) return NULL;
+            size_t need = strlen(col_buf) + strlen(list_text) + 8;
+            char *buf = malloc(need);
+            if (buf) snprintf(buf, need, "%s__in=%s", col_buf, list_text);
+            free(list_text);
+            return buf;
+        }
 
         char list[KDB_SQL_TOK_MAX];
         size_t list_len = 0;
@@ -315,9 +435,16 @@ static char *sql__parse_condition(SqlParser *p) {
         return NULL;
     }
 
-    char *val_text = sql__value_text(&p->cur);
-    if (!val_text) { sql__err("expected a value after the comparison operator on '%s'", col_buf); return NULL; }
-    sql__advance(p);
+    char *val_text;
+    if (p->cur.type == SQLTOK_LPAREN) {
+        sql__advance(p);
+        val_text = sql__parse_scalar_subquery(p, db, col_buf);
+        if (!val_text) return NULL;
+    } else {
+        val_text = sql__value_text(&p->cur);
+        if (!val_text) { sql__err("expected a value after the comparison operator on '%s'", col_buf); return NULL; }
+        sql__advance(p);
+    }
 
     size_t need = strlen(col_buf) + strlen(suffix) + strlen(val_text) + 8;
     char *buf = malloc(need);
@@ -335,7 +462,7 @@ static char *sql__parse_condition(SqlParser *p) {
  * convention kdb_find()/kdb_update()/kdb_delete() understand. Shared by
  * WHERE and HAVING -- the keyword itself is consumed by the caller.
  * returns 0 on error (error already set), 1 on success */
-static int sql__parse_cond_list(SqlParser *p, char *filters_buf[KDB_SQL_MAX_COND], int *count_out) {
+static int sql__parse_cond_list(SqlParser *p, KumDB *db, char *filters_buf[KDB_SQL_MAX_COND], int *count_out) {
     int n = 0;
     *count_out = 0;
     int start_new_group = 0;
@@ -345,7 +472,7 @@ static int sql__parse_cond_list(SqlParser *p, char *filters_buf[KDB_SQL_MAX_COND
             sql__free_filters(filters_buf, n);
             return 0;
         }
-        char *f = sql__parse_condition(p);
+        char *f = sql__parse_condition(p, db);
         if (!f) { sql__free_filters(filters_buf, n); return 0; }
 
         if (start_new_group) {
@@ -377,19 +504,19 @@ static int sql__parse_cond_list(SqlParser *p, char *filters_buf[KDB_SQL_MAX_COND
 }
 
 /* returns 0 on error (error already set), 1 on success */
-static int sql__parse_where(SqlParser *p, char *filters_buf[KDB_SQL_MAX_COND], int *count_out) {
+static int sql__parse_where(SqlParser *p, KumDB *db, char *filters_buf[KDB_SQL_MAX_COND], int *count_out) {
     *count_out = 0;
     if (!sql__kw_is(&p->cur, "WHERE")) return 1;
     sql__advance(p);
-    return sql__parse_cond_list(p, filters_buf, count_out);
+    return sql__parse_cond_list(p, db, filters_buf, count_out);
 }
 
 /* returns 0 on error (error already set), 1 on success */
-static int sql__parse_having(SqlParser *p, char *filters_buf[KDB_SQL_MAX_COND], int *count_out) {
+static int sql__parse_having(SqlParser *p, KumDB *db, char *filters_buf[KDB_SQL_MAX_COND], int *count_out) {
     *count_out = 0;
     if (!sql__kw_is(&p->cur, "HAVING")) return 1;
     sql__advance(p);
-    return sql__parse_cond_list(p, filters_buf, count_out);
+    return sql__parse_cond_list(p, db, filters_buf, count_out);
 }
 
 static int sql__is_reserved_column(const char *name) {
@@ -1320,7 +1447,7 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
 
     char *filters[KDB_SQL_MAX_COND];
     int   nfilt = 0;
-    if (!sql__parse_where(p, filters, &nfilt)) return kdb_last_status();
+    if (!sql__parse_where(p, db, filters, &nfilt)) return kdb_last_status();
 
     char group_col[KDB_SQL_IDENT_BUF] = "";
     int  has_group_by = 0;
@@ -1357,7 +1484,7 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
             sql__free_filters(filters, nfilt);
             return sql__err("HAVING requires GROUP BY or an aggregate function -- use WHERE to filter plain columns");
         }
-        if (!sql__parse_having(p, having_filters, &nhaving)) { sql__free_filters(filters, nfilt); return kdb_last_status(); }
+        if (!sql__parse_having(p, db, having_filters, &nhaving)) { sql__free_filters(filters, nfilt); return kdb_last_status(); }
     }
 
     const char *filter_ptrs[KDB_SQL_MAX_COND + 1];
@@ -1569,7 +1696,7 @@ static KdbStatus sql__exec_update(SqlParser *p, KumDB *db, size_t *affected_out)
 
     char *filters[KDB_SQL_MAX_COND];
     int   nfilt = 0;
-    if (!sql__parse_where(p, filters, &nfilt)) return kdb_last_status();
+    if (!sql__parse_where(p, db, filters, &nfilt)) return kdb_last_status();
 
     KdbField patch[KDB_SQL_MAX_COLUMNS + 1];
     for (uint32_t i = 0; i < nset; i++) {
@@ -1603,7 +1730,7 @@ static KdbStatus sql__exec_delete(SqlParser *p, KumDB *db, size_t *affected_out)
 
     char *filters[KDB_SQL_MAX_COND];
     int   nfilt = 0;
-    if (!sql__parse_where(p, filters, &nfilt)) return kdb_last_status();
+    if (!sql__parse_where(p, db, filters, &nfilt)) return kdb_last_status();
 
     const char *filter_ptrs[KDB_SQL_MAX_COND + 1];
     for (int i = 0; i < nfilt; i++) filter_ptrs[i] = filters[i];

@@ -336,6 +336,19 @@ skipped (or rejected for `ADD`) rather than erroring, so a copy-pasted
 (leading/trailing `%` only — no `_` wildcard, no mid-pattern `%`), and
 `AND`/`OR` at standard SQL precedence (`AND` binds tighter than `OR`, no
 parens/nesting: `a=1 AND b=2 OR c=3` means `(a=1 AND b=2) OR (c=3)`).
+Same syntax works in `UPDATE`/`DELETE`'s `WHERE` too.
+
+**Subqueries**: `=`/`!=`/`>`/`>=`/`<`/`<=` accept `(SELECT ...)` as a
+scalar right-hand side (must return exactly one row, one column), and `IN`
+accepts `(SELECT col FROM ...)` in place of a literal list (any number of
+rows, still exactly one column). Non-correlated only — the inner query
+can't reference the outer row, it just runs once, up front, like any other
+`SELECT`.
+
+```sql
+SELECT name FROM employees WHERE salary = (SELECT MAX(salary) FROM employees)
+SELECT name FROM employees WHERE dept IN (SELECT dept FROM managers)
+```
 
 **`SELECT` items** can be a plain column, `*`, or an aggregate call —
 `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` —
