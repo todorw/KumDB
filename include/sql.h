@@ -64,8 +64,10 @@ extern "C" {
  * pseudo-columns each table gets for joining against (id/created_at/
  * updated_at aren't ordinarily part of a row's field list, but they're
  * common join keys, e.g. "ON orders.user_id = users.id"). LEFT JOIN pads
- * an unmatched row with NULL for every column from that step's table. JOIN
- * doesn't support GROUP BY/aggregates yet. An alias doesn't need AS --
+ * an unmatched row with NULL for every column from that step's table.
+ * GROUP BY/aggregates work fine after a JOIN too -- group/aggregate on
+ * qualified columns same as any other post-JOIN reference. An alias
+ * doesn't need AS --
  * "FROM t alias"/"JOIN t2 alias2" work the same as with it -- except for a
  * short list of words (WHERE/GROUP/HAVING/ORDER/LIMIT/UNION/JOIN/INNER/
  * LEFT/ON/AS) that always mean the keyword, never a bare alias. A

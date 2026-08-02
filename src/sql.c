@@ -2569,11 +2569,6 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     }
     int has_group_by = ngroup_cols > 0;
 
-    if (has_join && (has_aggregate || has_group_by)) {
-        sql__free_cond_node(where_tree);
-        return sql__err("JOIN doesn't support GROUP BY or aggregate functions yet");
-    }
-
     if (has_case && (has_aggregate || has_group_by)) {
         sql__free_cond_node(where_tree);
         return sql__err("CASE doesn't support GROUP BY or aggregate functions yet");

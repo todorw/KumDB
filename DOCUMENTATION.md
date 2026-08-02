@@ -439,10 +439,19 @@ against that step's table gets every column from that table set to
 `NULL` (including `alias.id`) instead of being dropped, same as real
 `LEFT JOIN`. `INNER JOIN` (or just `JOIN`) drops unmatched rows.
 
-`JOIN` doesn't support `GROUP BY`/aggregate functions yet, and every
-table is always fetched in full — there's no filter pushed into the join
-itself, `WHERE` runs afterward over the combined rows. Fine for the row
-counts this engine targets, not something to reach for on huge tables.
+`GROUP BY`/aggregate functions work fine after a `JOIN` — group and
+aggregate on qualified columns same as any other post-`JOIN` reference:
+
+```sql
+SELECT u.name, COUNT(*) AS order_count
+    FROM users AS u
+    JOIN orders AS o ON u.id = o.user_id
+    GROUP BY u.name
+```
+
+Every table is always fetched in full — there's no filter pushed into the
+join itself, `WHERE` runs afterward over the combined rows. Fine for the
+row counts this engine targets, not something to reach for on huge tables.
 
 **`SELECT` items** can be a plain column, `*`, an aggregate call —
 `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` —

@@ -613,8 +613,29 @@ static void test_join(void) {
     ASSERT(rows && rows->count == 1u);
     if (rows) { kdb_rows_free(rows); rows = NULL; }
 
-    /* JOIN + GROUP BY/aggregate rejected */
-    ASSERT_ERR(sql(db, "SELECT u.name, COUNT(*) FROM users AS u JOIN orders AS o ON u.id = o.user_id GROUP BY u.name"));
+    /* GROUP BY/aggregates work fine after a JOIN -- group/aggregate on
+     * qualified columns same as any other post-JOIN reference. alice has
+     * 2 orders, bob has none (and an INNER JOIN drops him entirely). */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT u.name, COUNT(*) AS n FROM users AS u JOIN orders AS o ON u.id = o.user_id GROUP BY u.name",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *name = NULL; int64_t n = 0;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "u.name", &name));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "n", &n));
+        ASSERT_STR(name, "alice");
+        ASSERT_EQ(n, 2);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* HAVING on top of a JOIN + GROUP BY */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT u.name, COUNT(*) AS n FROM users AS u JOIN orders AS o ON u.id = o.user_id "
+        "GROUP BY u.name HAVING n >= 2",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
 
     /* duplicate alias on both sides rejected */
     ASSERT_ERR(sql(db, "SELECT * FROM users AS u JOIN orders AS u ON u.id = u.user_id"));
