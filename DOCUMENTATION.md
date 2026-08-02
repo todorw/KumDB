@@ -361,6 +361,29 @@ SELECT name FROM employees WHERE salary = (SELECT MAX(salary) FROM employees)
 SELECT name FROM employees WHERE dept IN (SELECT dept FROM managers)
 ```
 
+**`EXISTS`/`NOT EXISTS`** accept a correlated `(SELECT ...)` in `WHERE` —
+unlike the scalar/`IN` subqueries above, the inner query *can* reference
+the outer row, qualified with the outer query's own alias (explicit
+`AS`, a bare alias, or just the table name if neither was given). Only
+row existence matters, not what's projected, so `SELECT *` is the usual
+choice:
+
+```sql
+SELECT name FROM users u WHERE EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id)
+SELECT name FROM users WHERE NOT EXISTS (SELECT * FROM orders o WHERE o.user_id = users.id)
+```
+
+Mechanically, the inner query is re-run once per outer row (real
+correlated-subquery cost — fine at this engine's target row counts, not
+something to reach for in a tight loop over a huge table): the outer
+row's alias-qualified references get substituted with that row's actual
+values, then the now-fully-self-contained `SELECT` runs fresh, same as
+any other. `EXISTS`/`NOT EXISTS` can combine with `AND`/`OR` and nest in
+parens like any other condition, and works in `UPDATE`/`DELETE`'s `WHERE`
+too (via the same full-scan `id` targeting a parenthesized `WHERE` there
+uses). Not supported in `HAVING` — it filters aggregated aliases like
+`total` from `SUM(amount) AS total`, not a real row to correlate against.
+
 **`JOIN`** (`INNER`/`LEFT`) matches rows via `ON`, a conjunction of
 `col = col` equalities — no `OR`, no comparing to a literal in `ON`
 (that's what `WHERE`, applied after the join, is for). Chain as many
@@ -393,6 +416,20 @@ every table gets for joining against — `alias.id`, `alias.created_at`,
 list but are common join keys (`ON orders.user_id = users.id`).
 `SELECT *` after a `JOIN` shows every qualified column from every table,
 including those three.
+
+Aliasing itself doesn't need `AS` — `FROM orders o` works the same as
+`FROM orders AS o` (same for a `JOIN` target), except for a handful of
+words (`WHERE`, `GROUP`, `HAVING`, `ORDER`, `LIMIT`, `UNION`, `JOIN`,
+`INNER`, `LEFT`, `ON`, `AS`) that always mean the keyword, never a bare
+alias — `FROM t WHERE ...` parses `WHERE` as the clause, not as `t`'s
+alias, exactly like real SQL's reserved-word handling.
+
+A query with no `JOIN` at all can still qualify its own columns with its
+own alias if one's in scope (explicit, bare, or just the table name) —
+`SELECT * FROM users u WHERE u.name = 'alice'` works the same as the
+unqualified `WHERE name = 'alice'`. Mostly useful for `EXISTS`'s inner
+query, where qualifying is the natural way to write a self-reference
+alongside a correlated one to the outer row (see below).
 
 `LEFT JOIN` keeps every row accumulated so far; one with no `ON` match
 against that step's table gets every column from that table set to

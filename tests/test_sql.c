@@ -662,6 +662,105 @@ static void test_join_chain(void) {
     teardown(db);
 }
 
+static void test_bare_alias(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE users (name TEXT)"));
+    ASSERT_OK(sql(db, "CREATE TABLE orders (user_id INT, item TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO users (name) VALUES ('alice')"));  /* id 1 */
+    ASSERT_OK(sql(db, "INSERT INTO users (name) VALUES ('bob')"));    /* id 2 */
+    ASSERT_OK(sql(db, "INSERT INTO orders (user_id, item) VALUES (1, 'widget')"));
+
+    KdbRows *rows = NULL;
+
+    /* FROM t alias (no AS) works the same as FROM t AS alias */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* a bare alias that happens to collide with a real clause keyword is
+     * NOT swallowed as an alias -- "FROM users WHERE ..." must still parse
+     * WHERE as the WHERE clause */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM users WHERE name = 'alice'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    teardown(db);
+}
+
+static void test_exists(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE users (name TEXT)"));
+    ASSERT_OK(sql(db, "CREATE TABLE orders (user_id INT, item TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO users (name) VALUES ('alice')"));  /* id 1, has an order */
+    ASSERT_OK(sql(db, "INSERT INTO users (name) VALUES ('bob')"));    /* id 2, no orders */
+    ASSERT_OK(sql(db, "INSERT INTO orders (user_id, item) VALUES (1, 'widget')"));
+
+    KdbRows *rows = NULL;
+
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name FROM users u WHERE EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id)",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &name));
+        ASSERT_STR(name, "alice");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name FROM users u WHERE NOT EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id)",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &name));
+        ASSERT_STR(name, "bob");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* correlates against the default (bare, no AS) outer alias too */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name FROM users WHERE EXISTS (SELECT * FROM orders o WHERE o.user_id = users.id)",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* EXISTS composes with AND like any other condition */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name FROM users u WHERE EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id) AND name = 'nobody'",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 0u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* UPDATE/DELETE with EXISTS in WHERE (the parens-style id__in fallback) */
+    size_t affected = 0;
+    ASSERT_OK(kdb_exec_sql(db,
+        "UPDATE users SET name = 'has_orders' WHERE EXISTS (SELECT * FROM orders o WHERE o.user_id = users.id)",
+        NULL, &affected));
+    ASSERT_EQ(affected, 1u);
+
+    affected = 0;
+    ASSERT_OK(kdb_exec_sql(db,
+        "DELETE FROM users WHERE NOT EXISTS (SELECT * FROM orders o WHERE o.user_id = users.id)",
+        NULL, &affected));
+    ASSERT_EQ(affected, 1u);
+    ASSERT_EQ(kdb_count(db, "users", NULL), 1);
+
+    /* EXISTS isn't supported in HAVING */
+    ASSERT_ERR(sql(db,
+        "SELECT name, COUNT(*) AS cnt FROM users u GROUP BY name "
+        "HAVING EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id)"));
+
+    /* malformed EXISTS -- unterminated subquery -- errors cleanly */
+    ASSERT_ERR(sql(db, "SELECT name FROM users u WHERE EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id"));
+
+    teardown(db);
+}
+
 static void test_case_when(void) {
     KumDB *db;
     setup(&db);
@@ -987,6 +1086,8 @@ int main(void) {
     test_subqueries();
     test_join();
     test_join_chain();
+    test_bare_alias();
+    test_exists();
     test_case_when();
     test_distinct();
     test_alter_table();

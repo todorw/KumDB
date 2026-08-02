@@ -65,7 +65,13 @@ extern "C" {
  * updated_at aren't ordinarily part of a row's field list, but they're
  * common join keys, e.g. "ON orders.user_id = users.id"). LEFT JOIN pads
  * an unmatched row with NULL for every column from that step's table. JOIN
- * doesn't support GROUP BY/aggregates yet.
+ * doesn't support GROUP BY/aggregates yet. An alias doesn't need AS --
+ * "FROM t alias"/"JOIN t2 alias2" work the same as with it -- except for a
+ * short list of words (WHERE/GROUP/HAVING/ORDER/LIMIT/UNION/JOIN/INNER/
+ * LEFT/ON/AS) that always mean the keyword, never a bare alias. A
+ * non-JOIN query can also qualify its own columns with its own alias if
+ * one's in scope ("FROM users u WHERE u.name=..." works same as
+ * unqualified); mostly useful for EXISTS's inner query (below).
  *
  * CASE (as a SELECT item): "CASE WHEN cond THEN val [WHEN cond THEN val
  * ...] [ELSE val] END". First matching WHEN wins; NULL if nothing matches
@@ -85,6 +91,14 @@ extern "C" {
  * =/!=/>/>=/</<= (must return exactly one row, one column), or
  * "IN (SELECT col FROM ...)" in place of a literal list. Non-correlated
  * only -- the inner query can't see the outer row.
+ *
+ * EXISTS/NOT EXISTS (SELECT ...) in WHERE, unlike the above, IS
+ * correlated -- the inner query can reference the outer row, qualified
+ * with the outer query's own alias. Only row existence matters, not what
+ * gets projected ("SELECT *" is the usual choice). Re-runs the inner
+ * query once per outer row (real correlated-subquery cost); combines with
+ * AND/OR and parens like any other condition; works in UPDATE/DELETE's
+ * WHERE too; not supported in HAVING.
  *
  * CREATE VIEW v AS SELECT ... stores a named query; SELECT ... FROM v
  * re-runs it fresh every time (not materialized/cached). Validates the

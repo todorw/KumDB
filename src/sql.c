@@ -161,6 +161,24 @@ static int sql__ident_text(const SqlToken *t, const char **out) {
     return 0;
 }
 
+/* Words that can legitimately follow a FROM/JOIN target, and so are
+ * ambiguous with a bare (no-AS) alias otherwise -- "FROM t WHERE ..." must
+ * parse WHERE as the WHERE clause, not as t's alias. This lexer doesn't
+ * distinguish keyword tokens from identifier tokens at all (both are just
+ * SQLTOK_IDENT; sql__kw_is is a text comparison, not a token-type check),
+ * so bare aliasing needs its own explicit reserved-word check -- scoped to
+ * exactly the keywords that can appear in this position, not a general
+ * reserved-word list. */
+static int sql__is_clause_keyword(const char *text) {
+    static const char *kws[] = {
+        "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "UNION",
+        "JOIN", "INNER", "LEFT", "ON", "AS", NULL
+    };
+    for (int i = 0; kws[i]; i++)
+        if (strcasecmp(text, kws[i]) == 0) return 1;
+    return 0;
+}
+
 static int sql__value_to_field(const char *col, const SqlToken *t, KdbField *out) {
     switch (t->type) {
         case SQLTOK_NUMBER:
@@ -467,12 +485,17 @@ static char *sql__parse_condition(SqlParser *p, KumDB *db) {
  * SQL's AND-binds-tighter-than-OR flattening being the only option. Leaves
  * reuse sql__parse_condition()'s filter-string format unchanged (no "OR:"
  * prefix at this level -- that convention only matters for the flattened
- * form below, which the storage engine's OR'd-AND-groups model needs). */
-typedef enum { SQL_COND_LEAF, SQL_COND_AND, SQL_COND_OR } SqlCondKind;
+ * form below, which the storage engine's OR'd-AND-groups model needs).
+ * SQL_COND_EXISTS/SQL_COND_NOT_EXISTS are a different kind of leaf: their
+ * leaf_filter holds the inner SELECT's raw source text (same convention
+ * CREATE VIEW stores a view's query as -- see sql__exec_create_view),
+ * re-parsed and re-run once per outer row by sql__cond_tree_matches(),
+ * with correlated column references substituted in first. */
+typedef enum { SQL_COND_LEAF, SQL_COND_AND, SQL_COND_OR, SQL_COND_EXISTS, SQL_COND_NOT_EXISTS } SqlCondKind;
 
 typedef struct SqlCondNode {
     SqlCondKind          kind;
-    char                 *leaf_filter;   /* SQL_COND_LEAF only */
+    char                 *leaf_filter;   /* SQL_COND_LEAF: "col__op=val"; SQL_COND_[NOT_]EXISTS: inner SELECT text */
     struct SqlCondNode   *left;          /* AND/OR only */
     struct SqlCondNode   *right;         /* AND/OR only */
 } SqlCondNode;
@@ -485,15 +508,106 @@ static void sql__free_cond_node(SqlCondNode *n) {
     free(n);
 }
 
+/* HAVING filters the aggregated output (SUM(...)  AS total-style aliases),
+ * which EXISTS's outer-row correlation model (built around a real table's
+ * own alias/columns) doesn't have a sensible meaning against -- rejected
+ * at parse time instead of silently correlating against nonsense. */
+static int sql__cond_tree_has_exists(const SqlCondNode *n) {
+    if (!n) return 0;
+    if (n->kind == SQL_COND_EXISTS || n->kind == SQL_COND_NOT_EXISTS) return 1;
+    return sql__cond_tree_has_exists(n->left) || sql__cond_tree_has_exists(n->right);
+}
+
 #define KDB_SQL_MAX_COND_DEPTH 16
 
-static SqlCondNode *sql__parse_or_expr(SqlParser *p, KumDB *db, int *used_parens, int *leaf_count, int depth);
+/* A non-JOIN row's own fields are always stored bare ("name", never
+ * "u.name") -- only a JOIN's combined row gets alias-qualified field names
+ * (see sql__append_qualified_fields). So a condition that qualifies its
+ * own table with the query's own alias -- "FROM users u WHERE u.name=...",
+ * or EXISTS's inner query qualifying its own FROM target the same way,
+ * which is the natural style to write once an alias is in scope at all --
+ * would otherwise silently never match. Strips exactly that one prefix
+ * back to the bare column name sql__row_cond_matches actually understands;
+ * a reference to any OTHER alias is left alone (and, with no JOIN to make
+ * it meaningful, will simply never match -- same as always). Modifies f in
+ * place (only ever shrinks it) and returns it; alias may be NULL (a JOIN
+ * is present, so no query-adopted unqualifying happens -- every reference
+ * must stay exactly as qualified, same as before this existed). */
+static char *sql__strip_own_alias(char *f, const char *alias) {
+    if (!alias) return f;
+    size_t alen = strlen(alias);
+    if (strncmp(f, alias, alen) != 0 || f[alen] != '.') return f;
+    memmove(f, f + alen + 1, strlen(f + alen + 1) + 1);
+    return f;
+}
 
-/* '(' expr ')' | leaf-condition. Bumps *used_parens the moment a '(' is
- * seen anywhere in the clause -- callers use that to tell whether the tree
- * still has the classic "OR'd AND-groups" shape (no parens => guaranteed
- * by the grammar below) or needs real tree evaluation. */
-static SqlCondNode *sql__parse_cond_primary(SqlParser *p, KumDB *db, int *used_parens, int *leaf_count, int depth) {
+static SqlCondNode *sql__parse_or_expr(SqlParser *p, KumDB *db, const char *unqualify_alias, int *used_parens, int *leaf_count, int depth);
+
+/* Advances p past a parenthesized SELECT without executing or semantically
+ * validating it -- EXISTS/NOT EXISTS's inner query can reference an outer
+ * alias that isn't a real table of its own, so it can't be parsed and run
+ * for real up front the way CREATE VIEW's body is. This only needs to find
+ * where the statement ends, using the same lexer everything else here
+ * does (so it can't be fooled by a stray '(' or ')' inside a string
+ * literal). p must be positioned at the first token after the '(' the
+ * caller already consumed (i.e. at "SELECT"). Leaves p positioned at the
+ * matching ')' itself, not consumed. Returns 0 on unexpected EOF (error
+ * already set). */
+static int sql__skip_parenthesized_select(SqlParser *p) {
+    int depth = 1;
+    for (;;) {
+        if (p->cur.type == SQLTOK_EOF) { sql__err("unexpected end of input inside EXISTS (...)"); return 0; }
+        if (p->cur.type == SQLTOK_LPAREN) depth++;
+        else if (p->cur.type == SQLTOK_RPAREN) {
+            depth--;
+            if (depth == 0) return 1;
+        }
+        sql__advance(p);
+    }
+}
+
+/* EXISTS (SELECT ...) | NOT EXISTS (SELECT ...) | '(' expr ')' |
+ * leaf-condition. Bumps *used_parens the moment a '(' is seen anywhere in
+ * the clause, or an EXISTS/NOT EXISTS leaf is parsed -- callers use that
+ * to tell whether the tree still has the classic "OR'd AND-groups" shape
+ * (the flat parenless, EXISTS-less case, guaranteed by the grammar below)
+ * or needs real tree evaluation (parens can't flatten; EXISTS has no flat
+ * filter-string form at all). */
+static SqlCondNode *sql__parse_cond_primary(SqlParser *p, KumDB *db, const char *unqualify_alias, int *used_parens, int *leaf_count, int depth) {
+    int negate_exists = 0;
+    if (sql__kw_is(&p->cur, "NOT")) {
+        sql__advance(p);
+        if (!sql__kw_is(&p->cur, "EXISTS")) { sql__err("expected EXISTS after NOT"); return NULL; }
+        negate_exists = 1;
+    }
+    if (sql__kw_is(&p->cur, "EXISTS")) {
+        sql__advance(p);
+        if (p->cur.type != SQLTOK_LPAREN) { sql__err("expected '(' after EXISTS"); return NULL; }
+        sql__advance(p);
+        if (!sql__kw_is(&p->cur, "SELECT")) { sql__err("expected a SELECT statement inside EXISTS (...)"); return NULL; }
+        size_t start = p->lx.pos - strlen(p->cur.text);
+        if (!sql__skip_parenthesized_select(p)) return NULL;
+        size_t end = p->lx.pos - 1; /* p->cur is the ')' itself (empty token text, pos is 1 past it) */
+        while (end > start && isspace((unsigned char)p->lx.src[end - 1])) end--;
+        sql__advance(p); /* consume ')' */
+
+        size_t len = end - start;
+        if (len == 0) { sql__err("EXISTS (...) query is empty"); return NULL; }
+        if (len >= KDB_MAX_STRING_LEN) len = KDB_MAX_STRING_LEN - 1;
+        char *inner_sql = malloc(len + 1);
+        if (!inner_sql) { kdb_err_oom("EXISTS subquery text"); return NULL; }
+        memcpy(inner_sql, p->lx.src + start, len);
+        inner_sql[len] = '\0';
+
+        SqlCondNode *n = KDB_ALLOC(SqlCondNode);
+        if (!n) { kdb_err_oom("condition tree node"); free(inner_sql); return NULL; }
+        n->kind = negate_exists ? SQL_COND_NOT_EXISTS : SQL_COND_EXISTS;
+        n->leaf_filter = inner_sql;
+        *used_parens = 1; /* EXISTS has no flat filter-string form -- forces tree evaluation, same as real parens */
+        (*leaf_count)++;
+        return n;
+    }
+
     if (p->cur.type == SQLTOK_LPAREN) {
         if (depth + 1 > KDB_SQL_MAX_COND_DEPTH) {
             sql__err("condition nested too deeply (max depth %d)", KDB_SQL_MAX_COND_DEPTH);
@@ -501,7 +615,7 @@ static SqlCondNode *sql__parse_cond_primary(SqlParser *p, KumDB *db, int *used_p
         }
         sql__advance(p);
         *used_parens = 1;
-        SqlCondNode *inner = sql__parse_or_expr(p, db, used_parens, leaf_count, depth + 1);
+        SqlCondNode *inner = sql__parse_or_expr(p, db, unqualify_alias, used_parens, leaf_count, depth + 1);
         if (!inner) return NULL;
         if (p->cur.type != SQLTOK_RPAREN) {
             sql__err("expected ')' closing a parenthesized condition");
@@ -518,6 +632,7 @@ static SqlCondNode *sql__parse_cond_primary(SqlParser *p, KumDB *db, int *used_p
     }
     char *f = sql__parse_condition(p, db);
     if (!f) return NULL;
+    f = sql__strip_own_alias(f, unqualify_alias);
     SqlCondNode *n = KDB_ALLOC(SqlCondNode);
     if (!n) { kdb_err_oom("condition tree node"); free(f); return NULL; }
     n->kind = SQL_COND_LEAF;
@@ -527,12 +642,12 @@ static SqlCondNode *sql__parse_cond_primary(SqlParser *p, KumDB *db, int *used_p
 }
 
 /* AND binds tighter than OR, same as standard SQL. */
-static SqlCondNode *sql__parse_and_expr(SqlParser *p, KumDB *db, int *used_parens, int *leaf_count, int depth) {
-    SqlCondNode *left = sql__parse_cond_primary(p, db, used_parens, leaf_count, depth);
+static SqlCondNode *sql__parse_and_expr(SqlParser *p, KumDB *db, const char *unqualify_alias, int *used_parens, int *leaf_count, int depth) {
+    SqlCondNode *left = sql__parse_cond_primary(p, db, unqualify_alias, used_parens, leaf_count, depth);
     if (!left) return NULL;
     while (sql__kw_is(&p->cur, "AND")) {
         sql__advance(p);
-        SqlCondNode *right = sql__parse_cond_primary(p, db, used_parens, leaf_count, depth);
+        SqlCondNode *right = sql__parse_cond_primary(p, db, unqualify_alias, used_parens, leaf_count, depth);
         if (!right) { sql__free_cond_node(left); return NULL; }
         SqlCondNode *n = KDB_ALLOC(SqlCondNode);
         if (!n) { kdb_err_oom("condition tree node"); sql__free_cond_node(left); sql__free_cond_node(right); return NULL; }
@@ -544,12 +659,12 @@ static SqlCondNode *sql__parse_and_expr(SqlParser *p, KumDB *db, int *used_paren
     return left;
 }
 
-static SqlCondNode *sql__parse_or_expr(SqlParser *p, KumDB *db, int *used_parens, int *leaf_count, int depth) {
-    SqlCondNode *left = sql__parse_and_expr(p, db, used_parens, leaf_count, depth);
+static SqlCondNode *sql__parse_or_expr(SqlParser *p, KumDB *db, const char *unqualify_alias, int *used_parens, int *leaf_count, int depth) {
+    SqlCondNode *left = sql__parse_and_expr(p, db, unqualify_alias, used_parens, leaf_count, depth);
     if (!left) return NULL;
     while (sql__kw_is(&p->cur, "OR")) {
         sql__advance(p);
-        SqlCondNode *right = sql__parse_and_expr(p, db, used_parens, leaf_count, depth);
+        SqlCondNode *right = sql__parse_and_expr(p, db, unqualify_alias, used_parens, leaf_count, depth);
         if (!right) { sql__free_cond_node(left); return NULL; }
         SqlCondNode *n = KDB_ALLOC(SqlCondNode);
         if (!n) { kdb_err_oom("condition tree node"); sql__free_cond_node(left); sql__free_cond_node(right); return NULL; }
@@ -561,40 +676,46 @@ static SqlCondNode *sql__parse_or_expr(SqlParser *p, KumDB *db, int *used_parens
     return left;
 }
 
-/* *tree_out comes back NULL if there's no WHERE/HAVING clause at all (not
- * an error). *used_parens comes back 0 iff the clause never used '(' --
- * in that case the grammar above guarantees the tree is exactly one
- * left-nested AND-chain per OR-branch, the same shape the old flat parser
- * produced, so sql__cond_flatten() below can losslessly turn it back into
- * the "OR:"-prefixed filter-string array the storage engine understands
- * and the fast pushdown path (no full-table fetch) keeps working unchanged.
- * Shared by WHERE and HAVING -- the keyword itself is consumed by the
- * caller. Returns 0 on error (error already set), 1 on success. */
-static int sql__parse_cond_clause(SqlParser *p, KumDB *db, SqlCondNode **tree_out, int *used_parens) {
+/* unqualify_alias is the query's own FROM alias when it has no JOIN (see
+ * sql__strip_own_alias), or NULL when it does (a JOIN needs every
+ * reference to stay exactly as qualified -- there's more than one table
+ * it could mean). *tree_out comes back NULL if there's no WHERE/HAVING
+ * clause at all (not an error). *used_parens comes back 0 iff the clause
+ * never used '(' -- in that case the grammar above guarantees the tree is
+ * exactly one left-nested AND-chain per OR-branch, the same shape the old
+ * flat parser produced, so sql__cond_flatten() below can losslessly turn
+ * it back into the "OR:"-prefixed filter-string array the storage engine
+ * understands and the fast pushdown path (no full-table fetch) keeps
+ * working unchanged. Shared by WHERE and HAVING -- the keyword itself is
+ * consumed by the caller. Returns 0 on error (error already set), 1 on
+ * success. */
+static int sql__parse_cond_clause(SqlParser *p, KumDB *db, const char *unqualify_alias, SqlCondNode **tree_out, int *used_parens) {
     int leaf_count = 0;
     *used_parens = 0;
-    SqlCondNode *t = sql__parse_or_expr(p, db, used_parens, &leaf_count, 0);
+    SqlCondNode *t = sql__parse_or_expr(p, db, unqualify_alias, used_parens, &leaf_count, 0);
     if (!t) { *tree_out = NULL; return 0; }
     *tree_out = t;
     return 1;
 }
 
-/* returns 0 on error (error already set), 1 on success */
-static int sql__parse_where_expr(SqlParser *p, KumDB *db, SqlCondNode **tree_out, int *used_parens) {
+/* unqualify_alias: see sql__parse_cond_clause. Returns 0 on error (error
+ * already set), 1 on success. */
+static int sql__parse_where_expr(SqlParser *p, KumDB *db, const char *unqualify_alias, SqlCondNode **tree_out, int *used_parens) {
     *tree_out = NULL;
     *used_parens = 0;
     if (!sql__kw_is(&p->cur, "WHERE")) return 1;
     sql__advance(p);
-    return sql__parse_cond_clause(p, db, tree_out, used_parens);
+    return sql__parse_cond_clause(p, db, unqualify_alias, tree_out, used_parens);
 }
 
-/* returns 0 on error (error already set), 1 on success */
-static int sql__parse_having_expr(SqlParser *p, KumDB *db, SqlCondNode **tree_out, int *used_parens) {
+/* unqualify_alias: see sql__parse_cond_clause. Returns 0 on error (error
+ * already set), 1 on success. */
+static int sql__parse_having_expr(SqlParser *p, KumDB *db, const char *unqualify_alias, SqlCondNode **tree_out, int *used_parens) {
     *tree_out = NULL;
     *used_parens = 0;
     if (!sql__kw_is(&p->cur, "HAVING")) return 1;
     sql__advance(p);
-    return sql__parse_cond_clause(p, db, tree_out, used_parens);
+    return sql__parse_cond_clause(p, db, unqualify_alias, tree_out, used_parens);
 }
 
 static int sql__cond_flatten_leaf(const SqlCondNode *node, char *filters_buf[KDB_SQL_MAX_COND], int *n, int is_or_start) {
@@ -1424,11 +1545,170 @@ static int sql__row_cond_matches(const KdbRow *row, const SqlRowCond *c) {
     }
 }
 
+/* A qualified reference inside EXISTS/NOT EXISTS's inner query that
+ * doesn't resolve to a real column of the outer row (field missing, or a
+ * type -- NULL/BLOB/ARRAY/OBJECT -- with no SQL literal syntax) gets
+ * substituted with this instead of a real value. It can't equal anything
+ * a real comparison would produce, so the substituted condition simply
+ * never matches -- approximates real SQL's "comparing against NULL is
+ * never true" behavior without needing three-valued logic. */
+#define SQL_EXISTS_NO_MATCH_SENTINEL "'\x01__kumdb_no_match__\x01'"
+
+/* col is the part of "alias.col" after the dot. Tries a direct field
+ * lookup first (covers both a plain outer row's own columns and, after a
+ * JOIN, the already-qualified "alias.col" pseudo/real columns the combined
+ * row carries -- see sql__append_qualified_fields), then falls back to the
+ * three pseudo-columns a plain (non-JOIN) row keeps outside its field list
+ * entirely. Returns 0 if col isn't a column of this row at all. */
+static int sql__lookup_outer_field(const KdbRow *row, const char *col, KdbField *out) {
+    const KdbField *f = kdb_row_get(row, col);
+    if (f) { *out = *f; return 1; }
+    out->name = NULL;
+    out->type = KDB_TYPE_INT;
+    if      (strcmp(col, "id")         == 0) { out->v.as_int = (int64_t)row->id;         return 1; }
+    else if (strcmp(col, "created_at") == 0) { out->v.as_int = (int64_t)row->created_at; return 1; }
+    else if (strcmp(col, "updated_at") == 0) { out->v.as_int = (int64_t)row->updated_at; return 1; }
+    return 0;
+}
+
+/* Renders f as inline SQL literal syntax (quoted for strings, with '' for
+ * an embedded quote -- the lexer's own escaping convention, see
+ * sql__lex_next's string case) -- NOT the same shape sql__field_to_filter_text
+ * produces, which is bare unquoted text meant for a "col__op=value" filter
+ * string, not something the SQL lexer could re-parse as a value token on
+ * its own. Returns 0 for a type with no literal syntax (NULL/BLOB/ARRAY/
+ * OBJECT) -- caller substitutes SQL_EXISTS_NO_MATCH_SENTINEL instead. */
+static int sql__render_sql_literal(const KdbField *f, char *buf, size_t buf_size) {
+    switch (f->type) {
+        case KDB_TYPE_INT:   snprintf(buf, buf_size, "%lld", (long long)f->v.as_int); return 1;
+        case KDB_TYPE_FLOAT: snprintf(buf, buf_size, "%g", f->v.as_float); return 1;
+        case KDB_TYPE_BOOL:  snprintf(buf, buf_size, "%s", f->v.as_bool ? "true" : "false"); return 1;
+        case KDB_TYPE_STRING: {
+            size_t pos = 0;
+            if (pos + 1 < buf_size) buf[pos++] = '\'';
+            for (const char *s = f->v.as_string ? f->v.as_string : ""; *s && pos + 3 < buf_size; s++) {
+                if (*s == '\'') { buf[pos++] = '\''; buf[pos++] = '\''; }
+                else buf[pos++] = *s;
+            }
+            if (pos + 1 < buf_size) buf[pos++] = '\'';
+            buf[pos < buf_size ? pos : buf_size - 1] = '\0';
+            return 1;
+        }
+        default: return 0;
+    }
+}
+
+/* Re-lexes inner_sql (EXISTS/NOT EXISTS's inner SELECT, verbatim source
+ * text) and rebuilds it token by token, replacing every identifier of the
+ * exact shape "<outer_alias>.<col>" with a literal rendering of that
+ * column's value in outer_row -- this is how correlation works here: real
+ * SQL scoping would thread a row context through evaluation, but every
+ * other part of this SQL layer already works by building/re-parsing plain
+ * query text (CREATE VIEW's stored query is the same idea), so correlated
+ * EXISTS does the same thing: substitute the outer reference away, then
+ * run the (now fully self-contained) inner SELECT exactly like any other.
+ * Returns a heap string the caller owns, or NULL on OOM (error already
+ * set) -- can't otherwise fail, an unresolvable/untyped reference just
+ * becomes SQL_EXISTS_NO_MATCH_SENTINEL rather than an error. */
+static char *sql__substitute_outer_refs(const char *inner_sql, const char *outer_alias, const KdbRow *outer_row) {
+    size_t alias_len = strlen(outer_alias);
+    size_t cap = strlen(inner_sql) + 256;
+    char *out = malloc(cap);
+    if (!out) { kdb_err_oom("substituted EXISTS subquery text"); return NULL; }
+    size_t len = 0;
+    int first = 1;
+
+    SqlLexer lx; lx.src = inner_sql; lx.pos = 0;
+    for (;;) {
+        SqlToken t = sql__lex_next(&lx);
+        if (t.type == SQLTOK_EOF) break;
+
+        char piece[KDB_MAX_STRING_LEN * 2 + 16];
+        if (t.type == SQLTOK_IDENT) {
+            const char *dot = strchr(t.text, '.');
+            if (dot && (size_t)(dot - t.text) == alias_len && strncmp(t.text, outer_alias, alias_len) == 0) {
+                KdbField fld;
+                if (!sql__lookup_outer_field(outer_row, dot + 1, &fld) || !sql__render_sql_literal(&fld, piece, sizeof(piece)))
+                    snprintf(piece, sizeof(piece), "%s", SQL_EXISTS_NO_MATCH_SENTINEL);
+            } else {
+                snprintf(piece, sizeof(piece), "%s", t.text);
+            }
+        } else {
+            switch (t.type) {
+                case SQLTOK_NUMBER: snprintf(piece, sizeof(piece), "%s", t.text); break;
+                case SQLTOK_STRING: {
+                    size_t p = 0;
+                    if (p + 1 < sizeof(piece)) piece[p++] = '\'';
+                    for (const char *s = t.text; *s && p + 3 < sizeof(piece); s++) {
+                        if (*s == '\'') { piece[p++] = '\''; piece[p++] = '\''; }
+                        else piece[p++] = *s;
+                    }
+                    if (p + 1 < sizeof(piece)) piece[p++] = '\'';
+                    piece[p < sizeof(piece) ? p : sizeof(piece) - 1] = '\0';
+                    break;
+                }
+                case SQLTOK_LPAREN: snprintf(piece, sizeof(piece), "("); break;
+                case SQLTOK_RPAREN: snprintf(piece, sizeof(piece), ")"); break;
+                case SQLTOK_COMMA:  snprintf(piece, sizeof(piece), ","); break;
+                case SQLTOK_STAR:   snprintf(piece, sizeof(piece), "*"); break;
+                case SQLTOK_SEMI:   snprintf(piece, sizeof(piece), ";"); break;
+                case SQLTOK_EQ:     snprintf(piece, sizeof(piece), "="); break;
+                case SQLTOK_NEQ:    snprintf(piece, sizeof(piece), "!="); break;
+                case SQLTOK_LT:     snprintf(piece, sizeof(piece), "<"); break;
+                case SQLTOK_LTE:    snprintf(piece, sizeof(piece), "<="); break;
+                case SQLTOK_GT:     snprintf(piece, sizeof(piece), ">"); break;
+                case SQLTOK_GTE:    snprintf(piece, sizeof(piece), ">="); break;
+                default: piece[0] = '\0'; break;
+            }
+        }
+
+        size_t plen = strlen(piece);
+        size_t need = len + (first ? 0 : 1) + plen + 1;
+        if (need > cap) {
+            while (cap < need) cap *= 2;
+            char *grown = realloc(out, cap);
+            if (!grown) { kdb_err_oom("substituted EXISTS subquery text"); free(out); return NULL; }
+            out = grown;
+        }
+        if (!first) out[len++] = ' ';
+        memcpy(out + len, piece, plen);
+        len += plen;
+        out[len] = '\0';
+        first = 0;
+    }
+    return out;
+}
+
+/* Runs an EXISTS/NOT EXISTS leaf for one outer row: substitute its
+ * correlated references, run the resulting self-contained SELECT fresh
+ * (same "no caching" philosophy views use), and check whether it returned
+ * any rows. A subquery execution error fails closed (condition doesn't
+ * match) rather than aborting the whole outer query -- consistent with
+ * sql__parse_row_cond's own "fail closed rather than assert" precedent for
+ * this file. */
+static int sql__eval_exists(KumDB *db, const char *outer_alias, const KdbRow *outer_row, const char *inner_sql, int negate) {
+    char *sub = sql__substitute_outer_refs(inner_sql, outer_alias, outer_row);
+    if (!sub) return 0;
+    SqlParser vp;
+    sql__init(&vp, sub);
+    KdbRows *inner = NULL;
+    KdbStatus st = sql__exec_select_stmt(&vp, db, &inner);
+    free(sub);
+    if (st != KDB_OK) { if (inner) kdb_rows_free(inner); return 0; }
+    int has_rows = inner && inner->count > 0;
+    if (inner) kdb_rows_free(inner);
+    return negate ? !has_rows : has_rows;
+}
+
 /* Recursive evaluation of a parsed WHERE/HAVING condition tree against one
  * in-memory row -- the general form sql__cond_flatten()'s flat "OR:"-group
  * shape is a restricted special case of. A NULL tree (no WHERE/HAVING
- * clause at all) matches everything. */
-static int sql__cond_tree_matches(const KdbRow *row, const SqlCondNode *node) {
+ * clause at all) matches everything. db/outer_alias are only used by
+ * SQL_COND_[NOT_]EXISTS leaves (outer_alias is the row's own table alias,
+ * for resolving "alias.col" correlated references -- see
+ * sql__substitute_outer_refs); pass NULL/whatever when a tree is known not
+ * to contain one (e.g. HAVING, where EXISTS is rejected at parse time). */
+static int sql__cond_tree_matches(KumDB *db, const char *outer_alias, const KdbRow *row, const SqlCondNode *node) {
     if (!node) return 1;
     switch (node->kind) {
         case SQL_COND_LEAF: {
@@ -1436,8 +1716,10 @@ static int sql__cond_tree_matches(const KdbRow *row, const SqlCondNode *node) {
             if (!sql__parse_row_cond(node->leaf_filter, &c)) return 0;
             return sql__row_cond_matches(row, &c);
         }
-        case SQL_COND_AND: return sql__cond_tree_matches(row, node->left) && sql__cond_tree_matches(row, node->right);
-        case SQL_COND_OR:  return sql__cond_tree_matches(row, node->left) || sql__cond_tree_matches(row, node->right);
+        case SQL_COND_AND: return sql__cond_tree_matches(db, outer_alias, row, node->left) && sql__cond_tree_matches(db, outer_alias, row, node->right);
+        case SQL_COND_OR:  return sql__cond_tree_matches(db, outer_alias, row, node->left) || sql__cond_tree_matches(db, outer_alias, row, node->right);
+        case SQL_COND_EXISTS:     return sql__eval_exists(db, outer_alias, row, node->leaf_filter, 0);
+        case SQL_COND_NOT_EXISTS: return sql__eval_exists(db, outer_alias, row, node->leaf_filter, 1);
         default: return 0;
     }
 }
@@ -1446,11 +1728,11 @@ static int sql__cond_tree_matches(const KdbRow *row, const SqlCondNode *node) {
  * memory, preserving order of the rows that stay. Used for HAVING and
  * post-JOIN/view/parenthesized WHERE, all of which need to filter an
  * already-materialized KdbRows rather than fetch from a stored table. */
-static void sql__filter_rows_tree(KdbRows *rows, const SqlCondNode *tree) {
+static void sql__filter_rows_tree(KumDB *db, const char *outer_alias, KdbRows *rows, const SqlCondNode *tree) {
     if (!rows || !tree) return;
     size_t kept = 0;
     for (size_t i = 0; i < rows->count; i++) {
-        if (sql__cond_tree_matches(&rows->rows[i], tree)) {
+        if (sql__cond_tree_matches(db, outer_alias, &rows->rows[i], tree)) {
             if (kept != i) rows->rows[kept] = rows->rows[i];
             kept++;
         } else {
@@ -2226,6 +2508,9 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
         if (!sql__ident_text(&p->cur, &aname)) return sql__err("expected an alias after AS");
         snprintf(alias1, sizeof(alias1), "%.255s", aname);
         sql__advance(p);
+    } else if (p->cur.type == SQLTOK_IDENT && !sql__is_clause_keyword(p->cur.text)) {
+        snprintf(alias1, sizeof(alias1), "%.255s", p->cur.text);
+        sql__advance(p);
     }
 
     SqlJoinClause joins[KDB_SQL_MAX_JOINS];
@@ -2269,6 +2554,9 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
             if (!sql__ident_text(&p->cur, &aname)) return sql__err("expected an alias after AS");
             snprintf(jc->alias, sizeof(jc->alias), "%.255s", aname);
             sql__advance(p);
+        } else if (p->cur.type == SQLTOK_IDENT && !sql__is_clause_keyword(p->cur.text)) {
+            snprintf(jc->alias, sizeof(jc->alias), "%.255s", p->cur.text);
+            sql__advance(p);
         }
 
         if (!sql__kw_is(&p->cur, "ON")) return sql__err("expected ON after JOIN %s", jc->table);
@@ -2290,7 +2578,7 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
 
     SqlCondNode *where_tree = NULL;
     int where_used_parens = 0;
-    if (!sql__parse_where_expr(p, db, &where_tree, &where_used_parens)) return kdb_last_status();
+    if (!sql__parse_where_expr(p, db, has_join ? NULL : alias1, &where_tree, &where_used_parens)) return kdb_last_status();
 
     char group_cols[KDB_SQL_MAX_GROUP_COLS][KDB_SQL_IDENT_BUF];
     int  ngroup_cols = 0;
@@ -2346,7 +2634,15 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
             sql__free_cond_node(where_tree);
             return sql__err("HAVING requires GROUP BY or an aggregate function -- use WHERE to filter plain columns");
         }
-        if (!sql__parse_having_expr(p, db, &having_tree, &having_used_parens)) { sql__free_cond_node(where_tree); return kdb_last_status(); }
+        /* HAVING conditions reference the SELECT list's own aliases (e.g.
+         * "total" from SUM(amount) AS total), never table-qualified --
+         * there's no query-alias unqualifying to do here. */
+        if (!sql__parse_having_expr(p, db, NULL, &having_tree, &having_used_parens)) { sql__free_cond_node(where_tree); return kdb_last_status(); }
+        if (sql__cond_tree_has_exists(having_tree)) {
+            sql__free_cond_node(where_tree);
+            sql__free_cond_node(having_tree);
+            return sql__err("EXISTS/NOT EXISTS isn't supported in HAVING yet -- HAVING filters aggregated aliases, not a real row to correlate against");
+        }
     }
 
     char *flat_filters[KDB_SQL_MAX_COND];
@@ -2371,7 +2667,7 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
                                              &all, &needs_filtering);
         sql__free_filters(flat_filters, nfilt);
         if (fst != KDB_OK) { sql__free_cond_node(where_tree); sql__free_cond_node(having_tree); return fst; }
-        if (needs_filtering) sql__filter_rows_tree(all, where_tree);
+        if (needs_filtering) sql__filter_rows_tree(db, alias1, all, where_tree);
         sql__free_cond_node(where_tree);
 
         KdbRows *agg = NULL;
@@ -2379,7 +2675,7 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
         kdb_rows_free(all);
         if (ast != KDB_OK) { sql__free_cond_node(having_tree); return ast; }
 
-        sql__filter_rows_tree(agg, having_tree);
+        sql__filter_rows_tree(db, alias1, agg, having_tree);
         sql__free_cond_node(having_tree);
         if (distinct) sql__dedupe_rows(agg);
 
@@ -2396,7 +2692,7 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
                                              &rows, &needs_filtering);
         sql__free_filters(flat_filters, nfilt);
         if (fst != KDB_OK) { sql__free_cond_node(where_tree); return fst; }
-        if (needs_filtering) sql__filter_rows_tree(rows, where_tree);
+        if (needs_filtering) sql__filter_rows_tree(db, alias1, rows, where_tree);
         sql__free_cond_node(where_tree);
     }
 
@@ -2560,7 +2856,7 @@ static int sql__resolve_where_to_id_filter(KumDB *db, const char *table_name, co
     *filter_out = NULL;
     KdbRows *all = kdb_find_ex(db, table_name, NULL, NULL);
     if (!all) return 0;
-    sql__filter_rows_tree(all, tree);
+    sql__filter_rows_tree(db, table_name, all, tree); /* UPDATE/DELETE have no AS syntax -- table_name is the only alias EXISTS could correlate against */
     if (all->count == 0) { kdb_rows_free(all); return 1; }
 
     size_t need = 8 + all->count * 24;
@@ -2606,7 +2902,7 @@ static KdbStatus sql__exec_update(SqlParser *p, KumDB *db, size_t *affected_out)
 
     SqlCondNode *where_tree = NULL;
     int used_parens = 0;
-    if (!sql__parse_where_expr(p, db, &where_tree, &used_parens)) return kdb_last_status();
+    if (!sql__parse_where_expr(p, db, table_name, &where_tree, &used_parens)) return kdb_last_status();
 
     KdbField patch[KDB_SQL_MAX_COLUMNS + 1];
     for (uint32_t i = 0; i < nset; i++) {
@@ -2659,7 +2955,7 @@ static KdbStatus sql__exec_delete(SqlParser *p, KumDB *db, size_t *affected_out)
 
     SqlCondNode *where_tree = NULL;
     int used_parens = 0;
-    if (!sql__parse_where_expr(p, db, &where_tree, &used_parens)) return kdb_last_status();
+    if (!sql__parse_where_expr(p, db, table_name, &where_tree, &used_parens)) return kdb_last_status();
 
     size_t deleted = 0;
     KdbStatus st;
