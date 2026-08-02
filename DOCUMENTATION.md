@@ -318,7 +318,8 @@ DROP TABLE t
 CREATE VIEW v AS SELECT ...
 DROP VIEW v
 
-INSERT INTO t (col, ...) VALUES (val, ...)
+INSERT INTO t (col, ...) VALUES (val, ...) [, (val, ...)]*
+INSERT INTO t (col, ...) SELECT ...
 
 [WITH name AS (SELECT ...) [, name2 AS (SELECT ...)]*]
 SELECT [DISTINCT] * | item, ... FROM t | (SELECT ...) [[AS] alias]
@@ -339,6 +340,24 @@ both stripped like whitespace, anywhere a token could otherwise start. An
 unterminated `/*` just eats to the end of the string rather than erroring
 on the comment itself — you'll get whatever "ran out of input mid-
 statement" error the missing content after it would've caused anyway.
+
+**`INSERT`** always needs an explicit column list — `INSERT INTO t (a, b)
+VALUES (...)`, never a bare `INSERT INTO t VALUES (...)`. `VALUES` accepts
+more than one comma-separated tuple in one statement — `VALUES (1, 'a'),
+(2, 'b'), (3, 'c')` — each inserted as its own row, in order; if one
+partway through fails (a uniqueness violation, say), whatever came before
+it stays inserted rather than rolling back the whole statement, since
+there's no implicit per-statement transaction wrapping here (wrap it in
+an explicit transaction yourself if that matters). `INSERT INTO t (a, b)
+SELECT ...` inserts one row per row the `SELECT` returns instead, matching
+its projected columns to `(a, b)` by position, not by name — the column
+counts must match, checked before anything is inserted. Same no-rollback
+behavior if a row partway through the `SELECT`'s results fails to insert.
+
+```sql
+INSERT INTO sales (region, amount) VALUES ('east', 100.0), ('west', 50.0)
+INSERT INTO archive (name, total) SELECT name, SUM(amount) FROM sales GROUP BY name
+```
 
 **`ORDER BY`** (the top-level clause, after `GROUP BY`/`UNION`/etc, not
 `OVER`'s own `ORDER BY`) takes one or more comma-separated columns, each

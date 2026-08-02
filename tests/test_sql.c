@@ -69,6 +69,79 @@ static void test_create_insert_select(void) {
     teardown(db);
 }
 
+static void test_multi_row_insert_and_insert_select(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (name TEXT, age INT)"));
+
+    KdbRows *rows = NULL;
+    size_t affected = 0;
+
+    /* multi-row VALUES */
+    ASSERT_OK(kdb_exec_sql(db,
+        "INSERT INTO t (name, age) VALUES ('alice', 30), ('bob', 25), ('carol', 40)",
+        NULL, &affected));
+    ASSERT_EQ(affected, 3u);
+    ASSERT_EQ(kdb_count(db, "t", NULL), 3);
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name, age FROM t ORDER BY name ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        const char *n0 = NULL, *n1 = NULL, *n2 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &n0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "name", &n1));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[2], "name", &n2));
+        ASSERT_STR(n0, "alice");
+        ASSERT_STR(n1, "bob");
+        ASSERT_STR(n2, "carol");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* a mismatched tuple in a multi-row VALUES list is rejected */
+    ASSERT_ERR(sql(db, "INSERT INTO t (name, age) VALUES ('dan', 22), ('eve')"));
+
+    /* INSERT ... SELECT, filtered */
+    ASSERT_OK(sql(db, "CREATE TABLE t2 (n TEXT, a INT)"));
+    affected = 0;
+    ASSERT_OK(kdb_exec_sql(db, "INSERT INTO t2 (n, a) SELECT name, age FROM t WHERE age > 26", NULL, &affected));
+    ASSERT_EQ(affected, 2u); /* alice (30), carol (40) -- not bob (25) */
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT n, a FROM t2 ORDER BY n ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const char *n0 = NULL;
+        int64_t a0 = 0;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "n", &n0));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "a", &a0));
+        ASSERT_STR(n0, "alice");
+        ASSERT_EQ(a0, 30);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* INSERT ... SELECT with an aggregate source */
+    ASSERT_OK(sql(db, "CREATE TABLE counts (label TEXT, cnt INT)"));
+    affected = 0;
+    ASSERT_OK(kdb_exec_sql(db, "INSERT INTO counts (label, cnt) SELECT name, age FROM t WHERE name = 'alice'", NULL, &affected));
+    ASSERT_EQ(affected, 1u);
+
+    /* column count mismatch between the target list and the SELECT's
+     * projected columns is rejected, nothing inserted */
+    ASSERT_ERR(sql(db, "INSERT INTO t2 (n, a) SELECT name FROM t"));
+    ASSERT_EQ(kdb_count(db, "t2", NULL), 2); /* unchanged from before */
+
+    /* zero matching rows -- 0 affected, not an error */
+    affected = 999;
+    ASSERT_OK(kdb_exec_sql(db, "INSERT INTO t2 (n, a) SELECT name, age FROM t WHERE age > 1000", NULL, &affected));
+    ASSERT_EQ(affected, 0u);
+
+    /* single-row INSERT still works unchanged */
+    affected = 0;
+    ASSERT_OK(kdb_exec_sql(db, "INSERT INTO t (name, age) VALUES ('zed', 99)", NULL, &affected));
+    ASSERT_EQ(affected, 1u);
+
+    teardown(db);
+}
+
 static void test_projection(void) {
     KumDB *db;
     setup(&db);
@@ -2147,6 +2220,7 @@ int main(void) {
     printf("=== test_sql ===\n");
 
     test_create_insert_select();
+    test_multi_row_insert_and_insert_select();
     test_projection();
     test_limit_offset();
     test_multi_column_order_by();

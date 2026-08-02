@@ -1310,36 +1310,99 @@ static KdbStatus sql__exec_insert(SqlParser *p, KumDB *db, size_t *affected_out)
     if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing the INSERT column list");
     sql__advance(p);
 
-    if (!sql__kw_is(&p->cur, "VALUES")) return sql__err("expected VALUES after the column list for '%s'", table_name);
-    sql__advance(p);
-    if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after VALUES");
+    /* INSERT INTO t (cols) SELECT ... -- runs the sub-SELECT fully (same
+     * "no caching" pattern every other query-consuming path here uses),
+     * then adds one row per result row, matching the SELECT's projected
+     * columns to (cols) positionally, not by name -- same convention
+     * VALUES's tuples already use. Each source field's value is borrowed
+     * directly (no copy) for the one kdb_add call that needs it, exactly
+     * like VALUES's tokens are -- kdb_add deep-copies into storage
+     * itself, so nothing here ever owns a heap pointer that needs
+     * freeing. A row whose column count doesn't match (cols) fails the
+     * whole statement before anything is inserted; a per-row kdb_add
+     * failure partway through (e.g. a uniqueness/type violation) leaves
+     * whatever already succeeded committed rather than rolling back --
+     * same no-automatic-rollback behavior a failing row partway through a
+     * multi-row VALUES list below already has, this file has no implicit
+     * per-statement transaction wrapping either way. */
+    if (sql__kw_is(&p->cur, "SELECT")) {
+        KdbRows *rows = NULL;
+        KdbStatus st = sql__exec_select_stmt(p, db, &rows);
+        if (st != KDB_OK) return st;
+
+        size_t affected = 0;
+        for (size_t r = 0; r < rows->count; r++) {
+            KdbRow *row = &rows->rows[r];
+            if (row->field_count != ncols) {
+                uint32_t got = row->field_count; /* read before freeing rows -- row points into it */
+                kdb_rows_free(rows);
+                if (affected_out) *affected_out = affected;
+                return sql__err("INSERT ... SELECT column count (%u) doesn't match the SELECT's column count (%u)",
+                                 ncols, got);
+            }
+            KdbField fields[KDB_SQL_MAX_COLUMNS + 1];
+            for (uint32_t i = 0; i < ncols; i++) {
+                fields[i].name = col_names[i];
+                fields[i].type = row->fields[i].type;
+                fields[i].v    = row->fields[i].v;
+            }
+            fields[ncols] = kdb_field_end();
+
+            st = kdb_add(db, table_name, fields);
+            if (st != KDB_OK) break;
+            affected++;
+        }
+        kdb_rows_free(rows);
+        if (affected_out) *affected_out = affected;
+        return st;
+    }
+
+    if (!sql__kw_is(&p->cur, "VALUES")) return sql__err("expected VALUES or SELECT after the column list for '%s'", table_name);
     sql__advance(p);
 
-    SqlToken value_toks[KDB_SQL_MAX_COLUMNS];
-    uint32_t nvals = 0;
+    /* One or more comma-separated (val, val, ...) tuples -- each is
+     * inserted as soon as it's parsed rather than buffered up front, so
+     * there's no separate cap on how many rows one statement can carry
+     * (only the per-row column cap already existed). Same no-automatic-
+     * rollback behavior as INSERT ... SELECT above if a row partway
+     * through fails. */
+    size_t affected = 0;
     for (;;) {
-        if (nvals >= KDB_SQL_MAX_COLUMNS) return sql__err("too many values (max %d)", KDB_SQL_MAX_COLUMNS);
-        value_toks[nvals++] = p->cur;
+        if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after VALUES");
         sql__advance(p);
+
+        SqlToken value_toks[KDB_SQL_MAX_COLUMNS];
+        uint32_t nvals = 0;
+        for (;;) {
+            if (nvals >= KDB_SQL_MAX_COLUMNS) return sql__err("too many values (max %d)", KDB_SQL_MAX_COLUMNS);
+            value_toks[nvals++] = p->cur;
+            sql__advance(p);
+            if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+            break;
+        }
+        if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing the VALUES list");
+        sql__advance(p);
+
+        if (ncols != nvals)
+            return sql__err("column count (%u) doesn't match value count (%u) for '%s'", ncols, nvals, table_name);
+
+        KdbField fields[KDB_SQL_MAX_COLUMNS + 1];
+        for (uint32_t i = 0; i < ncols; i++) {
+            if (!sql__value_to_field(col_names[i], &value_toks[i], &fields[i]))
+                return sql__err("unsupported value for column '%s'", col_names[i]);
+        }
+        fields[ncols] = kdb_field_end();
+
+        KdbStatus st = kdb_add(db, table_name, fields);
+        if (st != KDB_OK) { if (affected_out) *affected_out = affected; return st; }
+        affected++;
+
         if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
         break;
     }
-    if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing the VALUES list");
-    sql__advance(p);
 
-    if (ncols != nvals)
-        return sql__err("column count (%u) doesn't match value count (%u) for '%s'", ncols, nvals, table_name);
-
-    KdbField fields[KDB_SQL_MAX_COLUMNS + 1];
-    for (uint32_t i = 0; i < ncols; i++) {
-        if (!sql__value_to_field(col_names[i], &value_toks[i], &fields[i]))
-            return sql__err("unsupported value for column '%s'", col_names[i]);
-    }
-    fields[ncols] = kdb_field_end();
-
-    KdbStatus st = kdb_add(db, table_name, fields);
-    if (st == KDB_OK && affected_out) *affected_out = 1;
-    return st;
+    if (affected_out) *affected_out = affected;
+    return KDB_OK;
 }
 
 /* Recursively frees a single field's owned memory (name, plus whatever the

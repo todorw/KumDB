@@ -22,7 +22,8 @@ extern "C" {
  *   DROP TABLE t
  *   CREATE VIEW v AS SELECT ...
  *   DROP VIEW v
- *   INSERT INTO t (col, ...) VALUES (val, ...)
+ *   INSERT INTO t (col, ...) VALUES (val, ...) [, (val, ...)]*
+ *   INSERT INTO t (col, ...) SELECT ...
  *   [WITH name AS (SELECT ...) [, name2 AS (SELECT ...)]*]
  *   SELECT [DISTINCT] * | item, ... FROM t [[AS] alias]
  *                               [[INNER|LEFT [OUTER]|RIGHT [OUTER]|FULL [OUTER]|CROSS] JOIN t2 [[AS] alias2] [ON a.col OP (b.col|literal) [AND ...]]]*
@@ -34,6 +35,16 @@ extern "C" {
  *                               [LIMIT n [OFFSET m]]
  *   UPDATE t SET col = val, ... [WHERE cond [AND|OR cond ...]]
  *   DELETE FROM t [WHERE cond [AND|OR cond ...]]
+ *
+ * INSERT always needs an explicit column list, never a bare
+ * "INSERT INTO t VALUES (...)". VALUES accepts more than one
+ * comma-separated tuple in one statement, each inserted as its own row in
+ * order. INSERT INTO t (cols) SELECT ... inserts one row per SELECT
+ * result row instead, matching to (cols) by position (not name) -- column
+ * counts must match, checked before anything is inserted. Either form: a
+ * row partway through that fails to insert (a uniqueness violation, say)
+ * leaves whatever already succeeded committed rather than rolling back --
+ * no implicit per-statement transaction wrapping here.
  *
  * ORDER BY (top-level, not OVER's own) takes one or more comma-separated
  * columns, each with its own optional ASC/DESC, ties broken left to right
