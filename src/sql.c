@@ -1908,6 +1908,42 @@ static int sql__field_cmp_text(const KdbField *f, const char *text) {
     return SQL_CMP_INCOMPARABLE;
 }
 
+/* Same idea as sql__field_cmp_text, but comparing two fields directly --
+ * used by JOIN ON's column-vs-column theta comparisons, where
+ * "incomparable" (e.g. an int column against a string column) must fail
+ * every operator including =/!=, not silently compare equal the way
+ * sql__field_cmp (MIN/MAX's "won't replace the current extremum"
+ * tolerance) does. */
+static int sql__field_cmp_ex(const KdbField *a, const KdbField *b) {
+    if (!a || !b) return SQL_CMP_INCOMPARABLE;
+    double da, db;
+    if (sql__field_to_double(a, &da) && sql__field_to_double(b, &db)) {
+        if (da < db) return -1;
+        if (da > db) return 1;
+        return 0;
+    }
+    if (a->type == KDB_TYPE_STRING && b->type == KDB_TYPE_STRING)
+        return strcmp(a->v.as_string ? a->v.as_string : "", b->v.as_string ? b->v.as_string : "");
+    return SQL_CMP_INCOMPARABLE;
+}
+
+/* Applies a comparison-token operator to an sql__field_cmp_ex-style
+ * three-way result; SQL_CMP_INCOMPARABLE never matches, regardless of
+ * operator (same fail-closed rule sql__row_cond_matches's SQL_ROP_EQ/NEQ/
+ * etc already apply to sql__field_cmp_text's result). */
+static int sql__cmp_matches_op(int cmp, SqlTokType op) {
+    if (cmp == SQL_CMP_INCOMPARABLE) return 0;
+    switch (op) {
+        case SQLTOK_EQ:  return cmp == 0;
+        case SQLTOK_NEQ: return cmp != 0;
+        case SQLTOK_GT:  return cmp > 0;
+        case SQLTOK_GTE: return cmp >= 0;
+        case SQLTOK_LT:  return cmp < 0;
+        case SQLTOK_LTE: return cmp <= 0;
+        default:         return 0;
+    }
+}
+
 typedef enum {
     SQL_ROP_EQ, SQL_ROP_NEQ, SQL_ROP_GT, SQL_ROP_GTE, SQL_ROP_LT, SQL_ROP_LTE,
     SQL_ROP_BETWEEN, SQL_ROP_IN, SQL_ROP_LIKE, SQL_ROP_ISNULL, SQL_ROP_ISNOTNULL
@@ -3239,9 +3275,20 @@ static KdbStatus sql__compute_window_functions(KdbRows *rows, SqlSelectItem *ite
 #define KDB_SQL_MAX_JOIN_COND 8
 #define KDB_SQL_MAX_JOINS     4
 
+/* One ON condition: "left OP (right_col | literal)". right_is_col picks
+ * which of right_col/right_lit_* is meaningful. The literal form is kept
+ * as a raw token (type + text) rather than a real KdbField so this stays
+ * plain-old-data -- SqlJoinClause is stack-allocated with no cleanup path
+ * anywhere it's used, same reasoning SqlSelectItem's POD constraint
+ * follows elsewhere in this file; sql__value_to_field() turns it into a
+ * real (non-owning) KdbField fresh at match time instead. */
 typedef struct {
-    char left[KDB_SQL_IDENT_BUF];
-    char right[KDB_SQL_IDENT_BUF];
+    char        left[KDB_SQL_IDENT_BUF];
+    SqlTokType  op; /* SQLTOK_EQ/NEQ/GT/GTE/LT/LTE */
+    int         right_is_col;
+    char        right_col[KDB_SQL_IDENT_BUF];       /* right_is_col */
+    SqlTokType  right_lit_type;                      /* !right_is_col: SQLTOK_NUMBER/STRING/IDENT */
+    char        right_lit_text[KDB_SQL_IDENT_BUF];   /* !right_is_col */
 } SqlJoinCond;
 
 typedef enum { SQL_JOIN_INNER, SQL_JOIN_LEFT, SQL_JOIN_RIGHT, SQL_JOIN_FULL, SQL_JOIN_CROSS } SqlJoinKind;
@@ -3260,10 +3307,15 @@ typedef struct {
     int         ncond;
 } SqlJoinClause;
 
-/* ON is a conjunction of col = col equalities only -- no OR, no comparing
- * to a literal. That's what WHERE (applied after the join, over the
- * qualified combined rows) is for. Both sides are expected to already be
- * table-qualified ("alias.col"), same as everywhere else after a JOIN. */
+/* ON is a conjunction of comparisons (=, !=, >, >=, <, <=) -- no OR. The
+ * right-hand side of each is either another column reference or a
+ * literal (number/string/true/false) -- a real theta join, not just
+ * equi-join. There's no dedicated NULL literal here (same as WHERE:
+ * comparing to NULL wants IS [NOT] NULL, not =/!=, and ON doesn't
+ * special-case it either). Left is always expected to already be
+ * table-qualified ("alias.col"), same as everywhere else after a JOIN --
+ * a right-hand column reference is too, whenever it's a column and not a
+ * literal. */
 static int sql__parse_join_on(SqlParser *p, SqlJoinCond conds[KDB_SQL_MAX_JOIN_COND], int *count_out) {
     int n = 0;
     for (;;) {
@@ -3273,19 +3325,46 @@ static int sql__parse_join_on(SqlParser *p, SqlJoinCond conds[KDB_SQL_MAX_JOIN_C
         snprintf(left, sizeof(left), "%.255s", lc);
         sql__advance(p);
 
-        if (p->cur.type != SQLTOK_EQ) {
-            sql__err("ON only supports col = col equality (unexpected token after '%s')", left);
-            return 0;
+        SqlTokType op;
+        switch (p->cur.type) {
+            case SQLTOK_EQ: case SQLTOK_NEQ: case SQLTOK_GT:
+            case SQLTOK_GTE: case SQLTOK_LT: case SQLTOK_LTE:
+                op = p->cur.type;
+                break;
+            default:
+                sql__err("expected a comparison operator in ON (unexpected token after '%s')", left);
+                return 0;
         }
         sql__advance(p);
 
-        const char *rc;
-        if (!sql__ident_text(&p->cur, &rc)) { sql__err("expected a column reference after '=' in ON"); return 0; }
         if (n >= KDB_SQL_MAX_JOIN_COND) { sql__err("too many ON conditions (max %d)", KDB_SQL_MAX_JOIN_COND); return 0; }
-        snprintf(conds[n].left,  sizeof(conds[n].left),  "%s",    left);
-        snprintf(conds[n].right, sizeof(conds[n].right), "%.255s", rc);
+        snprintf(conds[n].left, sizeof(conds[n].left), "%s", left);
+        conds[n].op = op;
+
+        /* A literal is NUMBER/STRING outright, or a bare (no-dot) true/
+         * false -- true/false WITH a dot ("t.true") is a column named
+         * "true" instead, vanishingly unlikely but handled correctly by
+         * just checking for the dot first. Anything else is a column
+         * reference. */
+        if (p->cur.type == SQLTOK_NUMBER || p->cur.type == SQLTOK_STRING) {
+            conds[n].right_is_col = 0;
+            conds[n].right_lit_type = p->cur.type;
+            snprintf(conds[n].right_lit_text, sizeof(conds[n].right_lit_text), "%.255s", p->cur.text);
+            sql__advance(p);
+        } else if (p->cur.type == SQLTOK_IDENT && !strchr(p->cur.text, '.') &&
+                   (strcasecmp(p->cur.text, "true") == 0 || strcasecmp(p->cur.text, "false") == 0)) {
+            conds[n].right_is_col = 0;
+            conds[n].right_lit_type = SQLTOK_IDENT;
+            snprintf(conds[n].right_lit_text, sizeof(conds[n].right_lit_text), "%.255s", p->cur.text);
+            sql__advance(p);
+        } else {
+            const char *rc;
+            if (!sql__ident_text(&p->cur, &rc)) { sql__err("expected a column reference or literal after the operator in ON"); return 0; }
+            conds[n].right_is_col = 1;
+            snprintf(conds[n].right_col, sizeof(conds[n].right_col), "%.255s", rc);
+            sql__advance(p);
+        }
         n++;
-        sql__advance(p);
 
         if (sql__kw_is(&p->cur, "AND")) { sql__advance(p); continue; }
         break;
@@ -3513,9 +3592,22 @@ static KdbStatus sql__build_joined_rows_multi(KumDB *db, const char *table1, con
 
                 int on_ok = 1;
                 for (int c = 0; c < jc->ncond; c++) {
-                    const KdbField *lf = kdb_row_get(&combo, jc->conds[c].left);
-                    const KdbField *rf = kdb_row_get(&combo, jc->conds[c].right);
-                    if (!lf || !rf || !sql__field_equal(lf, rf)) { on_ok = 0; break; }
+                    const SqlJoinCond *jcond = &jc->conds[c];
+                    const KdbField *lf = kdb_row_get(&combo, jcond->left);
+                    const KdbField *rf;
+                    KdbField rf_lit;
+                    SqlToken lit_tok; /* declared here, not inside the branch below --
+                                        * rf_lit.v.as_string (for a STRING literal) points
+                                        * straight into lit_tok.text, which must outlive
+                                        * the sql__cmp_matches_op call using rf later */
+                    if (jcond->right_is_col) {
+                        rf = kdb_row_get(&combo, jcond->right_col);
+                    } else {
+                        lit_tok.type = jcond->right_lit_type;
+                        snprintf(lit_tok.text, sizeof(lit_tok.text), "%s", jcond->right_lit_text);
+                        rf = sql__value_to_field(NULL, &lit_tok, &rf_lit) ? &rf_lit : NULL;
+                    }
+                    if (!sql__cmp_matches_op(sql__field_cmp_ex(lf, rf), jcond->op)) { on_ok = 0; break; }
                 }
 
                 if (!on_ok) { sql__free_row_fields(&combo); continue; }

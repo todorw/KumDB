@@ -857,6 +857,75 @@ static void test_outer_joins(void) {
     teardown(db);
 }
 
+static void test_theta_join(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE emp (name TEXT, salary INT, active BOOL)"));
+    ASSERT_OK(sql(db, "CREATE TABLE band (label TEXT, lo INT, hi INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO emp (name, salary, active) VALUES ('alice', 50, true)"));
+    ASSERT_OK(sql(db, "INSERT INTO emp (name, salary, active) VALUES ('bob', 120, false)"));
+    ASSERT_OK(sql(db, "INSERT INTO emp (name, salary, active) VALUES ('carol', 80, true)"));
+    ASSERT_OK(sql(db, "INSERT INTO band (label, lo, hi) VALUES ('low', 0, 60)"));
+    ASSERT_OK(sql(db, "INSERT INTO band (label, lo, hi) VALUES ('mid', 60, 100)"));
+    ASSERT_OK(sql(db, "INSERT INTO band (label, lo, hi) VALUES ('high', 100, 200)"));
+
+    KdbRows *rows = NULL;
+
+    /* range-band theta join: salary >= lo AND salary < hi */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT e.name, b.label FROM emp e JOIN band b ON e.salary >= b.lo AND e.salary < b.hi ORDER BY e.name ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        const char *l0 = NULL, *l1 = NULL, *l2 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "b.label", &l0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "b.label", &l1));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[2], "b.label", &l2));
+        ASSERT_STR(l0, "low");   /* alice */
+        ASSERT_STR(l1, "high");  /* bob */
+        ASSERT_STR(l2, "mid");   /* carol */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* boolean literal comparison in ON */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT e.name FROM emp e JOIN band b ON e.active = true AND e.salary >= b.lo AND e.salary < b.hi",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u); /* alice, carol -- bob is inactive */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* != operator against a string literal */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT e.name FROM emp e JOIN band b ON b.label != 'mid' AND e.salary >= b.lo AND e.salary < b.hi",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u); /* alice(low), bob(high) -- carol's mid band excluded */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* LEFT JOIN with a theta ON that never matches -- every row still
+     * appears once, padded */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT e.name, b.label FROM emp e LEFT JOIN band b ON b.lo > 1000",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        const KdbField *label_f = kdb_row_get(&rows->rows[0], "b.label");
+        ASSERT(label_f && label_f->type == KDB_TYPE_NULL);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* equi-join still works unchanged */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT e.name FROM emp e JOIN band b ON b.label = 'low' AND e.salary >= b.lo AND e.salary < b.hi",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* an unsupported operator in ON (LIKE) errors cleanly */
+    ASSERT_ERR(sql(db, "SELECT * FROM emp e JOIN band b ON e.salary LIKE b.lo"));
+
+    teardown(db);
+}
+
 static void test_join_chain(void) {
     KumDB *db;
     setup(&db);
@@ -1924,6 +1993,7 @@ int main(void) {
     test_subqueries();
     test_join();
     test_outer_joins();
+    test_theta_join();
     test_join_chain();
     test_bare_alias();
     test_exists();

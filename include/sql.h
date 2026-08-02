@@ -25,7 +25,7 @@ extern "C" {
  *   INSERT INTO t (col, ...) VALUES (val, ...)
  *   [WITH name AS (SELECT ...) [, name2 AS (SELECT ...)]*]
  *   SELECT [DISTINCT] * | item, ... FROM t [[AS] alias]
- *                               [[INNER|LEFT [OUTER]] JOIN t2 [[AS] alias2] ON a.col = b.col [AND ...]]*
+ *                               [[INNER|LEFT [OUTER]|RIGHT [OUTER]|FULL [OUTER]|CROSS] JOIN t2 [[AS] alias2] [ON a.col OP (b.col|literal) [AND ...]]]*
  *                               [WHERE cond [AND|OR cond ...]]
  *                               [GROUP BY col, ...]
  *                               [HAVING cond [AND|OR cond ...]]
@@ -89,9 +89,11 @@ extern "C" {
  * on qualified columns, same as anything else there.
  *
  * JOIN (INNER, LEFT [OUTER], RIGHT [OUTER], FULL [OUTER], or CROSS)
- * matches rows via a conjunction of col = col equalities in ON (no OR, no
- * comparing to a literal there -- that's what WHERE, applied after the
- * join, is for). INNER (the default) drops unmatched rows; LEFT keeps
+ * matches rows via a conjunction of comparisons in ON -- =, !=, >, >=, <,
+ * <=, each between two columns or a column and a literal (number/string/
+ * true/false), a real theta join rather than just equi-join. Still no OR
+ * in ON -- that's what WHERE, applied after the join, is for. INNER (the
+ * default) drops unmatched rows; LEFT keeps
  * every row accumulated so far, padding an unmatched one with NULL for
  * the new table's columns; RIGHT is the mirror (keeps every row of the
  * new table, padding NULL for everything accumulated so far); FULL does

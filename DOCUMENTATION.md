@@ -322,7 +322,7 @@ INSERT INTO t (col, ...) VALUES (val, ...)
 
 [WITH name AS (SELECT ...) [, name2 AS (SELECT ...)]*]
 SELECT [DISTINCT] * | item, ... FROM t | (SELECT ...) [[AS] alias]
-    [[INNER|LEFT [OUTER]|RIGHT [OUTER]|FULL [OUTER]|CROSS] JOIN t2 [[AS] alias2] [ON a.col = b.col [AND ...]]]*
+    [[INNER|LEFT [OUTER]|RIGHT [OUTER]|FULL [OUTER]|CROSS] JOIN t2 [[AS] alias2] [ON a.col OP (b.col|literal) [AND ...]]]*
     [WHERE cond [AND|OR cond ...]]
     [GROUP BY col, ...]
     [HAVING cond [AND|OR cond ...]]
@@ -430,9 +430,11 @@ uses). Not supported in `HAVING` — it filters aggregated aliases like
 `total` from `SUM(amount) AS total`, not a real row to correlate against.
 
 **`JOIN`** (`INNER`/`LEFT [OUTER]`/`RIGHT [OUTER]`/`FULL [OUTER]`/`CROSS`)
-matches rows via `ON`, a conjunction of `col = col` equalities — no `OR`,
-no comparing to a literal in `ON` (that's what `WHERE`, applied after the
-join, is for). `INNER` (the default) drops unmatched rows; `LEFT` keeps
+matches rows via `ON`, a conjunction of comparisons — `=`, `!=`, `>`,
+`>=`, `<`, `<=` — between two columns, or a column and a literal
+(number/string/`true`/`false`): a real theta join, not just an equi-join.
+Still no `OR` in `ON` (that's what `WHERE`, applied after the join, is
+for). `INNER` (the default) drops unmatched rows; `LEFT` keeps
 every row from everything accumulated so far, padding an unmatched one
 with `NULL` for the new table's columns; `RIGHT` is the mirror — keeps
 every row of the new table, padding `NULL` for every column accumulated
@@ -458,6 +460,11 @@ SELECT u.name, o.item, r.stars
     FROM users AS u
     JOIN orders AS o ON u.id = o.user_id
     LEFT JOIN reviews AS r ON o.item = r.order_item
+
+-- theta join: band membership by range, plus a literal comparison
+SELECT e.name, b.label
+    FROM emp AS e
+    JOIN band AS b ON e.salary >= b.lo AND e.salary < b.hi AND e.active = true
 ```
 
 Every column reference anywhere after a `JOIN` — the `SELECT` list, `ON`,
