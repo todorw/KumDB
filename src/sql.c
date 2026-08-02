@@ -902,6 +902,102 @@ static KdbStatus sql__exec_drop_view(SqlParser *p, KumDB *db) {
     return kdb_delete(db, KDB_VIEWS_TABLE, filters, &deleted);
 }
 
+#define KDB_SQL_MAX_CTES 8
+
+/* WITH name AS (SELECT ...) [, name2 AS (SELECT ...)]* SELECT ... --
+ * implemented as temporary views: each CTE gets inserted into the exact
+ * same registry CREATE VIEW uses (validated by actually running it, same
+ * as CREATE VIEW), the main SELECT runs with them fully resolvable as
+ * regular views (a later CTE can reference an earlier one this way, for
+ * free), and every one of them gets deleted again before returning --
+ * success or failure, hence the single goto-cleanup exit instead of this
+ * file's usual early-return style; there's no other way to guarantee
+ * cleanup runs on every path without duplicating it at each one. Not
+ * recursive (no RECURSIVE keyword), and only ever precedes a SELECT --
+ * WITH before UPDATE/DELETE/INSERT isn't supported. Same restrictions as
+ * a real view: can't be JOINed, no dot-referencing a CTE from within a
+ * sibling CTE's own body declared before it (only prior CTEs, already-
+ * inserted by the time a later one validates, are visible -- same
+ * ordering rule real non-recursive WITH uses). p is positioned right
+ * after "WITH" (already consumed by the caller). */
+static KdbStatus sql__exec_with_stmt(SqlParser *p, KumDB *db, KdbRows **rows_out) {
+    char cte_names[KDB_SQL_MAX_CTES][KDB_SQL_IDENT_BUF];
+    int n_ctes = 0;
+    KdbStatus st = KDB_ERR_SQL_SYNTAX;
+
+    for (;;) {
+        if (n_ctes >= KDB_SQL_MAX_CTES) { sql__err("too many CTEs (max %d)", KDB_SQL_MAX_CTES); goto done; }
+
+        const char *cname;
+        if (!sql__ident_text(&p->cur, &cname)) { sql__err("expected a CTE name after WITH"); goto done; }
+        char cte_name[KDB_SQL_IDENT_BUF];
+        snprintf(cte_name, sizeof(cte_name), "%.255s", cname);
+        sql__advance(p);
+
+        if (kdb_table_exists(db, cte_name)) { sql__err("'%s' is already a table -- can't use it as a CTE name", cte_name); goto done; }
+        if (sql__view_exists(db, cte_name)) { sql__err("'%s' is already a view -- can't use it as a CTE name", cte_name); goto done; }
+        for (int i = 0; i < n_ctes; i++) {
+            if (strcmp(cte_names[i], cte_name) == 0) { sql__err("CTE name '%s' used more than once", cte_name); goto done; }
+        }
+
+        if (!sql__kw_is(&p->cur, "AS")) { sql__err("expected AS after CTE name '%s'", cte_name); goto done; }
+        sql__advance(p);
+        if (p->cur.type != SQLTOK_LPAREN) { sql__err("expected '(' after WITH %s AS", cte_name); goto done; }
+        sql__advance(p);
+        if (!sql__kw_is(&p->cur, "SELECT")) { sql__err("expected a SELECT statement inside WITH %s AS (...)", cte_name); goto done; }
+
+        size_t start = p->lx.pos - strlen(p->cur.text);
+        if (sql__exec_select_stmt(p, db, NULL) != KDB_OK) goto done;
+
+        if (p->cur.type != SQLTOK_RPAREN) { sql__err("expected ')' closing WITH %s AS (...)", cte_name); goto done; }
+        size_t end = p->lx.pos - 1; /* p->cur is the ')' itself (empty token text, pos is 1 past it) */
+        while (end > start && isspace((unsigned char)p->lx.src[end - 1])) end--;
+        sql__advance(p); /* consume ')' */
+
+        size_t len = end - start;
+        if (len == 0) { sql__err("WITH %s's query is empty", cte_name); goto done; }
+        char query_text[KDB_MAX_STRING_LEN];
+        if (len >= sizeof(query_text)) len = sizeof(query_text) - 1;
+        memcpy(query_text, p->lx.src + start, len);
+        query_text[len] = '\0';
+
+        KdbField fields[] = {
+            kdb_field_string("name",  cte_name),
+            kdb_field_string("query", query_text),
+            kdb_field_end()
+        };
+        if (kdb_add(db, KDB_VIEWS_TABLE, fields) != KDB_OK) goto done;
+        snprintf(cte_names[n_ctes++], sizeof(cte_names[0]), "%s", cte_name);
+
+        if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+        break;
+    }
+
+    if (!sql__kw_is(&p->cur, "SELECT")) { sql__err("expected SELECT after WITH ... AS (...)"); goto done; }
+    st = sql__exec_select_stmt(p, db, rows_out);
+
+done:
+    for (int i = 0; i < n_ctes; i++) {
+        char filter_buf[KDB_SQL_IDENT_BUF + 8];
+        /* GCC's -Wformat-truncation loses cte_names[i]'s real bound once
+         * sql__exec_with_stmt is inlined into kdb_exec_sql at -O2 -- same
+         * well-known limitation as sql__append_qualified_fields's qname
+         * above and kdb__tx_backup_path in kumdb.c. */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
+        snprintf(filter_buf, sizeof(filter_buf), "name=%s", cte_names[i]);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+        const char *filters[] = { filter_buf, NULL };
+        size_t deleted = 0;
+        kdb_delete(db, KDB_VIEWS_TABLE, filters, &deleted);
+    }
+    return st;
+}
+
 static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
     sql__advance(p); /* CREATE */
     if (sql__kw_is(&p->cur, "VIEW")) {
@@ -2973,7 +3069,8 @@ KdbStatus kdb_exec_sql(KumDB *db, const char *sql, KdbRows **rows_out, size_t *a
     else if (sql__kw_is(&p.cur, "SELECT")) st = sql__exec_select_stmt(&p, db, rows_out);
     else if (sql__kw_is(&p.cur, "UPDATE")) st = sql__exec_update(&p, db, affected_out);
     else if (sql__kw_is(&p.cur, "DELETE")) st = sql__exec_delete(&p, db, affected_out);
-    else return sql__err("unrecognized statement -- expected CREATE, ALTER, DROP, INSERT, SELECT, UPDATE, or DELETE");
+    else if (sql__kw_is(&p.cur, "WITH"))   { sql__advance(&p); st = sql__exec_with_stmt(&p, db, rows_out); }
+    else return sql__err("unrecognized statement -- expected CREATE, ALTER, DROP, INSERT, SELECT, UPDATE, DELETE, or WITH");
 
     if (st != KDB_OK) return st;
 

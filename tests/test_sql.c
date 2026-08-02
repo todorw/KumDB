@@ -1097,6 +1097,69 @@ static void test_views(void) {
     teardown(db);
 }
 
+static void test_ctes(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE sales (region TEXT, amount FLOAT)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount) VALUES ('east', 100.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount) VALUES ('east', 50.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount) VALUES ('west', 30.0)"));
+
+    KdbRows *rows = NULL;
+
+    ASSERT_OK(kdb_exec_sql(db,
+        "WITH big AS (SELECT * FROM sales WHERE amount > 40) SELECT region FROM big ORDER BY region ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* CTE over an aggregate */
+    ASSERT_OK(kdb_exec_sql(db,
+        "WITH totals AS (SELECT region, SUM(amount) AS total FROM sales GROUP BY region) "
+        "SELECT region FROM totals WHERE total > 60",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *region = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "region", &region));
+        ASSERT_STR(region, "east");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* a later CTE can reference an earlier one */
+    ASSERT_OK(kdb_exec_sql(db,
+        "WITH t1 AS (SELECT * FROM sales WHERE region = 'east'), "
+        "t2 AS (SELECT region FROM t1 WHERE amount > 60) "
+        "SELECT * FROM t2",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* a CTE is scoped to its own statement -- gone afterward */
+    ASSERT_ERR(sql(db, "SELECT * FROM big"));
+
+    /* a CTE name colliding with a real table is rejected */
+    ASSERT_ERR(sql(db, "WITH sales AS (SELECT * FROM sales) SELECT * FROM sales"));
+
+    /* an error inside a CTE's body still cleans up (no leaked temp view) */
+    ASSERT_ERR(sql(db, "WITH bad AS (SELECT * FROM nosuchtable) SELECT * FROM bad"));
+    ASSERT_ERR(sql(db, "SELECT * FROM bad"));
+
+    /* forward reference (t2 declared before t1 it depends on) is rejected,
+     * not recursive WITH -- only prior CTEs are visible to a later one */
+    ASSERT_ERR(sql(db, "WITH t2 AS (SELECT * FROM t1), t1 AS (SELECT * FROM sales) SELECT * FROM t2"));
+
+    /* same statement runs cleanly a second time -- no leftover state from
+     * the first run's cleanup */
+    ASSERT_OK(kdb_exec_sql(db,
+        "WITH big AS (SELECT * FROM sales WHERE amount > 40) SELECT region FROM big ORDER BY region ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    teardown(db);
+}
+
 static void test_syntax_errors(void) {
     KumDB *db;
     setup(&db);
@@ -1144,6 +1207,7 @@ int main(void) {
     test_reserved_columns_skipped();
     test_drop_table();
     test_views();
+    test_ctes();
     test_syntax_errors();
 
     printf("passed=%d  failed=%d\n", passed, failed);

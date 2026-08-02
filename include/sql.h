@@ -20,6 +20,7 @@ extern "C" {
  *   CREATE VIEW v AS SELECT ...
  *   DROP VIEW v
  *   INSERT INTO t (col, ...) VALUES (val, ...)
+ *   [WITH name AS (SELECT ...) [, name2 AS (SELECT ...)]*]
  *   SELECT [DISTINCT] * | item, ... FROM t [[AS] alias]
  *                               [[INNER|LEFT [OUTER]] JOIN t2 [[AS] alias2] ON a.col = b.col [AND ...]]*
  *                               [WHERE cond [AND|OR cond ...]]
@@ -112,6 +113,14 @@ extern "C" {
  * kdb_list_tables()/the CLI's "tables" command like any other table
  * (querying it directly works fine, it's just not hidden), so don't name
  * a real table that.
+ *
+ * WITH name AS (SELECT ...) SELECT ... FROM name (a CTE) is a view scoped
+ * to one statement instead of persisted -- same validate-immediately/
+ * re-run-fresh/no-JOIN behavior as CREATE VIEW, gone the moment the
+ * statement finishes either way. Chain more with a comma; a later one can
+ * reference an earlier one (each validated and made visible in
+ * declaration order), never the reverse and never itself -- no RECURSIVE.
+ * Only ever precedes a SELECT, not UPDATE/DELETE/INSERT.
  *
  * Types: INT/INTEGER, FLOAT/REAL/DOUBLE, BOOL/BOOLEAN, TEXT/STRING/VARCHAR,
  * BLOB. VARCHAR(n)/CHAR(n) length specs are accepted and ignored (KumDB

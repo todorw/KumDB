@@ -320,6 +320,7 @@ DROP VIEW v
 
 INSERT INTO t (col, ...) VALUES (val, ...)
 
+[WITH name AS (SELECT ...) [, name2 AS (SELECT ...)]*]
 SELECT [DISTINCT] * | item, ... FROM t [[AS] alias]
     [[INNER|LEFT [OUTER]] JOIN t2 [[AS] alias2] ON a.col = b.col [AND ...]]*
     [WHERE cond [AND|OR cond ...]]
@@ -532,6 +533,28 @@ not supported yet. Views are stored as rows in a reserved internal table,
 `__kumdb_views__`; it'll show up in `kdb_list_tables()`/the CLI's `tables`
 command like any other table (querying it directly works fine, it's just
 not hidden), so don't name a real table that.
+
+**`WITH name AS (SELECT ...) SELECT ... FROM name`** (a CTE) is a view
+scoped to one statement instead of persisted -- same validate-immediately
+and re-run-fresh-every-time behavior as `CREATE VIEW`, same `JOIN`
+restriction, gone the moment the statement finishes (success or error):
+
+```sql
+WITH big_orders AS (SELECT * FROM orders WHERE amount > 1000)
+SELECT customer, amount FROM big_orders ORDER BY amount DESC
+```
+
+Chain more than one with a comma; a later one can reference an earlier
+one (each is validated and made visible in declaration order), but not
+the other way around, and not itself -- no `RECURSIVE`:
+
+```sql
+WITH regional AS (SELECT region, amount FROM sales WHERE region = 'east'),
+     totals   AS (SELECT region, SUM(amount) AS total FROM regional GROUP BY region)
+SELECT region FROM totals WHERE total > 10000
+```
+
+`WITH` only ever precedes a `SELECT` -- not `UPDATE`/`DELETE`/`INSERT`.
 
 ```sql
 CREATE TABLE sales (region TEXT, amount FLOAT)
