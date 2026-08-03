@@ -101,11 +101,18 @@ KdbStatus kdb_delete(KumDB      *db,
  *
  *   - Rollback: kdb_tx_rollback() undoes every change the transaction
  *     made, across however many tables it touched.
+ *   - Savepoints: kdb_tx_savepoint()/kdb_tx_rollback_to_savepoint()/
+ *     kdb_tx_release_savepoint() nest checkpoints within a transaction --
+ *     undo back to one without ending the whole transaction, or discard
+ *     one without undoing anything. See KdbSavepoint below.
  *   - Crash safety: if the process dies anywhere between kdb_tx_begin()
  *     and a completed kdb_tx_commit(), the next kdb_open() (read-write)
  *     automatically finishes the job -- either rolling back an
  *     interrupted transaction, or finishing cleanup of one that had
- *     already committed. A table is never left half-migrated.
+ *     already committed. A table is never left half-migrated (this
+ *     covers savepoints too -- any of their own leftover backup files
+ *     are just orphaned garbage after a crash either way, and get
+ *     cleaned up the same pass).
  *
  * How: the first time a transaction touches a table, it backs up that
  * table's file (or, if the table didn't exist yet, remembers to drop it
@@ -127,6 +134,23 @@ KdbStatus kdb_delete(KumDB      *db,
  * full while writing the marker), tx is NOT freed -- nothing was lost,
  * retry the commit or roll back.
  */
+#define KDB_TX_MAX_SAVEPOINTS 8
+
+/* A named nested checkpoint within a transaction -- tracks, separately
+ * from the transaction's own whole-tx backups, every table first touched
+ * since THIS savepoint was created (own backup file each, suffixed by
+ * this savepoint's stack depth). A table touched under several nested
+ * savepoints gets a separate snapshot at each depth, each reflecting the
+ * data right before that depth's own first post-creation touch -- so
+ * rolling back to any one of them undoes exactly what happened from
+ * there on, including anything nested savepoints did in between. */
+typedef struct {
+    char     name[KDB_MAX_NAME_LEN];
+    char     tables[KDB_TX_MAX_TABLES][128];
+    uint8_t  is_new_table[KDB_TX_MAX_TABLES];
+    uint32_t table_count;
+} KdbSavepoint;
+
 typedef struct {
     KumDB   *db;
     char     tables[KDB_TX_MAX_TABLES][128];
@@ -134,6 +158,8 @@ typedef struct {
     uint32_t table_count;
     int      failed;
     int      active;
+    KdbSavepoint savepoints[KDB_TX_MAX_SAVEPOINTS];
+    uint32_t     savepoint_count;
 } KdbTx;
 
 KdbTx *kdb_tx_begin(KumDB *db);
@@ -145,6 +171,26 @@ KdbStatus kdb_tx_delete(KdbTx *tx, const char *table_name, const char **filters,
 
 KdbStatus kdb_tx_commit  (KdbTx *tx);
 KdbStatus kdb_tx_rollback(KdbTx *tx);
+
+/* Establishes a named nested checkpoint within tx, up to
+ * KDB_TX_MAX_SAVEPOINTS deep. Rejects a name already used by an active
+ * savepoint in this same transaction (no shadowing -- pick a different
+ * name instead). */
+KdbStatus kdb_tx_savepoint(KdbTx *tx, const char *name);
+
+/* Undoes every change made since the named savepoint was established
+ * (including anything done under savepoints nested inside it, which are
+ * discarded along with it), without ending the transaction -- tx is still
+ * open afterward, at exactly the state it was in when the savepoint was
+ * created, and the savepoint itself is still there to roll back to again
+ * or release. Clears tx's failed flag, same recovery-escape-hatch
+ * reasoning kdb_tx_rollback() (the whole-transaction form) already has. */
+KdbStatus kdb_tx_rollback_to_savepoint(KdbTx *tx, const char *name);
+
+/* Discards the named savepoint (and anything nested inside it) without
+ * undoing anything -- keeps every change made since it was created,
+ * just gives up the ability to roll back to that specific point. */
+KdbStatus kdb_tx_release_savepoint(KdbTx *tx, const char *name);
 
 KdbStatus kdb_drop_table  (KumDB *db, const char *table_name);
 KdbStatus kdb_compact     (KumDB *db, const char *table_name);

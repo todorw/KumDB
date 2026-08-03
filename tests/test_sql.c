@@ -443,10 +443,13 @@ static void test_transactions(void) {
     ASSERT_OK(sql(db, "BEGIN"));
     ASSERT_ERR(sql(db, "BEGIN"));                   /* no nested transactions */
     ASSERT_ERR(sql(db, "CREATE TABLE u (x INT)"));  /* DDL isn't transactional here */
-    ASSERT_ERR(sql(db, "SAVEPOINT sp1"));           /* not supported, see docs */
+    ASSERT_OK(sql(db, "ROLLBACK")); /* clean up the still-open transaction */
+
+    /* SAVEPOINT/ROLLBACK TO SAVEPOINT/RELEASE SAVEPOINT all need an open
+     * transaction -- see test_savepoints for the real behavior */
+    ASSERT_ERR(sql(db, "SAVEPOINT sp1"));
     ASSERT_ERR(sql(db, "ROLLBACK TO SAVEPOINT sp1"));
     ASSERT_ERR(sql(db, "RELEASE SAVEPOINT sp1"));
-    ASSERT_OK(sql(db, "ROLLBACK")); /* clean up the still-open transaction */
 
     /* a transaction left open when the handle closes is rolled back, same
      * as a crash mid-transaction would be -- reopen the same directory
@@ -459,6 +462,78 @@ static void test_transactions(void) {
     db = kdb_open(TEST_DIR);
     ASSERT(db != NULL);
     ASSERT_EQ(count_all(db, "t"), 3); /* ghost rolled back automatically */
+
+    teardown(db);
+}
+
+static void test_savepoints(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (name TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('alice')"));
+
+    /* basic SAVEPOINT + ROLLBACK TO undoes only what came after it */
+    ASSERT_OK(sql(db, "BEGIN"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('bob')"));
+    ASSERT_OK(sql(db, "SAVEPOINT sp1"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('carol')"));
+    ASSERT_EQ(count_all(db, "t"), 3);
+    ASSERT_OK(sql(db, "ROLLBACK TO SAVEPOINT sp1"));
+    ASSERT_EQ(count_all(db, "t"), 2); /* alice, bob; carol undone */
+    ASSERT_OK(sql(db, "COMMIT"));
+    ASSERT_EQ(count_all(db, "t"), 2);
+
+    /* ROLLBACK TO doesn't release the savepoint -- it can be used again */
+    ASSERT_OK(sql(db, "BEGIN"));
+    ASSERT_OK(sql(db, "SAVEPOINT sp1"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('dave')"));
+    ASSERT_OK(sql(db, "ROLLBACK TO SAVEPOINT sp1"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('erin')"));
+    ASSERT_OK(sql(db, "ROLLBACK TO SAVEPOINT sp1"));
+    ASSERT_EQ(count_all(db, "t"), 2); /* both dave and erin undone */
+    ASSERT_OK(sql(db, "COMMIT"));
+
+    /* RELEASE SAVEPOINT keeps the changes, just forgets the name */
+    ASSERT_OK(sql(db, "BEGIN"));
+    ASSERT_OK(sql(db, "SAVEPOINT sp2"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('frank')"));
+    ASSERT_OK(sql(db, "RELEASE SAVEPOINT sp2"));
+    ASSERT_EQ(sql(db, "ROLLBACK TO SAVEPOINT sp2"), KDB_ERR_NOT_FOUND);
+    ASSERT_OK(sql(db, "COMMIT"));
+    ASSERT_EQ(count_all(db, "t"), 3); /* frank kept */
+
+    /* nested savepoints: rolling back to the outer one discards the inner
+     * one too, undoing everything after the outer savepoint */
+    ASSERT_OK(sql(db, "BEGIN"));
+    ASSERT_OK(sql(db, "SAVEPOINT sp_outer"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('g')"));
+    ASSERT_OK(sql(db, "SAVEPOINT sp_inner"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('h')"));
+    ASSERT_EQ(count_all(db, "t"), 5);
+    ASSERT_OK(sql(db, "ROLLBACK TO SAVEPOINT sp_outer"));
+    ASSERT_EQ(count_all(db, "t"), 3); /* g and h both undone */
+    ASSERT_EQ(sql(db, "ROLLBACK TO SAVEPOINT sp_inner"), KDB_ERR_NOT_FOUND);
+    ASSERT_OK(sql(db, "ROLLBACK"));
+
+    /* a table created (implicitly, via INSERT) since a savepoint is
+     * dropped entirely when rolling back to it */
+    ASSERT_OK(sql(db, "BEGIN"));
+    ASSERT_OK(sql(db, "SAVEPOINT sp3"));
+    ASSERT_OK(sql(db, "INSERT INTO fresh (x) VALUES (1)"));
+    ASSERT_OK(sql(db, "SELECT * FROM fresh"));
+    ASSERT_OK(sql(db, "ROLLBACK TO SAVEPOINT sp3"));
+    ASSERT_EQ(sql(db, "SELECT * FROM fresh"), KDB_ERR_NOT_FOUND);
+    ASSERT_OK(sql(db, "COMMIT"));
+
+    /* error paths */
+    ASSERT_ERR(sql(db, "SAVEPOINT spx"));            /* no open transaction */
+    ASSERT_ERR(sql(db, "RELEASE SAVEPOINT spx"));    /* no open transaction */
+    ASSERT_ERR(sql(db, "ROLLBACK TO SAVEPOINT spx")); /* no open transaction */
+    ASSERT_OK(sql(db, "BEGIN"));
+    ASSERT_EQ(sql(db, "ROLLBACK TO SAVEPOINT nope"), KDB_ERR_NOT_FOUND);
+    ASSERT_OK(sql(db, "SAVEPOINT dup1"));
+    ASSERT_EQ(sql(db, "SAVEPOINT dup1"), KDB_ERR_EXISTS);
+    ASSERT_OK(sql(db, "ROLLBACK"));
 
     teardown(db);
 }
@@ -3473,6 +3548,7 @@ int main(void) {
     test_upsert();
     test_returning();
     test_transactions();
+    test_savepoints();
     test_projection();
     test_limit_offset();
     test_multi_column_order_by();

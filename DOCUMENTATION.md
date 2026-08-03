@@ -317,6 +317,21 @@ rollback). This means a transaction costs a full copy of each table it
 touches on first touch — fine for coordinating a handful of tables, not
 meant for wrapping bulk operations on a huge one.
 
+**Savepoints**: `kdb_tx_savepoint(tx, name)` establishes a named
+checkpoint inside an open transaction, up to `KDB_TX_MAX_SAVEPOINTS` (8)
+deep. `kdb_tx_rollback_to_savepoint(tx, name)` undoes every change made
+since that savepoint (including anything done under savepoints nested
+inside it, which are discarded too), but leaves the transaction — and the
+named savepoint itself — open, so it can be rolled back to again.
+`kdb_tx_release_savepoint(tx, name)` keeps the changes and just forgets
+the name (and any names nested inside it). Mechanically this works the
+same way as the whole-transaction backup, just scoped: the first time a
+table is touched since a given savepoint was created, that savepoint gets
+its own backup of the table, taken independently of the transaction's own
+outer backup and of any other active savepoint's. Crash recovery on the
+next `kdb_open()` cleans up any leftover savepoint backup files the same
+way it cleans up interrupted whole-transaction ones.
+
 **From SQL**: `BEGIN` (`TRANSACTION`/`WORK` optional, and `START
 TRANSACTION` works too) opens a `kdb_tx_*` transaction on the connection;
 every `INSERT`/`UPDATE`/`DELETE` after that runs through it instead of the
@@ -336,13 +351,32 @@ No nested transactions (`BEGIN` while one is already open errors —
 transaction errors too. Schema changes (`CREATE`/`ALTER`/`DROP`) aren't
 wrapped by `kdb_tx_*`, so they're rejected while a transaction is open
 rather than silently running outside it, where `ROLLBACK` wouldn't
-actually undo them. `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO
-SAVEPOINT` aren't supported — `kdb_tx_*` only backs up/restores a whole
-transaction, it has no concept of a partial rollback point to wrap, and
-faking one wouldn't actually roll back to it. A transaction still open
-when the connection is closed is rolled back automatically (same outcome
-a crash mid-transaction already gets from the next `kdb_open()`, just
-immediate instead of deferred to next open).
+actually undo them. A transaction still open when the connection is
+closed is rolled back automatically (same outcome a crash mid-transaction
+already gets from the next `kdb_open()`, just immediate instead of
+deferred to next open).
+
+`SAVEPOINT name` / `RELEASE [SAVEPOINT] name` / `ROLLBACK TO [SAVEPOINT]
+name` are all supported, and each needs an open transaction (`BEGIN`
+first):
+
+```sql
+BEGIN
+INSERT INTO accounts (name, balance) VALUES ('alice', 50)
+SAVEPOINT before_bonus
+UPDATE accounts SET balance = balance + 1000000 WHERE name = 'alice'
+ROLLBACK TO SAVEPOINT before_bonus
+COMMIT
+```
+
+`ROLLBACK TO SAVEPOINT` undoes everything since that savepoint (including
+any savepoints nested inside it, which are discarded too) but leaves the
+savepoint itself and the surrounding transaction open, so it can be
+rolled back to again. `RELEASE SAVEPOINT` keeps the changes made and just
+forgets the name (and any names nested inside it). Same underlying
+mechanism as `kdb_tx_savepoint`/`kdb_tx_rollback_to_savepoint`/
+`kdb_tx_release_savepoint` above, just driven from SQL text instead of a
+`KdbTx*` handle.
 
 ## SQL
 

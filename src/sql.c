@@ -6325,14 +6325,49 @@ static KdbStatus sql__exec_commit(SqlParser *p, KumDB *db) {
 static KdbStatus sql__exec_rollback(SqlParser *p, KumDB *db) {
     sql__advance(p); /* ROLLBACK */
     if (sql__kw_is(&p->cur, "TRANSACTION") || sql__kw_is(&p->cur, "WORK")) sql__advance(p);
-    if (sql__kw_is(&p->cur, "TO"))
-        return sql__err("ROLLBACK TO SAVEPOINT isn't supported -- the underlying transaction API only "
-                         "backs up/restores a whole transaction, not partial rollback points; ROLLBACK "
-                         "undoes the whole transaction instead");
+
+    if (sql__kw_is(&p->cur, "TO")) {
+        sql__advance(p);
+        if (sql__kw_is(&p->cur, "SAVEPOINT")) sql__advance(p);
+        const char *name;
+        if (!sql__ident_text(&p->cur, &name)) return sql__err("expected a savepoint name after ROLLBACK TO [SAVEPOINT]");
+        char sp_name[KDB_SQL_IDENT_BUF];
+        snprintf(sp_name, sizeof(sp_name), "%.255s", name);
+        sql__advance(p);
+
+        if (!db->sql_tx) return sql__err("no transaction is open -- nothing to ROLLBACK TO SAVEPOINT");
+        return kdb_tx_rollback_to_savepoint((KdbTx *)db->sql_tx, sp_name);
+    }
+
     if (!db->sql_tx) return sql__err("no transaction is open -- nothing to ROLLBACK");
     KdbStatus st = kdb_tx_rollback((KdbTx *)db->sql_tx);
     db->sql_tx = NULL; /* kdb_tx_rollback always frees tx, success or not */
     return st;
+}
+
+static KdbStatus sql__exec_savepoint(SqlParser *p, KumDB *db) {
+    sql__advance(p); /* SAVEPOINT */
+    const char *name;
+    if (!sql__ident_text(&p->cur, &name)) return sql__err("expected a savepoint name after SAVEPOINT");
+    char sp_name[KDB_SQL_IDENT_BUF];
+    snprintf(sp_name, sizeof(sp_name), "%.255s", name);
+    sql__advance(p);
+
+    if (!db->sql_tx) return sql__err("no transaction is open -- SAVEPOINT needs an open BEGIN...COMMIT/ROLLBACK transaction");
+    return kdb_tx_savepoint((KdbTx *)db->sql_tx, sp_name);
+}
+
+static KdbStatus sql__exec_release_savepoint(SqlParser *p, KumDB *db) {
+    sql__advance(p); /* RELEASE */
+    if (sql__kw_is(&p->cur, "SAVEPOINT")) sql__advance(p);
+    const char *name;
+    if (!sql__ident_text(&p->cur, &name)) return sql__err("expected a savepoint name after RELEASE [SAVEPOINT]");
+    char sp_name[KDB_SQL_IDENT_BUF];
+    snprintf(sp_name, sizeof(sp_name), "%.255s", name);
+    sql__advance(p);
+
+    if (!db->sql_tx) return sql__err("no transaction is open -- nothing to RELEASE");
+    return kdb_tx_release_savepoint((KdbTx *)db->sql_tx, sp_name);
 }
 
 KdbStatus kdb_exec_sql(KumDB *db, const char *sql, KdbRows **rows_out, size_t *affected_out) {
@@ -6372,14 +6407,10 @@ KdbStatus kdb_exec_sql(KumDB *db, const char *sql, KdbRows **rows_out, size_t *a
     else if (sql__kw_is(&p.cur, "START"))  st = sql__exec_start_transaction(&p, db);
     else if (sql__kw_is(&p.cur, "COMMIT")) st = sql__exec_commit(&p, db);
     else if (sql__kw_is(&p.cur, "ROLLBACK")) st = sql__exec_rollback(&p, db);
-    else if (sql__kw_is(&p.cur, "SAVEPOINT"))
-        return sql__err("SAVEPOINT isn't supported -- the underlying transaction API only backs up/restores "
-                         "a whole transaction, not partial rollback points; use ROLLBACK for the whole "
-                         "transaction instead");
-    else if (sql__kw_is(&p.cur, "RELEASE"))
-        return sql__err("RELEASE SAVEPOINT isn't supported -- see SAVEPOINT");
+    else if (sql__kw_is(&p.cur, "SAVEPOINT")) st = sql__exec_savepoint(&p, db);
+    else if (sql__kw_is(&p.cur, "RELEASE"))   st = sql__exec_release_savepoint(&p, db);
     else return sql__err("unrecognized statement -- expected CREATE, ALTER, DROP, INSERT, SELECT, UPDATE, "
-                          "DELETE, WITH, BEGIN, START TRANSACTION, COMMIT, or ROLLBACK");
+                          "DELETE, WITH, BEGIN, START TRANSACTION, COMMIT, ROLLBACK, SAVEPOINT, or RELEASE SAVEPOINT");
 
     if (st != KDB_OK) return st;
 

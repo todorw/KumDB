@@ -45,6 +45,9 @@ extern "C" {
  *   BEGIN [TRANSACTION | WORK] | START TRANSACTION
  *   COMMIT [TRANSACTION | WORK]
  *   ROLLBACK [TRANSACTION | WORK]
+ *   SAVEPOINT name
+ *   RELEASE [SAVEPOINT] name
+ *   ROLLBACK TO [SAVEPOINT] name
  *
  * BEGIN opens a kdb_tx_* transaction on the connection (see kumdb.h) --
  * every INSERT/UPDATE/DELETE after that runs through it instead of the
@@ -53,10 +56,15 @@ extern "C" {
  * changes (CREATE/ALTER/DROP) aren't wrapped by kdb_tx_*, so they're
  * rejected while a transaction is open rather than silently running
  * outside it, where ROLLBACK wouldn't actually undo them. SAVEPOINT/
- * RELEASE SAVEPOINT/ROLLBACK TO SAVEPOINT aren't supported -- kdb_tx_*
- * only backs up/restores a whole transaction, it has no partial rollback
- * point to wrap. A transaction still open when the connection closes is
- * rolled back automatically.
+ * RELEASE SAVEPOINT/ROLLBACK TO SAVEPOINT are all supported and need an
+ * open transaction; ROLLBACK TO SAVEPOINT undoes everything done since
+ * that savepoint (including any savepoints nested inside it, which are
+ * discarded too) but leaves the savepoint itself and the transaction
+ * open, so it can be rolled back to again. RELEASE SAVEPOINT keeps the
+ * changes and just forgets the name (and any names nested inside it). See
+ * kdb_tx_savepoint/kdb_tx_rollback_to_savepoint/kdb_tx_release_savepoint
+ * in kumdb.h for the underlying semantics. A transaction still open when
+ * the connection closes is rolled back automatically.
  *
  * INSERT always needs an explicit column list, never a bare
  * "INSERT INTO t VALUES (...)". VALUES accepts more than one

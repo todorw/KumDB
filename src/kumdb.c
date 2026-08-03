@@ -398,6 +398,19 @@ static void kdb__tx_backup_path(KumDB *db, const char *table_name, char *out, si
     snprintf(out, out_size, "%s.txbak", kdb_path);
 }
 
+/* A savepoint's own backup for one table -- suffixed by the savepoint's
+ * stack depth (unique within one transaction at any given time, since
+ * depths are only reused after the savepoint that held them is popped
+ * and its own backup already deleted -- see kdb_tx_rollback_to_savepoint/
+ * kdb_tx_release_savepoint). Recognizable (and cleaned up as orphaned
+ * garbage on crash recovery) by containing ".txbak.sp" -- see
+ * kdb__tx_recover. */
+static void kdb__tx_savepoint_backup_path(KumDB *db, const char *table_name, uint32_t depth, char *out, size_t out_size) {
+    char kdb_path[4104];
+    kdb_storage_path(db->data_dir, table_name, kdb_path, sizeof(kdb_path));
+    snprintf(out, out_size, "%s.txbak.sp%u", kdb_path, depth);
+}
+
 static void kdb__tx_marker_path(KumDB *db, char *out, size_t out_size) {
     snprintf(out, out_size, "%s/%s", db->data_dir, KDB_TX_MARKER_NAME);
 }
@@ -406,10 +419,9 @@ static void kdb__tx_marker_path(KumDB *db, char *out, size_t out_size) {
 #pragma GCC diagnostic pop
 #endif
 
-static KdbStatus kdb__tx_backup_table(KumDB *db, const char *table_name) {
-    char src_path[4104], dst_path[4104];
+static KdbStatus kdb__tx_backup_table_to(KumDB *db, const char *table_name, const char *dst_path) {
+    char src_path[4104];
     kdb_storage_path(db->data_dir, table_name, src_path, sizeof(src_path));
-    kdb__tx_backup_path(db, table_name, dst_path, sizeof(dst_path));
 
     FILE *src = fopen(src_path, "rb");
     if (!src) { kdb_err_io(src_path, "open for tx backup"); return KDB_ERR_IO; }
@@ -436,14 +448,19 @@ static KdbStatus kdb__tx_backup_table(KumDB *db, const char *table_name) {
     return KDB_OK;
 }
 
+static KdbStatus kdb__tx_backup_table(KumDB *db, const char *table_name) {
+    char dst_path[4104];
+    kdb__tx_backup_path(db, table_name, dst_path, sizeof(dst_path));
+    return kdb__tx_backup_table_to(db, table_name, dst_path);
+}
+
 /* Rolls back one table by putting its backup back in place. Evicts any
  * cached handle first -- an already-open fd keeps referencing the old
  * inode through a rename, so without this the cache would silently keep
  * pointing at the pre-rollback (or pre-commit-cleanup) file. */
-static KdbStatus kdb__tx_restore_table(KumDB *db, const char *table_name) {
-    char real_path[4104], bak_path[4104];
+static KdbStatus kdb__tx_restore_table_from(KumDB *db, const char *table_name, const char *bak_path) {
+    char real_path[4104];
     kdb_storage_path(db->data_dir, table_name, real_path, sizeof(real_path));
-    kdb__tx_backup_path(db, table_name, bak_path, sizeof(bak_path));
 
     kdb__evict_table(db, table_name);
 
@@ -452,6 +469,12 @@ static KdbStatus kdb__tx_restore_table(KumDB *db, const char *table_name) {
         return KDB_ERR_IO;
     }
     return KDB_OK;
+}
+
+static KdbStatus kdb__tx_restore_table(KumDB *db, const char *table_name) {
+    char bak_path[4104];
+    kdb__tx_backup_path(db, table_name, bak_path, sizeof(bak_path));
+    return kdb__tx_restore_table_from(db, table_name, bak_path);
 }
 
 static void kdb__tx_delete_backup(KumDB *db, const char *table_name) {
@@ -513,6 +536,20 @@ static void kdb__tx_recover(KumDB *db) {
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         const char *name = entry->d_name;
+
+        /* a leftover savepoint-level backup is always orphaned garbage by
+         * the time we get here -- the transaction that made it either
+         * committed already (savepoint backups are cleaned up as part of
+         * that, see kdb_tx_commit) or needs the whole-transaction
+         * rollback below, which makes every savepoint within it moot.
+         * Just discard it, regardless of which table/depth. */
+        if (strstr(name, ".kdb.txbak.sp") != NULL) {
+            char path[4104];
+            snprintf(path, sizeof(path), "%s/%s", db->data_dir, name);
+            unlink(path);
+            continue;
+        }
+
         size_t nlen = strlen(name);
         static const char suffix[] = ".kdb.txbak";
         size_t slen = sizeof(suffix) - 1;
@@ -530,28 +567,66 @@ static void kdb__tx_recover(KumDB *db) {
 }
 
 /* Tracks 'table_name' in the transaction exactly once: backs it up (or,
- * if it doesn't exist yet, remembers to drop it on rollback instead). */
+ * if it doesn't exist yet, remembers to drop it on rollback instead).
+ * Separately (and regardless of whether the transaction as a whole has
+ * already seen this table before), also tracks it in every currently
+ * active savepoint that hasn't seen it yet since ITS OWN creation --
+ * each such savepoint gets its own backup of the table's current state,
+ * so kdb_tx_rollback_to_savepoint can undo back to exactly that point
+ * later without needing to touch any of the others. */
 static KdbStatus kdb__tx_touch(KdbTx *tx, const char *table_name) {
+    int already_tracked = 0;
     for (uint32_t i = 0; i < tx->table_count; i++) {
-        if (strcmp(tx->tables[i], table_name) == 0) return KDB_OK;
+        if (strcmp(tx->tables[i], table_name) == 0) { already_tracked = 1; break; }
     }
-    if (tx->table_count >= KDB_TX_MAX_TABLES) {
-        kdb_set_error(KDB_ERR_FULL, "Transaction already touches %d tables, that's the limit.", KDB_TX_MAX_TABLES);
-        return KDB_ERR_FULL;
+    if (!already_tracked) {
+        if (tx->table_count >= KDB_TX_MAX_TABLES) {
+            kdb_set_error(KDB_ERR_FULL, "Transaction already touches %d tables, that's the limit.", KDB_TX_MAX_TABLES);
+            return KDB_ERR_FULL;
+        }
+
+        uint32_t idx = tx->table_count;
+        KDB_STRLCPY(tx->tables[idx], table_name, sizeof(tx->tables[idx]));
+
+        if (!kdb_table_exists(tx->db, table_name)) {
+            tx->is_new_table[idx] = 1;
+        } else {
+            tx->is_new_table[idx] = 0;
+            KdbStatus st = kdb__tx_backup_table(tx->db, table_name);
+            if (st != KDB_OK) return st;
+        }
+
+        tx->table_count++;
     }
 
-    uint32_t idx = tx->table_count;
-    KDB_STRLCPY(tx->tables[idx], table_name, sizeof(tx->tables[idx]));
+    for (uint32_t sp = 0; sp < tx->savepoint_count; sp++) {
+        KdbSavepoint *s = &tx->savepoints[sp];
+        int seen = 0;
+        for (uint32_t i = 0; i < s->table_count; i++) {
+            if (strcmp(s->tables[i], table_name) == 0) { seen = 1; break; }
+        }
+        if (seen) continue;
+        if (s->table_count >= KDB_TX_MAX_TABLES) {
+            kdb_set_error(KDB_ERR_FULL, "Savepoint '%s' already touches %d tables, that's the limit.", s->name, KDB_TX_MAX_TABLES);
+            return KDB_ERR_FULL;
+        }
 
-    if (!kdb_table_exists(tx->db, table_name)) {
-        tx->is_new_table[idx] = 1;
-    } else {
-        tx->is_new_table[idx] = 0;
-        KdbStatus st = kdb__tx_backup_table(tx->db, table_name);
-        if (st != KDB_OK) return st;
+        uint32_t idx = s->table_count;
+        KDB_STRLCPY(s->tables[idx], table_name, sizeof(s->tables[idx]));
+
+        if (!kdb_table_exists(tx->db, table_name)) {
+            s->is_new_table[idx] = 1;
+        } else {
+            s->is_new_table[idx] = 0;
+            char bak_path[4104];
+            kdb__tx_savepoint_backup_path(tx->db, table_name, sp, bak_path, sizeof(bak_path));
+            KdbStatus st = kdb__tx_backup_table_to(tx->db, table_name, bak_path);
+            if (st != KDB_OK) return st;
+        }
+
+        s->table_count++;
     }
 
-    tx->table_count++;
     return KDB_OK;
 }
 
@@ -612,12 +687,34 @@ KdbStatus kdb_tx_delete(KdbTx *tx, const char *table_name, const char **filters,
     return st;
 }
 
+/* Deletes every active savepoint's own backup files -- called right
+ * before a whole-transaction commit or rollback ends tx, since either way
+ * makes every savepoint within it moot: commit means nothing needs
+ * undoing, and the whole-transaction rollback below already restores
+ * each table by itself, without going through any savepoint's own
+ * backup. */
+static void kdb__tx_cleanup_savepoints(KdbTx *tx) {
+    for (uint32_t sp = 0; sp < tx->savepoint_count; sp++) {
+        KdbSavepoint *s = &tx->savepoints[sp];
+        for (uint32_t i = 0; i < s->table_count; i++) {
+            if (!s->is_new_table[i]) {
+                char bak_path[4104];
+                kdb__tx_savepoint_backup_path(tx->db, s->tables[i], sp, bak_path, sizeof(bak_path));
+                unlink(bak_path);
+            }
+        }
+    }
+    tx->savepoint_count = 0;
+}
+
 KdbStatus kdb_tx_commit(KdbTx *tx) {
     if (!tx || !tx->active) { kdb_err_bad_arg("tx", "not an active transaction"); return KDB_ERR_BAD_ARG; }
     if (tx->failed) {
         kdb_set_error(KDB_ERR_VALIDATION, "Transaction had a failed operation -- can't commit, roll it back instead.");
         return KDB_ERR_VALIDATION;
     }
+
+    kdb__tx_cleanup_savepoints(tx);
 
     char backed_up[KDB_TX_MAX_TABLES][KDB_MAX_NAME_LEN];
     uint32_t nbacked = 0;
@@ -643,6 +740,8 @@ KdbStatus kdb_tx_commit(KdbTx *tx) {
 KdbStatus kdb_tx_rollback(KdbTx *tx) {
     if (!tx || !tx->active) { kdb_err_bad_arg("tx", "not an active transaction"); return KDB_ERR_BAD_ARG; }
 
+    kdb__tx_cleanup_savepoints(tx);
+
     KdbStatus first_err = KDB_OK;
     for (uint32_t i = 0; i < tx->table_count; i++) {
         KdbStatus st = tx->is_new_table[i]
@@ -653,6 +752,121 @@ KdbStatus kdb_tx_rollback(KdbTx *tx) {
 
     free(tx);
     return first_err;
+}
+
+/* Finds an active savepoint by name; -1 if none matches. */
+static int32_t kdb__tx_find_savepoint(KdbTx *tx, const char *name) {
+    for (uint32_t i = 0; i < tx->savepoint_count; i++) {
+        if (strcmp(tx->savepoints[i].name, name) == 0) return (int32_t)i;
+    }
+    return -1;
+}
+
+KdbStatus kdb_tx_savepoint(KdbTx *tx, const char *name) {
+    if (!tx || !tx->active || !name || !name[0]) {
+        kdb_err_bad_arg("tx/name", "not an active transaction, or no savepoint name given");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (tx->failed) {
+        kdb_set_error(KDB_ERR_VALIDATION, "Transaction already has a failed operation -- roll it back.");
+        return KDB_ERR_VALIDATION;
+    }
+    if (kdb__tx_find_savepoint(tx, name) >= 0) {
+        kdb_set_error(KDB_ERR_EXISTS, "Savepoint '%s' already exists in this transaction.", name);
+        return KDB_ERR_EXISTS;
+    }
+    if (tx->savepoint_count >= KDB_TX_MAX_SAVEPOINTS) {
+        kdb_set_error(KDB_ERR_FULL, "Transaction already has the max %d savepoints.", KDB_TX_MAX_SAVEPOINTS);
+        return KDB_ERR_FULL;
+    }
+
+    KdbSavepoint *s = &tx->savepoints[tx->savepoint_count];
+    memset(s, 0, sizeof(*s));
+    KDB_STRLCPY(s->name, name, sizeof(s->name));
+    tx->savepoint_count++;
+    return KDB_OK;
+}
+
+KdbStatus kdb_tx_rollback_to_savepoint(KdbTx *tx, const char *name) {
+    if (!tx || !tx->active || !name) {
+        kdb_err_bad_arg("tx/name", "not an active transaction, or no savepoint name given");
+        return KDB_ERR_BAD_ARG;
+    }
+    int32_t idx = kdb__tx_find_savepoint(tx, name);
+    if (idx < 0) {
+        kdb_set_error(KDB_ERR_NOT_FOUND, "No savepoint named '%s' in this transaction.", name);
+        return KDB_ERR_NOT_FOUND;
+    }
+
+    /* discard every savepoint nested inside this one first -- their own
+     * tracked state no longer makes sense once we've rewound past their
+     * creation point (their backups are never restored, just dropped). */
+    for (uint32_t sp = tx->savepoint_count; sp > (uint32_t)idx + 1; ) {
+        sp--;
+        KdbSavepoint *s = &tx->savepoints[sp];
+        for (uint32_t i = 0; i < s->table_count; i++) {
+            if (!s->is_new_table[i]) {
+                char bak_path[4104];
+                kdb__tx_savepoint_backup_path(tx->db, s->tables[i], sp, bak_path, sizeof(bak_path));
+                unlink(bak_path);
+            }
+        }
+    }
+
+    /* now restore this savepoint's own tracked tables from ITS backups */
+    KdbSavepoint *target = &tx->savepoints[idx];
+    KdbStatus first_err = KDB_OK;
+    for (uint32_t i = 0; i < target->table_count; i++) {
+        KdbStatus st;
+        if (target->is_new_table[i]) {
+            st = kdb_drop_table(tx->db, target->tables[i]);
+        } else {
+            char bak_path[4104];
+            kdb__tx_savepoint_backup_path(tx->db, target->tables[i], (uint32_t)idx, bak_path, sizeof(bak_path));
+            st = kdb__tx_restore_table_from(tx->db, target->tables[i], bak_path);
+        }
+        if (st != KDB_OK && first_err == KDB_OK) first_err = st;
+    }
+
+    /* this savepoint stays active (same name, same depth), just reset to
+     * track nothing yet -- ready to back up fresh touches again from
+     * here, same as right after it was first created */
+    tx->savepoint_count = (uint32_t)idx + 1;
+    memset(target->tables, 0, sizeof(target->tables));
+    memset(target->is_new_table, 0, sizeof(target->is_new_table));
+    target->table_count = 0;
+
+    tx->failed = 0; /* same recovery-escape-hatch reasoning kdb_tx_rollback() has */
+    return first_err;
+}
+
+KdbStatus kdb_tx_release_savepoint(KdbTx *tx, const char *name) {
+    if (!tx || !tx->active || !name) {
+        kdb_err_bad_arg("tx/name", "not an active transaction, or no savepoint name given");
+        return KDB_ERR_BAD_ARG;
+    }
+    int32_t idx = kdb__tx_find_savepoint(tx, name);
+    if (idx < 0) {
+        kdb_set_error(KDB_ERR_NOT_FOUND, "No savepoint named '%s' in this transaction.", name);
+        return KDB_ERR_NOT_FOUND;
+    }
+
+    /* releasing a savepoint also releases everything nested inside it,
+     * same as real SQL -- delete every one of their backup files (giving
+     * up the ability to roll back to any of them specifically) without
+     * restoring anything. */
+    for (uint32_t sp = (uint32_t)idx; sp < tx->savepoint_count; sp++) {
+        KdbSavepoint *s = &tx->savepoints[sp];
+        for (uint32_t i = 0; i < s->table_count; i++) {
+            if (!s->is_new_table[i]) {
+                char bak_path[4104];
+                kdb__tx_savepoint_backup_path(tx->db, s->tables[i], sp, bak_path, sizeof(bak_path));
+                unlink(bak_path);
+            }
+        }
+    }
+    tx->savepoint_count = (uint32_t)idx;
+    return KDB_OK;
 }
 
 static KumDB *kdb__open_internal(const char *data_dir, uint8_t read_only) {
