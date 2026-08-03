@@ -1013,8 +1013,10 @@ static KdbStatus kdb__check_fk_child_update(KumDB *db, KdbTable *tbl, const KdbR
 }
 
 typedef struct {
-    char table[KDB_MAX_NAME_LEN];
-    char col[KDB_MAX_NAME_LEN];
+    char    table[KDB_MAX_NAME_LEN];
+    char    col[KDB_MAX_NAME_LEN];
+    uint8_t on_delete;
+    uint8_t on_update;
 } KdbFkReferencer;
 
 /* Every (table, column) anywhere in the data directory whose FK points at
@@ -1039,6 +1041,8 @@ static KdbStatus kdb__find_fk_referencers(KumDB *db, const char *ref_table_name,
             if (col->has_fk && strcmp(col->fk_ref_table, ref_table_name) == 0 && strcmp(col->fk_ref_col, ref_col_name) == 0) {
                 snprintf(out[*count_out].table, sizeof(out[*count_out].table), "%.127s", names[i]);
                 snprintf(out[*count_out].col, sizeof(out[*count_out].col), "%.127s", col->name);
+                out[*count_out].on_delete = col->on_delete;
+                out[*count_out].on_update = col->on_update;
                 (*count_out)++;
             }
         }
@@ -1048,15 +1052,72 @@ static KdbStatus kdb__find_fk_referencers(KumDB *db, const char *ref_table_name,
 
 #define KDB_MAX_FK_REFERENCERS 32
 
-/* RESTRICT: before removing/changing rows in tbl, reject if any other
- * table's FK still points at a value one of the affected rows currently
- * holds. affected is the exact row set this DELETE/UPDATE matches
- * (fetched by the caller before anything is actually mutated); patch is
- * NULL for DELETE, or the UPDATE's patch (a column the patch doesn't
- * touch can't orphan anyone, so those are skipped). No CASCADE/SET NULL
- * -- the write is simply rejected, same as a real FOREIGN KEY with no ON
- * DELETE/UPDATE clause defaults to. */
-static KdbStatus kdb__check_fk_restrict(KumDB *db, KdbTable *tbl, const KdbResult *affected, const KdbRecord *patch) {
+/* Forward declaration -- kdb__cascade_set_one_field (just below) needs to
+ * recurse into kdb__enforce_fk_referential_actions itself (a CASCADE/SET
+ * NULL propagated onto a referencing table might itself be referenced by
+ * yet another table), which is defined right after it. */
+static KdbStatus kdb__enforce_fk_referential_actions(KumDB *db, KdbTable *tbl, const KdbResult *affected,
+                                                      const KdbRecord *patch, int depth);
+
+/* Runs a single-field KdbRecord patch (col_name = val, or NULL for SET
+ * NULL) through kdb_table_update directly -- used for CASCADE (propagate
+ * the new referenced value) and SET NULL, neither of which needs (or
+ * safely can use, see the CASCADE case below) kdb__check_fk_child_update
+ * re-validation the way a genuinely new user-supplied value would. */
+static KdbStatus kdb__cascade_set_one_field(KumDB *db, KdbTable *tbl, const KdbQuery *q,
+                                            const char *col_name, const KdbValue *val, int depth) {
+    if (depth > KDB_FK_MAX_CASCADE_DEPTH) {
+        kdb_set_error(KDB_ERR_VALIDATION, "Foreign key cascade chain too deep (max %d) -- check for a cycle.", KDB_FK_MAX_CASCADE_DEPTH);
+        return KDB_ERR_VALIDATION;
+    }
+
+    KdbRecordField pf;
+    memset(&pf, 0, sizeof(pf));
+    KDB_STRLCPY(pf.col_name, col_name, KDB_MAX_NAME_LEN);
+    KdbStatus st = val ? kdb_value_copy(val, &pf.value) : kdb_value_from_null(&pf.value);
+    if (st != KDB_OK) return st;
+
+    KdbRecord patch;
+    memset(&patch, 0, sizeof(patch));
+    patch.fields = &pf;
+    patch.field_count = 1;
+
+    KdbResult affected;
+    st = kdb_query_execute(tbl, q, &affected);
+    if (st != KDB_OK) { kdb_value_free(&pf.value); return st; }
+    st = kdb__enforce_fk_referential_actions(db, tbl, &affected, &patch, depth);
+    kdb_result_free(&affected);
+    if (st == KDB_OK) {
+        size_t updated = 0;
+        st = kdb_table_update(tbl, q, &patch, &updated);
+    }
+    kdb_value_free(&pf.value);
+    return st;
+}
+
+/* On DELETE/UPDATE of a row in tbl, decides what happens to every other
+ * table's FK still pointing at it -- independently per referencer, each
+ * following its own on_delete (patch==NULL) or on_update (patch!=NULL,
+ * only for a column the patch actually touches -- one it doesn't touch
+ * can't orphan anyone) action:
+ *   KDB_FK_RESTRICT  -- rejects the write if any referencing row remains
+ *                        (the original, and until now only, behavior).
+ *   KDB_FK_CASCADE    -- deletes the referencing rows too (on delete), or
+ *                        propagates the new value to them (on update).
+ *   KDB_FK_SET_NULL   -- sets the referencing rows' FK column to NULL.
+ * CASCADE/SET_NULL recurse (via kdb__cascade_set_one_field/kdb__delete_
+ * with_depth), so a chain across several tables works the same way, but
+ * depth is capped (KDB_FK_MAX_CASCADE_DEPTH) to fail cleanly on a cycle
+ * instead of recursing forever. affected is the exact row set this
+ * DELETE/UPDATE matches, fetched by the caller before anything is
+ * actually mutated. */
+static KdbStatus kdb__enforce_fk_referential_actions(KumDB *db, KdbTable *tbl, const KdbResult *affected,
+                                                      const KdbRecord *patch, int depth) {
+    if (depth > KDB_FK_MAX_CASCADE_DEPTH) {
+        kdb_set_error(KDB_ERR_VALIDATION, "Foreign key cascade chain too deep (max %d) -- check for a cycle.", KDB_FK_MAX_CASCADE_DEPTH);
+        return KDB_ERR_VALIDATION;
+    }
+
     /* Real columns plus the three always-present pseudo-columns (id/
      * created_at/updated_at, tracked on KdbRecord itself, not in
      * tbl->header.columns[]) -- "id" is the single most common FOREIGN
@@ -1081,6 +1142,17 @@ static KdbStatus kdb__check_fk_restrict(KumDB *db, KdbTable *tbl, const KdbResul
         if (st != KDB_OK) return st;
         if (nrefs == 0) continue;
 
+        /* The new value a CASCADE update should propagate -- only ever
+         * read when patch is non-NULL (an UPDATE) and some referencer
+         * actually turns out to be CASCADE, but resolved once per column
+         * rather than per (row, referencer) pair. */
+        const KdbValue *new_val = NULL;
+        if (patch) {
+            for (uint32_t k = 0; k < patch->field_count; k++) {
+                if (strcmp(patch->fields[k].col_name, col_name) == 0) { new_val = &patch->fields[k].value; break; }
+            }
+        }
+
         for (size_t r = 0; r < affected->count; r++) {
             KdbValue pseudo_val;
             const KdbValue *fval = NULL;
@@ -1095,22 +1167,57 @@ static KdbStatus kdb__check_fk_restrict(KumDB *db, KdbTable *tbl, const KdbResul
             for (uint32_t ri = 0; ri < nrefs; ri++) {
                 KdbTable *rt = kdb__get_table(db, refs[ri].table);
                 if (!rt) continue;
+                KdbFkAction action = (KdbFkAction)(patch ? refs[ri].on_update : refs[ri].on_delete);
+
+                if (action == KDB_FK_RESTRICT) {
+                    KdbQuery q;
+                    kdb_query_init(&q);
+                    KdbStatus qst = kdb_query_add_filter_value(&q, refs[ri].col, KDB_OP_EQ, fval, NULL);
+                    if (qst != KDB_OK) { kdb_query_free(&q); return qst; }
+                    size_t count = 0;
+                    qst = kdb_query_count(rt, &q, &count);
+                    kdb_query_free(&q);
+                    if (qst != KDB_OK) return qst;
+
+                    if (count > 0) {
+                        kdb_set_error(KDB_ERR_VALIDATION,
+                            "Foreign key violation: '%s.%s' row(s) referenced by '%s.%s' can't be %s.",
+                            tbl->name, col_name, refs[ri].table, refs[ri].col, patch ? "changed" : "deleted");
+                        return KDB_ERR_VALIDATION;
+                    }
+                    continue;
+                }
 
                 KdbQuery q;
                 kdb_query_init(&q);
                 KdbStatus qst = kdb_query_add_filter_value(&q, refs[ri].col, KDB_OP_EQ, fval, NULL);
                 if (qst != KDB_OK) { kdb_query_free(&q); return qst; }
-                size_t count = 0;
-                qst = kdb_query_count(rt, &q, &count);
+
+                if (action == KDB_FK_SET_NULL) {
+                    qst = kdb__cascade_set_one_field(db, rt, &q, refs[ri].col, NULL, depth + 1);
+                } else { /* KDB_FK_CASCADE */
+                    if (patch) {
+                        qst = kdb__cascade_set_one_field(db, rt, &q, refs[ri].col, new_val, depth + 1);
+                    } else {
+                        /* DELETE CASCADE: remove the referencing rows too,
+                         * recursing through the same FK machinery (so a
+                         * chain across several tables cascades all the
+                         * way down) via the typed KdbQuery directly --
+                         * no raw-filter-string round trip needed here. */
+                        KdbResult casc_affected;
+                        qst = kdb_query_execute(rt, &q, &casc_affected);
+                        if (qst == KDB_OK) {
+                            qst = kdb__enforce_fk_referential_actions(db, rt, &casc_affected, NULL, depth + 1);
+                            kdb_result_free(&casc_affected);
+                        }
+                        if (qst == KDB_OK) {
+                            size_t deleted = 0;
+                            qst = kdb_table_delete(rt, &q, &deleted);
+                        }
+                    }
+                }
                 kdb_query_free(&q);
                 if (qst != KDB_OK) return qst;
-
-                if (count > 0) {
-                    kdb_set_error(KDB_ERR_VALIDATION,
-                        "Foreign key violation: '%s.%s' row(s) referenced by '%s.%s' can't be %s.",
-                        tbl->name, col_name, refs[ri].table, refs[ri].col, patch ? "changed" : "deleted");
-                    return KDB_ERR_VALIDATION;
-                }
             }
         }
     }
@@ -2029,13 +2136,14 @@ KdbStatus kdb_update(KumDB            *db,
     st = kdb__check_fk_child_update(db, tbl, patch);
     if (st != KDB_OK) { kdb_record_free(patch); kdb_query_free(&q); return st; }
 
-    /* RESTRICT: fetch exactly the rows this UPDATE matches before anything
-     * is mutated, so kdb__check_fk_restrict can see each one's current
+    /* Referential actions (RESTRICT/CASCADE/SET NULL): fetch exactly the
+     * rows this UPDATE matches before anything is mutated, so kdb__
+     * enforce_fk_referential_actions can see each one's current
      * (pre-patch) value for any column another table's FK depends on. */
     KdbResult affected;
     st = kdb_query_execute(tbl, &q, &affected);
     if (st != KDB_OK) { kdb_record_free(patch); kdb_query_free(&q); return st; }
-    st = kdb__check_fk_restrict(db, tbl, &affected, patch);
+    st = kdb__enforce_fk_referential_actions(db, tbl, &affected, patch, 0);
     kdb_result_free(&affected);
     if (st != KDB_OK) { kdb_record_free(patch); kdb_query_free(&q); return st; }
 
@@ -2067,12 +2175,12 @@ KdbStatus kdb_delete(KumDB       *db,
     KdbStatus st = kdb__build_query(filters, &q);
     if (st != KDB_OK) return st;
 
-    /* RESTRICT: same idea as kdb_update -- see which rows this DELETE
-     * would actually remove before removing them. */
+    /* Referential actions: same idea as kdb_update -- see which rows this
+     * DELETE would actually remove before removing them. */
     KdbResult affected;
     st = kdb_query_execute(tbl, &q, &affected);
     if (st != KDB_OK) { kdb_query_free(&q); return st; }
-    st = kdb__check_fk_restrict(db, tbl, &affected, NULL);
+    st = kdb__enforce_fk_referential_actions(db, tbl, &affected, NULL, 0);
     kdb_result_free(&affected);
     if (st != KDB_OK) { kdb_query_free(&q); return st; }
 
@@ -2287,7 +2395,8 @@ KdbStatus kdb_alter_column_type(KumDB *db, const char *table_name, const char *c
 }
 
 KdbStatus kdb_add_foreign_key(KumDB *db, const char *table_name, const char *col_name,
-                              const char *ref_table, const char *ref_col) {
+                              const char *ref_table, const char *ref_col,
+                              KdbFkAction on_delete, KdbFkAction on_update) {
     if (!db || !table_name || !col_name || !ref_table || !ref_col) {
         kdb_err_null_arg("db/table_name/col_name/ref_table/ref_col", "kdb_add_foreign_key");
         return KDB_ERR_BAD_ARG;
@@ -2319,7 +2428,7 @@ KdbStatus kdb_add_foreign_key(KumDB *db, const char *table_name, const char *col
                       table_name, col_name, ref_table, ref_col);
         return KDB_ERR_NOT_FOUND;
     }
-    return kdb_table_add_foreign_key(tbl, col_name, ref_table, ref_col);
+    return kdb_table_add_foreign_key(tbl, col_name, ref_table, ref_col, on_delete, on_update);
 }
 
 KdbStatus kdb_drop_foreign_key(KumDB *db, const char *table_name, const char *col_name) {

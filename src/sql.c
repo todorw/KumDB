@@ -1105,20 +1105,53 @@ static KdbStatus sql__type_from_ident(const char *s, KdbFieldType *out) {
     return KDB_ERR_SQL_SYNTAX;
 }
 
-/* NOT NULL / INDEX(ED) / UNIQUE / KEY / PRIMARY KEY / REFERENCES / DEFAULT
- * val -- shared between CREATE TABLE's column defs and ALTER TABLE ADD
- * COLUMN. NOT NULL and UNIQUE/PRIMARY KEY are really enforced (kdb_add/
- * kdb_update reject a violation); plain INDEX/INDEXED/KEY only ever set
- * the indexed lookup-hint flag, never enforced -- real SQL's own
- * distinction between a plain index and a uniqueness constraint.
- * REFERENCES ref_table(ref_col) is collected here but not applied --
- * the caller adds the actual foreign key (via kdb_add_foreign_key, which
- * needs a KumDB* to validate ref_table/ref_col exist) once the column
- * itself exists. The rest (DEFAULT) is accepted and ignored, best-effort
- * SQL DDL compatibility. */
+/* [ON DELETE {RESTRICT|CASCADE|SET NULL}] [ON UPDATE {RESTRICT|CASCADE|
+ * SET NULL}], in either order, both optional -- follows a REFERENCES
+ * ref_table(ref_col), whether written as a column modifier or as a
+ * table-level FOREIGN KEY (...) REFERENCES ... item. Untouched output
+ * params keep whatever default the caller set (KDB_FK_RESTRICT), same
+ * as real SQL's own default when the clause is omitted entirely.
+ * Returns 0 on error (error already set), 1 on success. */
+static int sql__parse_fk_actions(SqlParser *p, KdbFkAction *on_delete, KdbFkAction *on_update) {
+    while (sql__kw_is(&p->cur, "ON")) {
+        sql__advance(p);
+        int is_delete;
+        if (sql__kw_is(&p->cur, "DELETE"))      is_delete = 1;
+        else if (sql__kw_is(&p->cur, "UPDATE")) is_delete = 0;
+        else { sql__err("expected DELETE or UPDATE after ON"); return 0; }
+        sql__advance(p);
+
+        KdbFkAction action;
+        if (sql__kw_is(&p->cur, "RESTRICT"))       { action = KDB_FK_RESTRICT; sql__advance(p); }
+        else if (sql__kw_is(&p->cur, "CASCADE"))   { action = KDB_FK_CASCADE;  sql__advance(p); }
+        else if (sql__kw_is(&p->cur, "SET")) {
+            sql__advance(p);
+            if (!sql__kw_is(&p->cur, "NULL")) { sql__err("expected NULL after SET in ON DELETE/UPDATE SET"); return 0; }
+            sql__advance(p);
+            action = KDB_FK_SET_NULL;
+        } else { sql__err("expected RESTRICT, CASCADE, or SET NULL after ON DELETE/UPDATE"); return 0; }
+
+        if (is_delete) *on_delete = action; else *on_update = action;
+    }
+    return 1;
+}
+
+/* NOT NULL / INDEX(ED) / UNIQUE / KEY / PRIMARY KEY / REFERENCES [ON
+ * DELETE/UPDATE ...] / DEFAULT val -- shared between CREATE TABLE's
+ * column defs and ALTER TABLE ADD COLUMN. NOT NULL and UNIQUE/PRIMARY
+ * KEY are really enforced (kdb_add/kdb_update reject a violation); plain
+ * INDEX/INDEXED/KEY only ever set the indexed lookup-hint flag, never
+ * enforced -- real SQL's own distinction between a plain index and a
+ * uniqueness constraint. REFERENCES ref_table(ref_col) [ON DELETE ...]
+ * [ON UPDATE ...] is collected here but not applied -- the caller adds
+ * the actual foreign key (via kdb_add_foreign_key, which needs a KumDB*
+ * to validate ref_table/ref_col exist) once the column itself exists.
+ * The rest (DEFAULT) is accepted and ignored, best-effort SQL DDL
+ * compatibility. */
 static KdbStatus sql__parse_column_modifiers(SqlParser *p, const char *col_name, int *nullable, int *indexed, int *unique,
                                              int *has_fk, char *fk_ref_table, size_t fk_ref_table_size,
-                                             char *fk_ref_col, size_t fk_ref_col_size) {
+                                             char *fk_ref_col, size_t fk_ref_col_size,
+                                             KdbFkAction *fk_on_delete, KdbFkAction *fk_on_update) {
     for (;;) {
         if (sql__kw_is(&p->cur, "NOT")) {
             sql__advance(p);
@@ -1151,6 +1184,7 @@ static KdbStatus sql__parse_column_modifiers(SqlParser *p, const char *col_name,
             if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing REFERENCES %s(...) for column '%s'", fk_ref_table, col_name);
             sql__advance(p);
             *has_fk = 1;
+            if (!sql__parse_fk_actions(p, fk_on_delete, fk_on_update)) return kdb_last_status();
             continue;
         }
         if (sql__kw_is(&p->cur, "DEFAULT")) {
@@ -1687,17 +1721,21 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
     /* A column's own REFERENCES modifier -- applied (via kdb_add_foreign_
      * key, which needs KumDB* to validate the referenced table/column)
      * only after kdb_create_table has actually made the column exist. */
-    int  col_has_fk[KDB_SQL_MAX_COLUMNS];
-    char col_fk_ref_table[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
-    char col_fk_ref_col[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
+    int         col_has_fk[KDB_SQL_MAX_COLUMNS];
+    char        col_fk_ref_table[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
+    char        col_fk_ref_col[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
+    KdbFkAction col_fk_on_delete[KDB_SQL_MAX_COLUMNS];
+    KdbFkAction col_fk_on_update[KDB_SQL_MAX_COLUMNS];
 
     /* Table-level FOREIGN KEY (col) REFERENCES ref_table(ref_col) items --
      * same thing, spelled the other standard-SQL way, not tied to one
      * column definition's own line. */
 #define KDB_SQL_MAX_TABLE_LEVEL_FKS 8
-    char tfk_col[KDB_SQL_MAX_TABLE_LEVEL_FKS][KDB_SQL_IDENT_BUF];
-    char tfk_ref_table[KDB_SQL_MAX_TABLE_LEVEL_FKS][KDB_SQL_IDENT_BUF];
-    char tfk_ref_col[KDB_SQL_MAX_TABLE_LEVEL_FKS][KDB_SQL_IDENT_BUF];
+    char        tfk_col[KDB_SQL_MAX_TABLE_LEVEL_FKS][KDB_SQL_IDENT_BUF];
+    char        tfk_ref_table[KDB_SQL_MAX_TABLE_LEVEL_FKS][KDB_SQL_IDENT_BUF];
+    char        tfk_ref_col[KDB_SQL_MAX_TABLE_LEVEL_FKS][KDB_SQL_IDENT_BUF];
+    KdbFkAction tfk_on_delete[KDB_SQL_MAX_TABLE_LEVEL_FKS];
+    KdbFkAction tfk_on_update[KDB_SQL_MAX_TABLE_LEVEL_FKS];
     int  n_tfk = 0;
 
     /* Table-level CHECK (col op literal) items. */
@@ -1746,6 +1784,9 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
             snprintf(tfk_col[n_tfk], sizeof(tfk_col[0]), "%s", fcol_buf);
             snprintf(tfk_ref_table[n_tfk], sizeof(tfk_ref_table[0]), "%s", rtable_buf);
             snprintf(tfk_ref_col[n_tfk], sizeof(tfk_ref_col[0]), "%s", rcol_buf);
+            tfk_on_delete[n_tfk] = KDB_FK_RESTRICT;
+            tfk_on_update[n_tfk] = KDB_FK_RESTRICT;
+            if (!sql__parse_fk_actions(p, &tfk_on_delete[n_tfk], &tfk_on_update[n_tfk])) return kdb_last_status();
             n_tfk++;
 
             if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
@@ -1818,9 +1859,11 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
 
         int nullable = 1, indexed = 0, unique = 0, has_fk = 0;
         char fk_ref_table[KDB_SQL_IDENT_BUF], fk_ref_col[KDB_SQL_IDENT_BUF];
+        KdbFkAction fk_on_delete = KDB_FK_RESTRICT, fk_on_update = KDB_FK_RESTRICT;
         KdbStatus mst = sql__parse_column_modifiers(p, this_name, &nullable, &indexed, &unique,
                                                     &has_fk, fk_ref_table, sizeof(fk_ref_table),
-                                                    fk_ref_col, sizeof(fk_ref_col));
+                                                    fk_ref_col, sizeof(fk_ref_col),
+                                                    &fk_on_delete, &fk_on_update);
         if (mst != KDB_OK) return mst;
 
         if (!sql__is_reserved_column(this_name)) {
@@ -1835,6 +1878,8 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
             if (has_fk) {
                 snprintf(col_fk_ref_table[n], sizeof(col_fk_ref_table[0]), "%s", fk_ref_table);
                 snprintf(col_fk_ref_col[n], sizeof(col_fk_ref_col[0]), "%s", fk_ref_col);
+                col_fk_on_delete[n] = fk_on_delete;
+                col_fk_on_update[n] = fk_on_update;
             }
             n++;
         }
@@ -1851,11 +1896,13 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
 
     for (uint32_t i = 0; i < n; i++) {
         if (!col_has_fk[i]) continue;
-        KdbStatus ast = kdb_add_foreign_key(db, table_name, cols[i].name, col_fk_ref_table[i], col_fk_ref_col[i]);
+        KdbStatus ast = kdb_add_foreign_key(db, table_name, cols[i].name, col_fk_ref_table[i], col_fk_ref_col[i],
+                                            col_fk_on_delete[i], col_fk_on_update[i]);
         if (ast != KDB_OK) { kdb_drop_table(db, table_name); return ast; }
     }
     for (int i = 0; i < n_tfk; i++) {
-        KdbStatus ast = kdb_add_foreign_key(db, table_name, tfk_col[i], tfk_ref_table[i], tfk_ref_col[i]);
+        KdbStatus ast = kdb_add_foreign_key(db, table_name, tfk_col[i], tfk_ref_table[i], tfk_ref_col[i],
+                                            tfk_on_delete[i], tfk_on_update[i]);
         if (ast != KDB_OK) { kdb_drop_table(db, table_name); return ast; }
     }
     for (int i = 0; i < n_chk; i++) {
@@ -1981,7 +2028,9 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
             sql__advance(p);
             if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing REFERENCES %s(%s in ALTER TABLE %s ADD", rtable_buf, rcol_buf, table_name);
             sql__advance(p);
-            return kdb_add_foreign_key(db, table_name, fcol_buf, rtable_buf, rcol_buf);
+            KdbFkAction on_delete = KDB_FK_RESTRICT, on_update = KDB_FK_RESTRICT;
+            if (!sql__parse_fk_actions(p, &on_delete, &on_update)) return kdb_last_status();
+            return kdb_add_foreign_key(db, table_name, fcol_buf, rtable_buf, rcol_buf, on_delete, on_update);
         }
 
         if (sql__kw_is(&p->cur, "CHECK")) {
@@ -2049,9 +2098,11 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
 
         int nullable = 1, indexed = 0, unique = 0, has_fk = 0;
         char fk_ref_table[KDB_SQL_IDENT_BUF], fk_ref_col[KDB_SQL_IDENT_BUF];
+        KdbFkAction fk_on_delete = KDB_FK_RESTRICT, fk_on_update = KDB_FK_RESTRICT;
         KdbStatus mst = sql__parse_column_modifiers(p, col_name, &nullable, &indexed, &unique,
                                                     &has_fk, fk_ref_table, sizeof(fk_ref_table),
-                                                    fk_ref_col, sizeof(fk_ref_col));
+                                                    fk_ref_col, sizeof(fk_ref_col),
+                                                    &fk_on_delete, &fk_on_update);
         if (mst != KDB_OK) return mst;
 
         if (sql__is_reserved_column(col_name))
@@ -2060,7 +2111,7 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
         KdbStatus ast = kdb_add_column(db, table_name, col_name, ftype, nullable, indexed, unique);
         if (ast != KDB_OK) return ast;
         if (has_fk) {
-            ast = kdb_add_foreign_key(db, table_name, col_name, fk_ref_table, fk_ref_col);
+            ast = kdb_add_foreign_key(db, table_name, col_name, fk_ref_table, fk_ref_col, fk_on_delete, fk_on_update);
             if (ast != KDB_OK) { kdb_drop_column(db, table_name, col_name); return ast; }
         }
         return KDB_OK;

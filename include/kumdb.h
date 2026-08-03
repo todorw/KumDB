@@ -436,13 +436,22 @@ KdbStatus kdb_alter_column_type(KumDB *db, const char *table_name, const char *c
  * must already exist (checked right away, not deferred). Enforced from
  * here on: kdb_add/kdb_update reject a non-NULL col_name value with no
  * matching row in ref_table.ref_col; deleting or updating away a row in
- * ref_table that col_name still points to is rejected too (RESTRICT --
- * no ON DELETE/UPDATE CASCADE or SET NULL). One FK per column
- * (KDB_ERR_EXISTS if col_name already has one); no composite
- * (multi-column) foreign keys. kdb_batch_import bypasses this, same as
- * it bypasses NOT NULL/UNIQUE. */
+ * ref_table that col_name still points to follows on_delete/on_update
+ * (independently -- a delete follows on_delete, an update that changes
+ * the referenced value follows on_update): KDB_FK_RESTRICT (the
+ * default -- pass it for both if you just want the original behavior)
+ * rejects the write; KDB_FK_CASCADE deletes/updates the referencing
+ * rows too (propagating the new value on an update); KDB_FK_SET_NULL
+ * sets col_name to NULL on the referencing rows instead (col_name must
+ * be nullable -- KDB_ERR_BAD_ARG otherwise). CASCADE/SET_NULL can chain
+ * across multiple tables, capped at KDB_FK_MAX_CASCADE_DEPTH to catch a
+ * cycle rather than recurse forever. One FK per column (KDB_ERR_EXISTS
+ * if col_name already has one); no composite (multi-column) foreign
+ * keys. kdb_batch_import bypasses this, same as it bypasses NOT NULL/
+ * UNIQUE. */
 KdbStatus kdb_add_foreign_key(KumDB *db, const char *table_name, const char *col_name,
-                              const char *ref_table, const char *ref_col);
+                              const char *ref_table, const char *ref_col,
+                              KdbFkAction on_delete, KdbFkAction on_update);
 
 /* Removes col_name's foreign key. KDB_ERR_NOT_FOUND if it doesn't have one. */
 KdbStatus kdb_drop_foreign_key(KumDB *db, const char *table_name, const char *col_name);

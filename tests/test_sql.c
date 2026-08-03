@@ -2446,6 +2446,106 @@ static void test_foreign_keys_and_checks(void) {
     teardown(db);
 }
 
+static void test_fk_cascade_actions(void) {
+    KumDB *db;
+    setup(&db);
+
+    /* ON DELETE CASCADE */
+    ASSERT_OK(sql(db, "CREATE TABLE customers (name TEXT UNIQUE)"));
+    ASSERT_OK(sql(db, "CREATE TABLE orders (customer_id INT REFERENCES customers(id) ON DELETE CASCADE, amount FLOAT)"));
+    KdbRows *rows = NULL;
+    ASSERT_OK(kdb_exec_sql(db, "INSERT INTO customers (name) VALUES ('alice') RETURNING id", &rows, NULL));
+    int64_t alice_id = 0;
+    if (rows && rows->count == 1) ASSERT_OK(kdb_row_get_int(&rows->rows[0], "id", &alice_id));
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+    {
+        char q[128];
+        snprintf(q, sizeof(q), "INSERT INTO orders (customer_id, amount) VALUES (%lld, 10.0)", (long long)alice_id);
+        ASSERT_OK(sql(db, q));
+        snprintf(q, sizeof(q), "INSERT INTO orders (customer_id, amount) VALUES (%lld, 20.0)", (long long)alice_id);
+        ASSERT_OK(sql(db, q));
+    }
+    ASSERT_EQ(count_all(db, "orders"), 2);
+    ASSERT_OK(sql(db, "DELETE FROM customers WHERE name = 'alice'"));
+    ASSERT_EQ(count_all(db, "customers"), 0);
+    ASSERT_EQ(count_all(db, "orders"), 0); /* cascaded away */
+
+    /* ON DELETE SET NULL -- and rejected on a NOT NULL column */
+    ASSERT_OK(sql(db, "CREATE TABLE tags (name TEXT UNIQUE)"));
+    ASSERT_OK(sql(db, "CREATE TABLE posts (title TEXT, tag_id INT REFERENCES tags(id) ON DELETE SET NULL)"));
+    ASSERT_ERR(sql(db, "CREATE TABLE bad (x INT NOT NULL REFERENCES tags(id) ON DELETE SET NULL)"));
+    ASSERT_OK(kdb_exec_sql(db, "INSERT INTO tags (name) VALUES ('news') RETURNING id", &rows, NULL));
+    int64_t tag_id = 0;
+    if (rows && rows->count == 1) ASSERT_OK(kdb_row_get_int(&rows->rows[0], "id", &tag_id));
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+    {
+        char q[128];
+        snprintf(q, sizeof(q), "INSERT INTO posts (title, tag_id) VALUES ('breaking', %lld)", (long long)tag_id);
+        ASSERT_OK(sql(db, q));
+    }
+    ASSERT_OK(sql(db, "DELETE FROM tags WHERE name = 'news'"));
+    ASSERT_EQ(count_all(db, "posts"), 1); /* the post itself survives */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM posts WHERE tag_id IS NULL", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* ON UPDATE CASCADE propagates the new referenced value */
+    ASSERT_OK(sql(db, "CREATE TABLE depts (code TEXT UNIQUE)"));
+    ASSERT_OK(sql(db, "CREATE TABLE emps (name TEXT, dept_code TEXT REFERENCES depts(code) ON UPDATE CASCADE)"));
+    ASSERT_OK(sql(db, "INSERT INTO depts (code) VALUES ('ENG')"));
+    ASSERT_OK(sql(db, "INSERT INTO emps (name, dept_code) VALUES ('bob', 'ENG')"));
+    ASSERT_OK(sql(db, "UPDATE depts SET code = 'ENGINEERING' WHERE code = 'ENG'"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM emps WHERE dept_code = 'ENGINEERING'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM emps WHERE dept_code = 'ENG'", &rows, NULL));
+    ASSERT(rows && rows->count == 0u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* multi-level cascade chain: A -> B -> C, all ON DELETE CASCADE */
+    ASSERT_OK(sql(db, "CREATE TABLE ta (name TEXT UNIQUE)"));
+    ASSERT_OK(sql(db, "CREATE TABLE tb (a_id INT REFERENCES ta(id) ON DELETE CASCADE)"));
+    ASSERT_OK(sql(db, "CREATE TABLE tc (b_id INT REFERENCES tb(id) ON DELETE CASCADE)"));
+    ASSERT_OK(kdb_exec_sql(db, "INSERT INTO ta (name) VALUES ('root') RETURNING id", &rows, NULL));
+    int64_t a_id = 0;
+    if (rows && rows->count == 1) ASSERT_OK(kdb_row_get_int(&rows->rows[0], "id", &a_id));
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+    {
+        char q[128];
+        snprintf(q, sizeof(q), "INSERT INTO tb (a_id) VALUES (%lld) RETURNING id", (long long)a_id);
+        ASSERT_OK(kdb_exec_sql(db, q, &rows, NULL));
+    }
+    int64_t b_id = 0;
+    if (rows && rows->count == 1) ASSERT_OK(kdb_row_get_int(&rows->rows[0], "id", &b_id));
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+    {
+        char q[128];
+        snprintf(q, sizeof(q), "INSERT INTO tc (b_id) VALUES (%lld)", (long long)b_id);
+        ASSERT_OK(sql(db, q));
+    }
+    ASSERT_EQ(count_all(db, "tc"), 1);
+    ASSERT_OK(sql(db, "DELETE FROM ta WHERE name = 'root'"));
+    ASSERT_EQ(count_all(db, "ta"), 0);
+    ASSERT_EQ(count_all(db, "tb"), 0); /* cascaded from ta */
+    ASSERT_EQ(count_all(db, "tc"), 0); /* cascaded transitively through tb */
+
+    /* RESTRICT is still the default with no ON DELETE/UPDATE clause */
+    ASSERT_OK(sql(db, "CREATE TABLE parents (name TEXT UNIQUE)"));
+    ASSERT_OK(sql(db, "CREATE TABLE children (parent_id INT REFERENCES parents(id))"));
+    ASSERT_OK(kdb_exec_sql(db, "INSERT INTO parents (name) VALUES ('mom') RETURNING id", &rows, NULL));
+    int64_t parent_id = 0;
+    if (rows && rows->count == 1) ASSERT_OK(kdb_row_get_int(&rows->rows[0], "id", &parent_id));
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+    {
+        char q[128];
+        snprintf(q, sizeof(q), "INSERT INTO children (parent_id) VALUES (%lld)", (long long)parent_id);
+        ASSERT_OK(sql(db, q));
+    }
+    ASSERT_ERR(sql(db, "DELETE FROM parents WHERE name = 'mom'"));
+
+    teardown(db);
+}
+
 static void test_unique_not_null_constraints(void) {
     KumDB *db;
     setup(&db);
@@ -4024,6 +4124,7 @@ int main(void) {
     test_alter_table();
     test_alter_column_type();
     test_foreign_keys_and_checks();
+    test_fk_cascade_actions();
     test_unique_not_null_constraints();
     test_create_drop_index();
     test_composite_indexes();

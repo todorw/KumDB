@@ -571,7 +571,8 @@ KdbStatus kdb_table_alter_column_type(KdbTable *tbl, const char *col_name, KdbTy
  * kdb_add_foreign_key in kumdb.c, which validates that before calling
  * this). One FK per column -- KDB_ERR_EXISTS if col_name already has one. */
 KdbStatus kdb_table_add_foreign_key(KdbTable *tbl, const char *col_name,
-                                    const char *ref_table, const char *ref_col) {
+                                    const char *ref_table, const char *ref_col,
+                                    KdbFkAction on_delete, KdbFkAction on_update) {
     if (!tbl || !col_name || !ref_table || !ref_col) {
         kdb_err_null_arg("tbl/col_name/ref_table/ref_col", "kdb_table_add_foreign_key");
         return KDB_ERR_BAD_ARG;
@@ -588,9 +589,17 @@ KdbStatus kdb_table_add_foreign_key(KdbTable *tbl, const char *col_name,
         kdb_set_error(KDB_ERR_EXISTS, "Column '%s' on table '%s' already has a foreign key.", col_name, tbl->name);
         return KDB_ERR_EXISTS;
     }
+    if ((on_delete == KDB_FK_SET_NULL || on_update == KDB_FK_SET_NULL) && !col->nullable) {
+        kdb_set_error(KDB_ERR_BAD_ARG,
+            "Column '%s' on table '%s' is NOT NULL -- SET NULL doesn't make sense for its foreign key.",
+            col_name, tbl->name);
+        return KDB_ERR_BAD_ARG;
+    }
     col->has_fk = 1;
     KDB_STRLCPY(col->fk_ref_table, ref_table, KDB_MAX_NAME_LEN);
     KDB_STRLCPY(col->fk_ref_col, ref_col, KDB_MAX_NAME_LEN);
+    col->on_delete = (uint8_t)on_delete;
+    col->on_update = (uint8_t)on_update;
 
     tbl->dirty = 1;
     return kdb_storage_flush_header(tbl);

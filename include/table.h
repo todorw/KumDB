@@ -85,9 +85,12 @@ KdbStatus kdb_table_alter_column_type(KdbTable *tbl, const char *col_name, KdbTy
 /* Sets col_name's FK metadata only -- doesn't verify ref_table/ref_col
  * exist (this handle can't look up another table; kdb_add_foreign_key in
  * kumdb.c does that first). KDB_ERR_EXISTS if col_name already has a FK
- * (one per column, no composite foreign keys). */
+ * (one per column, no composite foreign keys). on_delete/on_update are
+ * KDB_FK_RESTRICT/CASCADE/SET_NULL -- KDB_ERR_BAD_ARG if either is
+ * SET_NULL but col_name isn't nullable. */
 KdbStatus kdb_table_add_foreign_key(KdbTable *tbl, const char *col_name,
-                                    const char *ref_table, const char *ref_col);
+                                    const char *ref_table, const char *ref_col,
+                                    KdbFkAction on_delete, KdbFkAction on_update);
 
 /* Clears col_name's FK metadata. KDB_ERR_NOT_FOUND if it doesn't have one. */
 KdbStatus kdb_table_drop_foreign_key(KdbTable *tbl, const char *col_name);

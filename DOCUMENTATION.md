@@ -312,14 +312,15 @@ Turning either flag on later (`kdb_alter_column_nullable`/
 rows that already violate the new rule aren't retroactively checked or
 rewritten.
 
-`kdb_add_foreign_key(db, table, col, ref_table, ref_col)` and
-`kdb_add_check_constraint(db, table, col, op, literal)` add real,
-enforced constraints the same way from the C API directly (`kdb_drop_
-foreign_key` removes one) — see `ALTER TABLE`'s `REFERENCES`/`FOREIGN
-KEY`/`CHECK` forms below for the full semantics (RESTRICT-only foreign
-keys, the six-comparison-operator CHECK, both enforced by `kdb_add`/
-`kdb_update`/`kdb_delete` regardless of whether they were declared from
-SQL or here). `kdb_batch_import` bypasses both, same as it bypasses NOT
+`kdb_add_foreign_key(db, table, col, ref_table, ref_col, on_delete,
+on_update)` and `kdb_add_check_constraint(db, table, col, op, literal)`
+add real, enforced constraints the same way from the C API directly
+(`kdb_drop_foreign_key` removes one) — see `ALTER TABLE`'s
+`REFERENCES`/`FOREIGN KEY`/`CHECK` forms below for the full semantics
+(`on_delete`/`on_update` are `KDB_FK_RESTRICT`/`KDB_FK_CASCADE`/
+`KDB_FK_SET_NULL`; the six-comparison-operator CHECK; both enforced by
+`kdb_add`/`kdb_update`/`kdb_delete` regardless of whether they were
+declared from SQL or here). `kdb_batch_import` bypasses both, same as it bypasses NOT
 NULL/UNIQUE.
 
 ### Errors, printing, misc
@@ -558,10 +559,10 @@ kdb_exec_sql_params(db, "SELECT * FROM employees WHERE age >= ? AND dept = ?",
 ```
 
 ```sql
-CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2)], ...
-                [, FOREIGN KEY (col) REFERENCES t2(col2)]* [, CHECK (col op literal)]*)
-ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2)]
-ALTER TABLE t ADD FOREIGN KEY (col) REFERENCES t2(col2)
+CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2) [ON DELETE|UPDATE action]], ...
+                [, FOREIGN KEY (col) REFERENCES t2(col2) [ON DELETE|UPDATE action]]* [, CHECK (col op literal)]*)
+ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2) [ON DELETE|UPDATE action]]
+ALTER TABLE t ADD FOREIGN KEY (col) REFERENCES t2(col2) [ON DELETE action] [ON UPDATE action]  -- action: RESTRICT | CASCADE | SET NULL
 ALTER TABLE t ADD CHECK (col op literal)
 ALTER TABLE t DROP [COLUMN] col
 ALTER TABLE t DROP FOREIGN KEY (col)
@@ -770,20 +771,36 @@ CREATE TABLE orders (customer_id INT REFERENCES customers(id), amount FLOAT)
 ```
 
 From then on, `INSERT`/`UPDATE` giving `customer_id` a non-`NULL` value
-with no matching `customers.id` is rejected, and deleting or updating
-away a `customers` row that some `orders` row still points to is
-rejected too — `RESTRICT` semantics, no `ON DELETE`/`ON UPDATE`
-`CASCADE`/`SET NULL`, the write is simply refused. `col2` can be a real
-column or one of the `id`/`created_at`/`updated_at` pseudo-columns —
-referencing a table's own auto `id` (as above) is the most common case,
-even though `id` isn't a "real" schema column (`kdb_table_has_column` is
-false for it — a plain `SELECT id` doesn't project it back out either,
-a separate, pre-existing gap; use `RETURNING id` to get it after an
-`INSERT`). One foreign key per column, no composite (multi-column)
-foreign keys. `ALTER TABLE t ADD FOREIGN KEY (col) REFERENCES
-t2(col2)` adds one after the fact, same validation and enforcement;
-`ALTER TABLE t DROP FOREIGN KEY (col)` removes it. Dropping `col` itself
-takes its foreign key with it.
+with no matching `customers.id` is rejected. `REFERENCES` also takes an
+optional `ON DELETE action` and/or `ON UPDATE action` (`action` is
+`RESTRICT`, `CASCADE`, or `SET NULL`, and the two are independent of
+each other — a delete follows `ON DELETE`'s action, an update that
+changes the referenced value follows `ON UPDATE`'s):
+
+```sql
+CREATE TABLE orders (customer_id INT REFERENCES customers(id) ON DELETE CASCADE, amount FLOAT)
+```
+
+`RESTRICT` (the default if the clause is omitted entirely, same as
+before this existed) rejects deleting or updating away a `customers` row
+that some `orders` row still points to. `CASCADE` deletes the
+referencing `orders` rows too (or, on an update, propagates the new
+value onto them instead). `SET NULL` sets `customer_id` to `NULL` on
+them instead of deleting/updating anything — `customer_id` must be
+nullable, or adding the foreign key is rejected up front. `CASCADE`/`SET
+NULL` chain across multiple tables (`A` references `B` references `C`),
+capped at a fixed depth so a cycle fails cleanly instead of recursing
+forever. `col2` can be a real column or one of the `id`/`created_at`/
+`updated_at` pseudo-columns — referencing a table's own auto `id` (as
+above) is the most common case, even though `id` isn't a "real" schema
+column (`kdb_table_has_column` is false for it — a plain `SELECT id`
+doesn't project it back out either, a separate, pre-existing gap; use
+`RETURNING id` to get it after an `INSERT`). One foreign key per column,
+no composite (multi-column) foreign keys. `ALTER TABLE t ADD FOREIGN KEY
+(col) REFERENCES t2(col2) [ON DELETE action] [ON UPDATE action]` adds
+one after the fact, same validation and enforcement; `ALTER TABLE t DROP
+FOREIGN KEY (col)` removes it. Dropping `col` itself takes its foreign
+key with it.
 
 **`CHECK (col op literal)`** — as its own table-level item in
 `CREATE TABLE`, or via `ALTER TABLE t ADD CHECK (col op literal)` —

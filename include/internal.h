@@ -128,8 +128,30 @@ typedef struct {
     uint8_t  has_fk;
     char     fk_ref_table[KDB_MAX_NAME_LEN];
     char     fk_ref_col[KDB_MAX_NAME_LEN];
-    uint8_t  _pad[4]; /* reserved for a future 2.x minor extension, same discipline as _pad above used to follow */
+    /* Added in file format 2.0, alongside has_fk/fk_ref_table/fk_ref_col
+     * (part of the same growth, this pad slot was already reserved --
+     * within-2.0 budget, not a new minor version). What happens to a
+     * referencing row when the row it points to is deleted/updated --
+     * KdbFkAction, KDB_FK_RESTRICT (0) is the default a pre-#40 FK
+     * (task #35) always meant, so an existing column reading these two
+     * bytes as 0 behaves exactly as it always did. */
+    uint8_t  on_delete;
+    uint8_t  on_update;
+    uint8_t  _pad[2]; /* reserved for a future 2.x minor extension, same discipline as _pad above used to follow */
 } KdbColumn;
+
+/* has_fk's on_delete/on_update action. RESTRICT (0, the original-and-
+ * only behavior before #40) rejects the delete/update if any row still
+ * references the value; CASCADE deletes/updates the referencing rows
+ * too (deleting them, or propagating the new value, respectively);
+ * SET_NULL sets the referencing rows' FK column to NULL instead (the
+ * column must be nullable -- checked at FK-creation time, not deferred
+ * to whenever a delete/update actually needs it). CASCADE/SET_NULL can
+ * chain across multiple tables (A -> B -> C); capped at
+ * KDB_FK_MAX_CASCADE_DEPTH to catch a cycle instead of recursing
+ * forever. */
+typedef enum { KDB_FK_RESTRICT = 0, KDB_FK_CASCADE = 1, KDB_FK_SET_NULL = 2 } KdbFkAction;
+#define KDB_FK_MAX_CASCADE_DEPTH 8
 
 
 /* A real composite (multi-column) index's definition: which columns (by

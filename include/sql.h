@@ -16,10 +16,10 @@ extern "C" {
  * lines) are both stripped like whitespace anywhere a token could start.
  *
  * Supported:
- *   CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2)], ...
- *                   [, FOREIGN KEY (col) REFERENCES t2(col2)]* [, CHECK (col OP literal)]*)
- *   ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2)]
- *   ALTER TABLE t ADD FOREIGN KEY (col) REFERENCES t2(col2)
+ *   CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2) [ON DELETE|UPDATE action]], ...
+ *                   [, FOREIGN KEY (col) REFERENCES t2(col2) [ON DELETE|UPDATE action]]* [, CHECK (col OP literal)]*)
+ *   ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2) [ON DELETE|UPDATE action]]
+ *   ALTER TABLE t ADD FOREIGN KEY (col) REFERENCES t2(col2) [ON DELETE action] [ON UPDATE action]  -- action: RESTRICT | CASCADE | SET NULL
  *   ALTER TABLE t ADD CHECK (col OP literal)
  *   ALTER TABLE t DROP [COLUMN] col
  *   ALTER TABLE t DROP FOREIGN KEY (col)
@@ -442,21 +442,30 @@ extern "C" {
  * column's current type. Renaming a column or table to a name that's
  * already taken errors rather than colliding silently.
  *
- * REFERENCES t2(col2), as a column modifier (col TYPE ... REFERENCES
- * t2(col2)) or as its own table-level item (FOREIGN KEY (col) REFERENCES
- * t2(col2)), declares a foreign key -- t2 and col2 must already exist
- * (checked immediately, not deferred). From then on, col must be NULL or
- * equal to some existing t2.col2 value: INSERT/UPDATE giving col a
- * non-NULL value with no match in t2.col2 is rejected, and deleting or
- * updating away a t2 row that col still points to is rejected too
- * (RESTRICT -- no ON DELETE/UPDATE CASCADE or SET NULL, the write is
- * simply refused). col2 can be a real column or one of the id/created_at/
- * updated_at pseudo-columns (referencing a table's own auto id is the
- * most common case, even though it's not a "real" schema column). One FK
- * per column; no composite (multi-column) foreign keys. ALTER TABLE t ADD
- * FOREIGN KEY (col) REFERENCES t2(col2) adds one after the fact (same
- * validation and enforcement); ALTER TABLE t DROP FOREIGN KEY (col)
- * removes it. Dropping col itself drops its FK along with it.
+ * REFERENCES t2(col2) [ON DELETE action] [ON UPDATE action], as a column
+ * modifier (col TYPE ... REFERENCES t2(col2)) or as its own table-level
+ * item (FOREIGN KEY (col) REFERENCES t2(col2)), declares a foreign key --
+ * t2 and col2 must already exist (checked immediately, not deferred).
+ * From then on, col must be NULL or equal to some existing t2.col2
+ * value: INSERT/UPDATE giving col a non-NULL value with no match in
+ * t2.col2 is rejected. action is RESTRICT (the default if the clause is
+ * omitted), CASCADE, or SET NULL, and ON DELETE/ON UPDATE are
+ * independent of each other (a delete follows ON DELETE's action, an
+ * update that changes the referenced value follows ON UPDATE's):
+ * RESTRICT rejects deleting/updating away a t2 row that col still points
+ * to; CASCADE deletes the referencing rows too (or propagates the new
+ * value, for an update); SET NULL sets col to NULL on them instead (col
+ * must be nullable -- rejected at FK-creation time otherwise). CASCADE/
+ * SET NULL chain across multiple tables (A references B references C),
+ * capped at a fixed depth to catch a cycle rather than recurse forever.
+ * col2 can be a real column or one of the id/created_at/updated_at
+ * pseudo-columns (referencing a table's own auto id is the most common
+ * case, even though it's not a "real" schema column). One FK per column;
+ * no composite (multi-column) foreign keys. ALTER TABLE t ADD FOREIGN
+ * KEY (col) REFERENCES t2(col2) [ON DELETE ...] [ON UPDATE ...] adds one
+ * after the fact (same validation and enforcement); ALTER TABLE t DROP
+ * FOREIGN KEY (col) removes it. Dropping col itself drops its FK along
+ * with it.
  *
  * CHECK (col OP literal), as its own table-level item in CREATE TABLE or
  * via ALTER TABLE t ADD CHECK (col OP literal), restricts col's values --
