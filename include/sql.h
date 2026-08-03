@@ -111,6 +111,16 @@ extern "C" {
  * window function (OVER on it is rejected, unlike the others). HAVING
  * filters the aggregated output (needs GROUP BY or an aggregate item).
  *
+ * Any GROUP BY-collapsing aggregate call (DISTINCT or not) accepts a
+ * trailing FILTER (WHERE cond [AND|OR cond ...]): only rows matching that
+ * aggregate's own filter are folded into it, so several differently-
+ * filtered aggregates can share one GROUP BY pass -- "SELECT dept,
+ * COUNT(*), COUNT(*) FILTER (WHERE status='done') FROM orders GROUP BY
+ * dept" -- instead of a CASE WHEN trick inside SUM/COUNT or separate
+ * queries. Same "no parens within one condition group" limit CASE's WHEN
+ * has. Not supported combined with OVER (...) -- only as a GROUP BY-
+ * collapsing aggregate, not a window function.
+ *
  * Scalar functions also work as a SELECT item, freely alongside plain
  * columns/CASE/window functions (not combined with GROUP BY/a plain
  * aggregate, same restriction CASE and window functions have): UPPER(x)/

@@ -2017,6 +2017,16 @@ typedef struct {
     int      is_distinct;                 /* COUNT(DISTINCT col) only */
     char     agg_sep[KDB_SQL_CASE_VAL_BUF]; /* SQL_AGG_STRING_AGG only: the separator literal */
 
+    /* agg(...) FILTER (WHERE cond [AND|OR cond ...]) -- only rows matching
+     * the filter are folded into this one aggregate's accumulation, same
+     * "OR:"-prefixed OR'd-AND-groups filter-string convention (and same
+     * no-parens-within-one-group scope) CASE's WHEN conditions use above.
+     * Not supported combined with OVER -- only as a GROUP BY-collapsing
+     * aggregate. */
+    int      has_filter;
+    char     filter_conds[KDB_SQL_MAX_CASE_SUBCONDS][KDB_SQL_IDENT_BUF];
+    int      n_filter_conds;
+
     int           is_case;
     SqlCaseBranch case_branches[KDB_SQL_MAX_CASE_BRANCHES];
     int           n_case_branches;
@@ -2968,13 +2978,15 @@ static void sql__filter_rows_tree(KumDB *db, const char *outer_alias, KdbRows *r
 
 /* Same AND-within-group / OR-across-groups semantics the pre-condition-
  * tree WHERE parser's "OR:" convention encoded (see sql__parse_case_item):
- * a row matches a WHEN if ANY group's conditions are ALL true. */
-static int sql__case_branch_matches(const KdbRow *row, const SqlCaseBranch *br) {
+ * a row matches if ANY group's conditions are ALL true. Shared by CASE's
+ * WHEN conditions and aggregate FILTER (WHERE ...) conditions -- both are
+ * a small fixed array of filter strings, evaluated the same way. */
+static int sql__conds_match(const KdbRow *row, const char conds[][KDB_SQL_IDENT_BUF], int n_conds) {
     int group_ok = 1;
     int result = 0;
-    for (int i = 0; i < br->n_cond_filters; i++) {
+    for (int i = 0; i < n_conds; i++) {
         SqlRowCond c;
-        if (!sql__parse_row_cond(br->cond_filters[i], &c)) return 0;
+        if (!sql__parse_row_cond(conds[i], &c)) return 0;
         if (c.is_or_start && i > 0) {
             if (group_ok) result = 1;
             group_ok = 1;
@@ -2983,6 +2995,14 @@ static int sql__case_branch_matches(const KdbRow *row, const SqlCaseBranch *br) 
     }
     if (group_ok) result = 1;
     return result;
+}
+
+static int sql__case_branch_matches(const KdbRow *row, const SqlCaseBranch *br) {
+    return sql__conds_match(row, br->cond_filters, br->n_cond_filters);
+}
+
+static int sql__item_filter_matches(const KdbRow *row, const SqlSelectItem *item) {
+    return sql__conds_match(row, item->filter_conds, item->n_filter_conds);
 }
 
 /* Evaluates one already-parsed CASE item against a specific row -- first
@@ -3283,7 +3303,6 @@ typedef struct {
      * rows; NULL = that column was missing/null on this group's rows.
      * Only the first ngroup_cols slots are used. */
     const KdbField *key_refs[KDB_SQL_MAX_GROUP_COLS];
-    size_t          row_count;
     double          sum[KDB_SQL_MAX_COLUMNS];
     size_t          count_nonnull[KDB_SQL_MAX_COLUMNS];
     const KdbField *min_ref[KDB_SQL_MAX_COLUMNS];
@@ -3331,11 +3350,14 @@ static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uin
         }
 
         SqlGroupAcc *g = &groups[gi];
-        g->row_count++;
 
         for (uint32_t it = 0; it < nitems; it++) {
             if (items[it].fn == SQL_AGG_NONE) continue;
-            if (items[it].fn == SQL_AGG_COUNT && strcmp(items[it].arg_col, "*") == 0) continue;
+            if (items[it].has_filter && !sql__item_filter_matches(row, &items[it])) continue;
+            if (items[it].fn == SQL_AGG_COUNT && strcmp(items[it].arg_col, "*") == 0) {
+                g->count_nonnull[it]++; /* COUNT(*) [FILTER ...] both counted here now, not via row_count */
+                continue;
+            }
 
             const KdbField *f = kdb_row_get(row, items[it].arg_col);
             if (!f) continue;
@@ -3386,6 +3408,7 @@ static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uin
                     if (!sql__field_equal(groups[gi].key_refs[k], kf)) { belongs = 0; break; }
                 }
                 if (!belongs) continue;
+                if (items[it].has_filter && !sql__item_filter_matches(row, &items[it])) continue;
                 const KdbField *f = kdb_row_get(row, items[it].arg_col);
                 if (!f || f->type == KDB_TYPE_NULL) continue;
                 int dup = 0;
@@ -3440,7 +3463,7 @@ static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uin
                 }
                 case SQL_AGG_COUNT:
                     of->type = KDB_TYPE_INT;
-                    of->v.as_int = (int64_t)(strcmp(items[it].arg_col, "*") == 0 ? g->row_count : g->count_nonnull[it]);
+                    of->v.as_int = (int64_t)g->count_nonnull[it];
                     break;
                 case SQL_AGG_SUM:
                     of->type = KDB_TYPE_FLOAT;
@@ -3478,6 +3501,7 @@ static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uin
                             if (!sql__field_equal(g->key_refs[k], kf)) { belongs = 0; break; }
                         }
                         if (!belongs) continue;
+                        if (items[it].has_filter && !sql__item_filter_matches(arow, &items[it])) continue;
                         const KdbField *f = kdb_row_get(arow, items[it].arg_col);
                         if (!f || f->type == KDB_TYPE_NULL) continue;
                         char valbuf[KDB_SQL_IDENT_BUF];
@@ -4775,7 +4799,38 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
                     if (fn == SQL_AGG_STRING_AGG && sql__kw_is(&p->cur, "OVER"))
                         return sql__err("%s() as a window function isn't supported -- only as a GROUP BY-collapsing aggregate", first_ident);
 
+                    if (!is_window_only_fn && sql__kw_is(&p->cur, "FILTER")) {
+                        sql__advance(p);
+                        if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after FILTER");
+                        sql__advance(p);
+                        if (!sql__kw_is(&p->cur, "WHERE")) return sql__err("expected WHERE inside FILTER (...)");
+                        sql__advance(p);
+
+                        item.has_filter = 1;
+                        int start_new_group = 0;
+                        for (;;) {
+                            if (item.n_filter_conds >= KDB_SQL_MAX_CASE_SUBCONDS)
+                                return sql__err("too many conditions in one FILTER (WHERE ...) (max %d)", KDB_SQL_MAX_CASE_SUBCONDS);
+                            SqlCorrResult unused_corr = { SQL_COND_LEAF, NULL, NULL, NULL };
+                            char *cond = sql__parse_condition(p, db, NULL, &unused_corr); /* NULL: no outer row to correlate a subquery against inside FILTER */
+                            if (!cond) return kdb_last_status();
+                            if (start_new_group) snprintf(item.filter_conds[item.n_filter_conds], sizeof(item.filter_conds[0]), "OR:%s", cond);
+                            else                 snprintf(item.filter_conds[item.n_filter_conds], sizeof(item.filter_conds[0]), "%s", cond);
+                            free(cond);
+                            item.n_filter_conds++;
+                            start_new_group = 0;
+
+                            if (sql__kw_is(&p->cur, "OR"))  { sql__advance(p); start_new_group = 1; continue; }
+                            if (sql__kw_is(&p->cur, "AND")) { sql__advance(p); continue; }
+                            break;
+                        }
+                        if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing FILTER (WHERE ...)");
+                        sql__advance(p);
+                    }
+
                     if (sql__kw_is(&p->cur, "OVER")) {
+                        if (item.has_filter)
+                            return sql__err("FILTER (WHERE ...) isn't supported combined with OVER (...) -- only as a GROUP BY-collapsing aggregate");
                         item.is_window = 1;
                         if (!sql__parse_window_over(p, &item)) return kdb_last_status();
                         has_window = 1;

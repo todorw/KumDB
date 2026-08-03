@@ -700,6 +700,24 @@ SELECT region, COUNT(DISTINCT rep) AS n_reps, STRING_AGG(rep, ', ') AS reps
 aggregate, not as a window function (`OVER (...)` on it is rejected) —
 the other aggregates can be either, `OVER`'s presence is what decides.
 
+Any `GROUP BY`-collapsing aggregate — `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/
+`STRING_AGG`/`GROUP_CONCAT`, `DISTINCT` or not — accepts a trailing
+`FILTER (WHERE cond [AND|OR cond ...])`: only rows matching that
+aggregate's own filter are folded into it, so several differently-
+filtered aggregates can share one `GROUP BY` pass instead of needing a
+`CASE WHEN ... END` trick inside `SUM`/`COUNT` or several separate
+queries. No parens within one `FILTER`'s conditions (same limit `CASE`'s
+`WHEN` has). Not supported combined with `OVER (...)` — only as a
+`GROUP BY`-collapsing aggregate, not a window function.
+
+```sql
+SELECT dept,
+       COUNT(*) AS total,
+       COUNT(*) FILTER (WHERE status = 'done') AS done_count,
+       SUM(amount) FILTER (WHERE status = 'done') AS done_sum
+    FROM orders GROUP BY dept
+```
+
 **Scalar functions** can also be a `SELECT` item, freely alongside plain
 columns/`CASE`/window functions (but not combined with `GROUP BY` or a
 plain aggregate in the same `SELECT`, same restriction `CASE` and window

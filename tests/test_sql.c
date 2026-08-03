@@ -1018,6 +1018,88 @@ static void test_group_by_extensions(void) {
     teardown(db);
 }
 
+static void test_aggregate_filter(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE orders (dept TEXT, amount FLOAT, status TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO orders (dept, amount, status) VALUES ('eng', 100, 'done')"));
+    ASSERT_OK(sql(db, "INSERT INTO orders (dept, amount, status) VALUES ('eng', 50, 'pending')"));
+    ASSERT_OK(sql(db, "INSERT INTO orders (dept, amount, status) VALUES ('eng', 200, 'done')"));
+    ASSERT_OK(sql(db, "INSERT INTO orders (dept, amount, status) VALUES ('sales', 10, 'done')"));
+    ASSERT_OK(sql(db, "INSERT INTO orders (dept, amount, status) VALUES ('sales', 20, 'pending')"));
+
+    KdbRows *rows = NULL;
+
+    /* COUNT(*) FILTER (WHERE ...) alongside a plain COUNT(*), per group */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT dept, COUNT(*) AS total, COUNT(*) FILTER (WHERE status = 'done') AS done_count "
+        "FROM orders GROUP BY dept ORDER BY dept ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        int64_t total0 = 0, done0 = 0, total1 = 0, done1 = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "total", &total0));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "done_count", &done0));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[1], "total", &total1));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[1], "done_count", &done1));
+        ASSERT_EQ(total0, 3); ASSERT_EQ(done0, 2); /* eng: 3 rows, 2 done */
+        ASSERT_EQ(total1, 2); ASSERT_EQ(done1, 1); /* sales: 2 rows, 1 done */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* SUM(...) FILTER (WHERE ...) */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT dept, SUM(amount) FILTER (WHERE status = 'done') AS done_sum "
+        "FROM orders GROUP BY dept ORDER BY dept ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        double s0 = 0, s1 = 0;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "done_sum", &s0));
+        ASSERT_OK(kdb_row_get_float(&rows->rows[1], "done_sum", &s1));
+        ASSERT(s0 > 299.9 && s0 < 300.1); /* eng: 100 + 200 */
+        ASSERT(s1 > 9.9 && s1 < 10.1);    /* sales: 10 */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* FILTER with AND, no GROUP BY -- single summary row */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT COUNT(*) FILTER (WHERE dept = 'eng' AND status = 'done') AS c FROM orders", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        int64_t c = -1;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "c", &c));
+        ASSERT_EQ(c, 2);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* COUNT(DISTINCT col) FILTER (WHERE ...) */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT COUNT(DISTINCT dept) FILTER (WHERE status = 'done') AS c FROM orders", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        int64_t c = -1;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "c", &c));
+        ASSERT_EQ(c, 2); /* both eng and sales have at least one done row */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* STRING_AGG(...) FILTER (WHERE ...) */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT dept, STRING_AGG(status, ',') FILTER (WHERE amount > 15) AS agg "
+        "FROM orders GROUP BY dept ORDER BY dept ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const char *a1 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "agg", &a1));
+        ASSERT_STR(a1, "pending"); /* sales: only the amount=20 row clears >15 */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* FILTER isn't supported combined with OVER (window functions) */
+    ASSERT_ERR(sql(db, "SELECT SUM(amount) FILTER (WHERE status = 'done') OVER (PARTITION BY dept) FROM orders"));
+
+    teardown(db);
+}
+
 static void test_multi_column_group_by(void) {
     KumDB *db;
     setup(&db);
@@ -2785,6 +2867,7 @@ int main(void) {
     test_parenthesized_where();
     test_group_by_and_aggregates();
     test_group_by_extensions();
+    test_aggregate_filter();
     test_multi_column_group_by();
     test_having();
     test_union();
