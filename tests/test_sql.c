@@ -2546,6 +2546,91 @@ static void test_fk_cascade_actions(void) {
     teardown(db);
 }
 
+static void test_composite_foreign_key(void) {
+    KumDB *db;
+    setup(&db);
+    KdbRows *rows = NULL;
+
+    /* insert/child-side validation, incl. MATCH SIMPLE (any NULL component skips the check) */
+    ASSERT_OK(sql(db, "CREATE TABLE parts (maker TEXT, model TEXT)"));
+    ASSERT_OK(sql(db, "CREATE TABLE orders (part_maker TEXT, part_model TEXT, qty INT, "
+                      "FOREIGN KEY (part_maker, part_model) REFERENCES parts(maker, model) ON DELETE CASCADE)"));
+    ASSERT_OK(sql(db, "INSERT INTO parts (maker, model) VALUES ('acme', 'x1')"));
+    ASSERT_OK(sql(db, "INSERT INTO orders (part_maker, part_model, qty) VALUES ('acme', 'x1', 5)"));
+    ASSERT_ERR(sql(db, "INSERT INTO orders (part_maker, part_model, qty) VALUES ('acme', 'x2', 1)")); /* no matching pair */
+    ASSERT_ERR(sql(db, "INSERT INTO orders (part_maker, part_model, qty) VALUES ('other', 'x1', 1)")); /* half-matches only */
+    ASSERT_OK(sql(db, "INSERT INTO orders (part_maker, qty) VALUES ('nowhere', 9)")); /* part_model missing -> skipped */
+    ASSERT_EQ(count_all(db, "orders"), 2);
+
+    /* ON DELETE CASCADE (composite) -- only the fully-matched row cascades away */
+    ASSERT_OK(sql(db, "DELETE FROM parts WHERE maker = 'acme'"));
+    ASSERT_EQ(count_all(db, "orders"), 1);
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM orders WHERE part_maker = 'acme'", &rows, NULL));
+    ASSERT(rows && rows->count == 0u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* ON DELETE SET NULL (composite) -- both components get nulled together */
+    ASSERT_OK(sql(db, "CREATE TABLE parts2 (maker TEXT, model TEXT)"));
+    ASSERT_OK(sql(db, "CREATE TABLE orders2 (part_maker TEXT, part_model TEXT, qty INT, "
+                      "FOREIGN KEY (part_maker, part_model) REFERENCES parts2(maker, model) ON DELETE SET NULL)"));
+    ASSERT_OK(sql(db, "INSERT INTO parts2 (maker, model) VALUES ('bosch', 'z9')"));
+    ASSERT_OK(sql(db, "INSERT INTO orders2 (part_maker, part_model, qty) VALUES ('bosch', 'z9', 3)"));
+    ASSERT_OK(sql(db, "DELETE FROM parts2 WHERE maker = 'bosch'"));
+    ASSERT_EQ(count_all(db, "orders2"), 1); /* the order itself survives */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM orders2 WHERE part_maker IS NULL AND part_model IS NULL", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* SET NULL rejected unless every component column is nullable */
+    ASSERT_ERR(sql(db, "CREATE TABLE bad (a TEXT NOT NULL, b TEXT, "
+                       "FOREIGN KEY (a, b) REFERENCES parts2(maker, model) ON DELETE SET NULL)"));
+
+    /* ON UPDATE CASCADE (composite) -- propagates even when only one component actually changes */
+    ASSERT_OK(sql(db, "CREATE TABLE parts3 (maker TEXT, model TEXT)"));
+    ASSERT_OK(sql(db, "CREATE TABLE orders3 (part_maker TEXT, part_model TEXT, qty INT, "
+                      "FOREIGN KEY (part_maker, part_model) REFERENCES parts3(maker, model) ON UPDATE CASCADE)"));
+    ASSERT_OK(sql(db, "INSERT INTO parts3 (maker, model) VALUES ('sony', 'a1')"));
+    ASSERT_OK(sql(db, "INSERT INTO orders3 (part_maker, part_model, qty) VALUES ('sony', 'a1', 7)"));
+    ASSERT_OK(sql(db, "UPDATE parts3 SET model = 'a2' WHERE maker = 'sony'"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM orders3 WHERE part_maker = 'sony' AND part_model = 'a2'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM orders3 WHERE part_model = 'a1'", &rows, NULL));
+    ASSERT(rows && rows->count == 0u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* RESTRICT is still the default with no ON DELETE/UPDATE clause */
+    ASSERT_OK(sql(db, "CREATE TABLE parts4 (maker TEXT, model TEXT)"));
+    ASSERT_OK(sql(db, "CREATE TABLE orders4 (part_maker TEXT, part_model TEXT, "
+                      "FOREIGN KEY (part_maker, part_model) REFERENCES parts4(maker, model))"));
+    ASSERT_OK(sql(db, "INSERT INTO parts4 (maker, model) VALUES ('lg', 'q7')"));
+    ASSERT_OK(sql(db, "INSERT INTO orders4 (part_maker, part_model) VALUES ('lg', 'q7')"));
+    ASSERT_ERR(sql(db, "DELETE FROM parts4 WHERE maker = 'lg'"));
+
+    /* ALTER TABLE ADD/DROP FOREIGN KEY with 2+ columns */
+    ASSERT_OK(sql(db, "CREATE TABLE t5 (x TEXT, y TEXT)"));
+    ASSERT_OK(sql(db, "CREATE TABLE t6 (a TEXT, b TEXT)"));
+    ASSERT_OK(sql(db, "ALTER TABLE t6 ADD FOREIGN KEY (a, b) REFERENCES t5(x, y) ON DELETE CASCADE"));
+    ASSERT_OK(sql(db, "INSERT INTO t5 (x, y) VALUES ('p', 'q')"));
+    ASSERT_OK(sql(db, "INSERT INTO t6 (a, b) VALUES ('p', 'q')"));
+    ASSERT_ERR(sql(db, "INSERT INTO t6 (a, b) VALUES ('p', 'z')"));
+    ASSERT_OK(sql(db, "ALTER TABLE t6 DROP FOREIGN KEY (a, b)"));
+    ASSERT_OK(sql(db, "INSERT INTO t6 (a, b) VALUES ('p', 'z')")); /* fk gone -- no longer checked */
+
+    /* mismatched column counts on the two sides are rejected */
+    ASSERT_ERR(sql(db, "CREATE TABLE t7 (a TEXT, FOREIGN KEY (a) REFERENCES t5(x, y))"));
+
+    /* single-column FK syntax is completely unaffected */
+    ASSERT_OK(sql(db, "CREATE TABLE sp (name TEXT UNIQUE)"));
+    ASSERT_OK(sql(db, "CREATE TABLE sc (parent_id INT REFERENCES sp(id) ON DELETE CASCADE)"));
+    ASSERT_OK(sql(db, "INSERT INTO sp (name) VALUES ('solo')"));
+    ASSERT_OK(sql(db, "INSERT INTO sc (parent_id) VALUES (1)"));
+    ASSERT_OK(sql(db, "DELETE FROM sp WHERE name = 'solo'"));
+    ASSERT_EQ(count_all(db, "sc"), 0); /* single-column CASCADE still works */
+
+    teardown(db);
+}
+
 static void test_unique_not_null_constraints(void) {
     KumDB *db;
     setup(&db);
@@ -4125,6 +4210,7 @@ int main(void) {
     test_alter_column_type();
     test_foreign_keys_and_checks();
     test_fk_cascade_actions();
+    test_composite_foreign_key();
     test_unique_not_null_constraints();
     test_create_drop_index();
     test_composite_indexes();

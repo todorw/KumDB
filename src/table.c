@@ -630,6 +630,115 @@ KdbStatus kdb_table_drop_foreign_key(KdbTable *tbl, const char *col_name) {
     return kdb_storage_flush_header(tbl);
 }
 
+/* A composite (multi-column) foreign key -- doesn't verify ref_table/
+ * ref_cols actually exist (this handle has no way to look up another
+ * table; see kdb_add_composite_foreign_key in kumdb.c, which validates
+ * that first). n_cols must be 2..KDB_MAX_COMPOSITE_COLS and equal
+ * n_ref_cols (positional correspondence: ref_cols[i] is what col_names[i]
+ * references). KDB_ERR_EXISTS if a composite FK on exactly this column
+ * set (any order) already exists on this table; KDB_ERR_FULL past
+ * KDB_MAX_COMPOSITE_FKS. Unlike single-column FK, this never touches the
+ * pseudo-columns id/created_at/updated_at on either side. */
+KdbStatus kdb_table_add_composite_foreign_key(KdbTable *tbl, const char **col_names, uint32_t n_cols,
+                                              const char *ref_table, const char **ref_cols, uint32_t n_ref_cols,
+                                              KdbFkAction on_delete, KdbFkAction on_update) {
+    if (!tbl || !col_names || !ref_table || !ref_cols || n_cols < 2 || n_cols > KDB_MAX_COMPOSITE_COLS) {
+        kdb_err_bad_arg("col_names/n_cols", "kdb_table_add_composite_foreign_key needs 2..KDB_MAX_COMPOSITE_COLS columns");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (n_cols != n_ref_cols) {
+        kdb_set_error(KDB_ERR_BAD_ARG,
+            "composite foreign key needs the same number of columns on both sides (%u vs %u)", n_cols, n_ref_cols);
+        return KDB_ERR_BAD_ARG;
+    }
+    if (tbl->header.n_composite_fks >= KDB_MAX_COMPOSITE_FKS) {
+        kdb_set_error(KDB_ERR_FULL, "table '%s' already has the max %d composite foreign keys", tbl->name, KDB_MAX_COMPOSITE_FKS);
+        return KDB_ERR_FULL;
+    }
+
+    uint8_t positions[KDB_MAX_COMPOSITE_COLS];
+    int all_nullable = 1;
+    for (uint32_t i = 0; i < n_cols; i++) {
+        const KdbColumn *c = kdb_table_get_column(tbl, col_names[i]);
+        if (!c) {
+            kdb_err_field_not_found(col_names[i], tbl->name);
+            return KDB_ERR_NOT_FOUND;
+        }
+        positions[i] = (uint8_t)(c - tbl->header.columns);
+        if (!c->nullable) all_nullable = 0;
+    }
+    if ((on_delete == KDB_FK_SET_NULL || on_update == KDB_FK_SET_NULL) && !all_nullable) {
+        kdb_set_error(KDB_ERR_BAD_ARG,
+            "every column of this composite foreign key on table '%s' must be nullable for SET NULL to make sense", tbl->name);
+        return KDB_ERR_BAD_ARG;
+    }
+
+    for (uint8_t d = 0; d < tbl->header.n_composite_fks; d++) {
+        KdbCompositeFkDef *def = &tbl->header.composite_fks[d];
+        if (def->n_cols != n_cols) continue;
+        int all_match = 1;
+        for (uint32_t i = 0; i < n_cols && all_match; i++) {
+            int found = 0;
+            for (uint32_t k = 0; k < def->n_cols; k++) if (def->col_positions[k] == positions[i]) { found = 1; break; }
+            if (!found) all_match = 0;
+        }
+        if (all_match) {
+            kdb_set_error(KDB_ERR_EXISTS, "a composite foreign key on exactly these columns already exists on table '%s'", tbl->name);
+            return KDB_ERR_EXISTS;
+        }
+    }
+
+    KdbCompositeFkDef *def = &tbl->header.composite_fks[tbl->header.n_composite_fks];
+    memset(def, 0, sizeof(*def));
+    for (uint32_t i = 0; i < n_cols; i++) {
+        def->col_positions[i] = positions[i];
+        KDB_STRLCPY(def->ref_cols[i], ref_cols[i], KDB_MAX_NAME_LEN);
+    }
+    def->n_cols = (uint8_t)n_cols;
+    KDB_STRLCPY(def->ref_table, ref_table, KDB_MAX_NAME_LEN);
+    def->on_delete = (uint8_t)on_delete;
+    def->on_update = (uint8_t)on_update;
+    tbl->header.n_composite_fks++;
+
+    tbl->dirty = 1;
+    return kdb_storage_flush_header(tbl);
+}
+
+/* Drops a composite foreign key matching exactly this column set (any
+ * order) -- KDB_ERR_NOT_FOUND if none does. */
+KdbStatus kdb_table_drop_composite_foreign_key(KdbTable *tbl, const char **col_names, uint32_t n_cols) {
+    if (!tbl || !col_names || n_cols == 0 || n_cols > KDB_MAX_COMPOSITE_COLS) {
+        kdb_err_null_arg("tbl/col_names", "kdb_table_drop_composite_foreign_key");
+        return KDB_ERR_BAD_ARG;
+    }
+
+    uint8_t positions[KDB_MAX_COMPOSITE_COLS];
+    for (uint32_t i = 0; i < n_cols; i++) {
+        const KdbColumn *c = kdb_table_get_column(tbl, col_names[i]);
+        positions[i] = c ? (uint8_t)(c - tbl->header.columns) : 0xFF;
+    }
+    for (uint8_t d = 0; d < tbl->header.n_composite_fks; d++) {
+        KdbCompositeFkDef *def = &tbl->header.composite_fks[d];
+        if (def->n_cols != n_cols) continue;
+        int all_match = 1;
+        for (uint32_t i = 0; i < n_cols && all_match; i++) {
+            int found = 0;
+            for (uint32_t k = 0; k < def->n_cols; k++) if (def->col_positions[k] == positions[i]) { found = 1; break; }
+            if (!found) all_match = 0;
+        }
+        if (all_match) {
+            memmove(def, def + 1, (size_t)(tbl->header.n_composite_fks - d - 1) * sizeof(*def));
+            memset(&tbl->header.composite_fks[tbl->header.n_composite_fks - 1], 0, sizeof(*def));
+            tbl->header.n_composite_fks--;
+            tbl->dirty = 1;
+            return kdb_storage_flush_header(tbl);
+        }
+    }
+
+    kdb_set_error(KDB_ERR_NOT_FOUND, "no composite foreign key on exactly these columns exists on table '%s'", tbl->name);
+    return KDB_ERR_NOT_FOUND;
+}
+
 /* CHECK (col_name op literal) -- op restricted to the six plain
  * comparisons (see KdbCheckDef), literal one of INT/FLOAT/BOOL/STRING
  * (not NULL -- a NULL comparison target isn't a meaningful check, reject

@@ -447,14 +447,38 @@ KdbStatus kdb_alter_column_type(KumDB *db, const char *table_name, const char *c
  * across multiple tables, capped at KDB_FK_MAX_CASCADE_DEPTH to catch a
  * cycle rather than recurse forever. One FK per column (KDB_ERR_EXISTS
  * if col_name already has one); no composite (multi-column) foreign
- * keys. kdb_batch_import bypasses this, same as it bypasses NOT NULL/
- * UNIQUE. */
+ * keys -- see kdb_add_composite_foreign_key for those. kdb_batch_import
+ * bypasses this, same as it bypasses NOT NULL/UNIQUE. */
 KdbStatus kdb_add_foreign_key(KumDB *db, const char *table_name, const char *col_name,
                               const char *ref_table, const char *ref_col,
                               KdbFkAction on_delete, KdbFkAction on_update);
 
 /* Removes col_name's foreign key. KDB_ERR_NOT_FOUND if it doesn't have one. */
 KdbStatus kdb_drop_foreign_key(KumDB *db, const char *table_name, const char *col_name);
+
+/* Adds a composite (multi-column) foreign key: col_names[0..n_cols) on
+ * table_name, taken together, must always either have a NULL/missing
+ * component (MATCH SIMPLE -- the whole check is skipped for that row) or
+ * match some existing row's ref_cols[0..n_ref_cols) on ref_table
+ * (positionally: col_names[i] corresponds to ref_cols[i]). n_cols must
+ * equal n_ref_cols and be 2..KDB_MAX_COMPOSITE_COLS. ref_table and every
+ * ref_cols entry must already exist as real columns (checked right away)
+ * -- unlike kdb_add_foreign_key, a composite key can NOT reference the
+ * pseudo-columns id/created_at/updated_at on either side. Same on_delete/
+ * on_update semantics (RESTRICT/CASCADE/SET_NULL, independent, chainable
+ * up to KDB_FK_MAX_CASCADE_DEPTH) as kdb_add_foreign_key, applied to the
+ * whole key at once -- a CASCADE update propagates every changed
+ * component together, a CASCADE delete removes the whole referencing row.
+ * KDB_ERR_EXISTS if a composite FK on exactly this column set (any order)
+ * already exists; KDB_ERR_FULL past KDB_MAX_COMPOSITE_FKS on one table. */
+KdbStatus kdb_add_composite_foreign_key(KumDB *db, const char *table_name,
+                                        const char **col_names, uint32_t n_cols,
+                                        const char *ref_table, const char **ref_cols, uint32_t n_ref_cols,
+                                        KdbFkAction on_delete, KdbFkAction on_update);
+
+/* Removes a composite foreign key matching exactly this column set (any
+ * order). KDB_ERR_NOT_FOUND if none does. */
+KdbStatus kdb_drop_composite_foreign_key(KumDB *db, const char *table_name, const char **col_names, uint32_t n_cols);
 
 /* Adds a CHECK (col_name op literal) constraint -- op must be one of
  * KDB_OP_EQ/NEQ/GT/GTE/LT/LTE (no BETWEEN/IN/LIKE/etc); literal.type must

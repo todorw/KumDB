@@ -1738,6 +1738,18 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
     KdbFkAction tfk_on_update[KDB_SQL_MAX_TABLE_LEVEL_FKS];
     int  n_tfk = 0;
 
+    /* Same FOREIGN KEY (...) REFERENCES ...(...) item, but with 2+ columns
+     * on each side -- a composite (multi-column) foreign key, dispatched
+     * to kdb_add_composite_foreign_key instead of kdb_add_foreign_key once
+     * the whole table is created (see the parsing loop below). */
+    char        tcfk_cols[KDB_SQL_MAX_TABLE_LEVEL_FKS][KDB_MAX_COMPOSITE_COLS][KDB_SQL_IDENT_BUF];
+    char        tcfk_ref_table[KDB_SQL_MAX_TABLE_LEVEL_FKS][KDB_SQL_IDENT_BUF];
+    char        tcfk_ref_cols[KDB_SQL_MAX_TABLE_LEVEL_FKS][KDB_MAX_COMPOSITE_COLS][KDB_SQL_IDENT_BUF];
+    uint32_t    tcfk_ncols[KDB_SQL_MAX_TABLE_LEVEL_FKS];
+    KdbFkAction tcfk_on_delete[KDB_SQL_MAX_TABLE_LEVEL_FKS];
+    KdbFkAction tcfk_on_update[KDB_SQL_MAX_TABLE_LEVEL_FKS];
+    int  n_tcfk = 0;
+
     /* Table-level CHECK (col op literal) items. */
     char         chk_col[KDB_MAX_CHECK_CONSTRAINTS][KDB_SQL_IDENT_BUF];
     SqlTokType   chk_op_tok[KDB_MAX_CHECK_CONSTRAINTS];
@@ -1755,14 +1767,27 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
             sql__advance(p);
             if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after FOREIGN KEY in CREATE TABLE '%s'", table_name);
             sql__advance(p);
-            const char *fcol;
-            if (!sql__ident_text(&p->cur, &fcol)) return sql__err("expected a column name after FOREIGN KEY ( in CREATE TABLE '%s'", table_name);
-            char fcol_buf[KDB_SQL_IDENT_BUF];
-            snprintf(fcol_buf, sizeof(fcol_buf), "%.255s", fcol);
+
+            /* One or more columns, comma-separated -- one means a normal
+             * single-column FK, two or more a composite one (dispatched
+             * below once REFERENCES is fully parsed and both sides' column
+             * counts are known to match). */
+            char fcols[KDB_MAX_COMPOSITE_COLS][KDB_SQL_IDENT_BUF];
+            int nfcols = 0;
+            for (;;) {
+                const char *fcol;
+                if (!sql__ident_text(&p->cur, &fcol)) return sql__err("expected a column name in FOREIGN KEY (...) in CREATE TABLE '%s'", table_name);
+                if (nfcols >= KDB_MAX_COMPOSITE_COLS)
+                    return sql__err("too many columns in one FOREIGN KEY (...) in CREATE TABLE '%s' (max %d)", table_name, KDB_MAX_COMPOSITE_COLS);
+                snprintf(fcols[nfcols], sizeof(fcols[0]), "%.255s", fcol);
+                nfcols++;
+                sql__advance(p);
+                if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+                break;
+            }
+            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing FOREIGN KEY (... in CREATE TABLE '%s'", table_name);
             sql__advance(p);
-            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' after FOREIGN KEY (%s in CREATE TABLE '%s'", fcol_buf, table_name);
-            sql__advance(p);
-            if (!sql__kw_is(&p->cur, "REFERENCES")) return sql__err("expected REFERENCES after FOREIGN KEY (%s) in CREATE TABLE '%s'", fcol_buf, table_name);
+            if (!sql__kw_is(&p->cur, "REFERENCES")) return sql__err("expected REFERENCES after FOREIGN KEY (...) in CREATE TABLE '%s'", table_name);
             sql__advance(p);
             const char *rtable;
             if (!sql__ident_text(&p->cur, &rtable)) return sql__err("expected a table name after REFERENCES in CREATE TABLE '%s'", table_name);
@@ -1771,23 +1796,52 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
             sql__advance(p);
             if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after REFERENCES %s in CREATE TABLE '%s'", rtable_buf, table_name);
             sql__advance(p);
-            const char *rcol;
-            if (!sql__ident_text(&p->cur, &rcol)) return sql__err("expected a column name after REFERENCES %s( in CREATE TABLE '%s'", rtable_buf, table_name);
-            char rcol_buf[KDB_SQL_IDENT_BUF];
-            snprintf(rcol_buf, sizeof(rcol_buf), "%.255s", rcol);
-            sql__advance(p);
-            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing REFERENCES %s(%s in CREATE TABLE '%s'", rtable_buf, rcol_buf, table_name);
+
+            char rcols[KDB_MAX_COMPOSITE_COLS][KDB_SQL_IDENT_BUF];
+            int nrcols = 0;
+            for (;;) {
+                const char *rcol;
+                if (!sql__ident_text(&p->cur, &rcol)) return sql__err("expected a column name after REFERENCES %s( in CREATE TABLE '%s'", rtable_buf, table_name);
+                if (nrcols >= KDB_MAX_COMPOSITE_COLS)
+                    return sql__err("too many columns in one REFERENCES (...) in CREATE TABLE '%s' (max %d)", table_name, KDB_MAX_COMPOSITE_COLS);
+                snprintf(rcols[nrcols], sizeof(rcols[0]), "%.255s", rcol);
+                nrcols++;
+                sql__advance(p);
+                if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+                break;
+            }
+            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing REFERENCES %s(...) in CREATE TABLE '%s'", rtable_buf, table_name);
             sql__advance(p);
 
-            if (n_tfk >= KDB_SQL_MAX_TABLE_LEVEL_FKS)
-                return sql__err("too many FOREIGN KEY entries in CREATE TABLE '%s' (max %d)", table_name, KDB_SQL_MAX_TABLE_LEVEL_FKS);
-            snprintf(tfk_col[n_tfk], sizeof(tfk_col[0]), "%s", fcol_buf);
-            snprintf(tfk_ref_table[n_tfk], sizeof(tfk_ref_table[0]), "%s", rtable_buf);
-            snprintf(tfk_ref_col[n_tfk], sizeof(tfk_ref_col[0]), "%s", rcol_buf);
-            tfk_on_delete[n_tfk] = KDB_FK_RESTRICT;
-            tfk_on_update[n_tfk] = KDB_FK_RESTRICT;
-            if (!sql__parse_fk_actions(p, &tfk_on_delete[n_tfk], &tfk_on_update[n_tfk])) return kdb_last_status();
-            n_tfk++;
+            if (nfcols != nrcols)
+                return sql__err("FOREIGN KEY (...) needs the same number of columns on both sides in CREATE TABLE '%s' (%d vs %d)",
+                                table_name, nfcols, nrcols);
+
+            KdbFkAction this_on_delete = KDB_FK_RESTRICT, this_on_update = KDB_FK_RESTRICT;
+            if (!sql__parse_fk_actions(p, &this_on_delete, &this_on_update)) return kdb_last_status();
+
+            if (nfcols == 1) {
+                if (n_tfk >= KDB_SQL_MAX_TABLE_LEVEL_FKS)
+                    return sql__err("too many FOREIGN KEY entries in CREATE TABLE '%s' (max %d)", table_name, KDB_SQL_MAX_TABLE_LEVEL_FKS);
+                snprintf(tfk_col[n_tfk], sizeof(tfk_col[0]), "%s", fcols[0]);
+                snprintf(tfk_ref_table[n_tfk], sizeof(tfk_ref_table[0]), "%s", rtable_buf);
+                snprintf(tfk_ref_col[n_tfk], sizeof(tfk_ref_col[0]), "%s", rcols[0]);
+                tfk_on_delete[n_tfk] = this_on_delete;
+                tfk_on_update[n_tfk] = this_on_update;
+                n_tfk++;
+            } else {
+                if (n_tcfk >= KDB_SQL_MAX_TABLE_LEVEL_FKS)
+                    return sql__err("too many FOREIGN KEY entries in CREATE TABLE '%s' (max %d)", table_name, KDB_SQL_MAX_TABLE_LEVEL_FKS);
+                for (int k = 0; k < nfcols; k++) {
+                    snprintf(tcfk_cols[n_tcfk][k], sizeof(tcfk_cols[0][0]), "%s", fcols[k]);
+                    snprintf(tcfk_ref_cols[n_tcfk][k], sizeof(tcfk_ref_cols[0][0]), "%s", rcols[k]);
+                }
+                tcfk_ncols[n_tcfk] = (uint32_t)nfcols;
+                snprintf(tcfk_ref_table[n_tcfk], sizeof(tcfk_ref_table[0]), "%s", rtable_buf);
+                tcfk_on_delete[n_tcfk] = this_on_delete;
+                tcfk_on_update[n_tcfk] = this_on_update;
+                n_tcfk++;
+            }
 
             if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
             break;
@@ -1905,6 +1959,18 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
                                             tfk_on_delete[i], tfk_on_update[i]);
         if (ast != KDB_OK) { kdb_drop_table(db, table_name); return ast; }
     }
+    for (int i = 0; i < n_tcfk; i++) {
+        const char *col_ptrs[KDB_MAX_COMPOSITE_COLS];
+        const char *ref_ptrs[KDB_MAX_COMPOSITE_COLS];
+        for (uint32_t k = 0; k < tcfk_ncols[i]; k++) {
+            col_ptrs[k] = tcfk_cols[i][k];
+            ref_ptrs[k] = tcfk_ref_cols[i][k];
+        }
+        KdbStatus ast = kdb_add_composite_foreign_key(db, table_name, col_ptrs, tcfk_ncols[i],
+                                                      tcfk_ref_table[i], ref_ptrs, tcfk_ncols[i],
+                                                      tcfk_on_delete[i], tcfk_on_update[i]);
+        if (ast != KDB_OK) { kdb_drop_table(db, table_name); return ast; }
+    }
     for (int i = 0; i < n_chk; i++) {
         KdbField lit;
         lit.name = NULL;
@@ -2005,14 +2071,23 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
             sql__advance(p);
             if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after FOREIGN KEY in ALTER TABLE %s ADD", table_name);
             sql__advance(p);
-            const char *fcol;
-            if (!sql__ident_text(&p->cur, &fcol)) return sql__err("expected a column name after FOREIGN KEY ( in ALTER TABLE %s ADD", table_name);
-            char fcol_buf[KDB_SQL_IDENT_BUF];
-            snprintf(fcol_buf, sizeof(fcol_buf), "%.255s", fcol);
+
+            char fcols[KDB_MAX_COMPOSITE_COLS][KDB_SQL_IDENT_BUF];
+            int nfcols = 0;
+            for (;;) {
+                const char *fcol;
+                if (!sql__ident_text(&p->cur, &fcol)) return sql__err("expected a column name in FOREIGN KEY (...) in ALTER TABLE %s ADD", table_name);
+                if (nfcols >= KDB_MAX_COMPOSITE_COLS)
+                    return sql__err("too many columns in one FOREIGN KEY (...) in ALTER TABLE %s ADD (max %d)", table_name, KDB_MAX_COMPOSITE_COLS);
+                snprintf(fcols[nfcols], sizeof(fcols[0]), "%.255s", fcol);
+                nfcols++;
+                sql__advance(p);
+                if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+                break;
+            }
+            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing FOREIGN KEY (... in ALTER TABLE %s ADD", table_name);
             sql__advance(p);
-            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' after FOREIGN KEY (%s in ALTER TABLE %s ADD", fcol_buf, table_name);
-            sql__advance(p);
-            if (!sql__kw_is(&p->cur, "REFERENCES")) return sql__err("expected REFERENCES after FOREIGN KEY (%s) in ALTER TABLE %s ADD", fcol_buf, table_name);
+            if (!sql__kw_is(&p->cur, "REFERENCES")) return sql__err("expected REFERENCES after FOREIGN KEY (...) in ALTER TABLE %s ADD", table_name);
             sql__advance(p);
             const char *rtable;
             if (!sql__ident_text(&p->cur, &rtable)) return sql__err("expected a table name after REFERENCES in ALTER TABLE %s ADD", table_name);
@@ -2021,16 +2096,36 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
             sql__advance(p);
             if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after REFERENCES %s in ALTER TABLE %s ADD", rtable_buf, table_name);
             sql__advance(p);
-            const char *rcol;
-            if (!sql__ident_text(&p->cur, &rcol)) return sql__err("expected a column name after REFERENCES %s( in ALTER TABLE %s ADD", rtable_buf, table_name);
-            char rcol_buf[KDB_SQL_IDENT_BUF];
-            snprintf(rcol_buf, sizeof(rcol_buf), "%.255s", rcol);
-            sql__advance(p);
-            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing REFERENCES %s(%s in ALTER TABLE %s ADD", rtable_buf, rcol_buf, table_name);
+
+            char rcols[KDB_MAX_COMPOSITE_COLS][KDB_SQL_IDENT_BUF];
+            int nrcols = 0;
+            for (;;) {
+                const char *rcol;
+                if (!sql__ident_text(&p->cur, &rcol)) return sql__err("expected a column name after REFERENCES %s( in ALTER TABLE %s ADD", rtable_buf, table_name);
+                if (nrcols >= KDB_MAX_COMPOSITE_COLS)
+                    return sql__err("too many columns in one REFERENCES (...) in ALTER TABLE %s ADD (max %d)", table_name, KDB_MAX_COMPOSITE_COLS);
+                snprintf(rcols[nrcols], sizeof(rcols[0]), "%.255s", rcol);
+                nrcols++;
+                sql__advance(p);
+                if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+                break;
+            }
+            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing REFERENCES %s(...) in ALTER TABLE %s ADD", rtable_buf, table_name);
             sql__advance(p);
             KdbFkAction on_delete = KDB_FK_RESTRICT, on_update = KDB_FK_RESTRICT;
             if (!sql__parse_fk_actions(p, &on_delete, &on_update)) return kdb_last_status();
-            return kdb_add_foreign_key(db, table_name, fcol_buf, rtable_buf, rcol_buf, on_delete, on_update);
+
+            if (nfcols != nrcols)
+                return sql__err("FOREIGN KEY (...) needs the same number of columns on both sides in ALTER TABLE %s ADD (%d vs %d)",
+                                table_name, nfcols, nrcols);
+            if (nfcols == 1)
+                return kdb_add_foreign_key(db, table_name, fcols[0], rtable_buf, rcols[0], on_delete, on_update);
+
+            const char *col_ptrs[KDB_MAX_COMPOSITE_COLS];
+            const char *ref_ptrs[KDB_MAX_COMPOSITE_COLS];
+            for (int k = 0; k < nfcols; k++) { col_ptrs[k] = fcols[k]; ref_ptrs[k] = rcols[k]; }
+            return kdb_add_composite_foreign_key(db, table_name, col_ptrs, (uint32_t)nfcols,
+                                                 rtable_buf, ref_ptrs, (uint32_t)nrcols, on_delete, on_update);
         }
 
         if (sql__kw_is(&p->cur, "CHECK")) {
@@ -2126,14 +2221,28 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
             sql__advance(p);
             if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after FOREIGN KEY in ALTER TABLE %s DROP", table_name);
             sql__advance(p);
-            const char *fcol;
-            if (!sql__ident_text(&p->cur, &fcol)) return sql__err("expected a column name after FOREIGN KEY ( in ALTER TABLE %s DROP", table_name);
-            char fcol_buf[KDB_SQL_IDENT_BUF];
-            snprintf(fcol_buf, sizeof(fcol_buf), "%.255s", fcol);
+
+            char fcols[KDB_MAX_COMPOSITE_COLS][KDB_SQL_IDENT_BUF];
+            int nfcols = 0;
+            for (;;) {
+                const char *fcol;
+                if (!sql__ident_text(&p->cur, &fcol)) return sql__err("expected a column name in FOREIGN KEY (...) in ALTER TABLE %s DROP", table_name);
+                if (nfcols >= KDB_MAX_COMPOSITE_COLS)
+                    return sql__err("too many columns in one FOREIGN KEY (...) in ALTER TABLE %s DROP (max %d)", table_name, KDB_MAX_COMPOSITE_COLS);
+                snprintf(fcols[nfcols], sizeof(fcols[0]), "%.255s", fcol);
+                nfcols++;
+                sql__advance(p);
+                if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+                break;
+            }
+            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing FOREIGN KEY (... in ALTER TABLE %s DROP", table_name);
             sql__advance(p);
-            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' after FOREIGN KEY (%s in ALTER TABLE %s DROP", fcol_buf, table_name);
-            sql__advance(p);
-            return kdb_drop_foreign_key(db, table_name, fcol_buf);
+
+            if (nfcols == 1) return kdb_drop_foreign_key(db, table_name, fcols[0]);
+
+            const char *col_ptrs[KDB_MAX_COMPOSITE_COLS];
+            for (int k = 0; k < nfcols; k++) col_ptrs[k] = fcols[k];
+            return kdb_drop_composite_foreign_key(db, table_name, col_ptrs, (uint32_t)nfcols);
         }
 
         if (sql__kw_is(&p->cur, "COLUMN")) sql__advance(p);

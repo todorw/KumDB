@@ -8,17 +8,27 @@
 
 
 #define KDB_MAGIC              0x4B554D44
-/* File format 2.0 -- KdbColumn/KdbTableHeader both grew real fields (FK
- * definitions, CHECK constraints) instead of carving them out of reserved
- * padding the way every 1.x extension did; a foreign key alone needs a
- * whole table-name-sized string, far more than 1.x's padding budget had
- * left. This makes 2.x genuinely incompatible with 1.x files -- caught by
- * kdb_storage_validate_header's existing version_major check, which
- * already rejects a mismatch with a clear "versions are incompatible"
- * message rather than silently misreading old data. Fine for this
- * project (no deployed 1.x data to migrate); a real migration tool would
- * read a 1.x header's own (smaller) layout explicitly and rewrite it. */
-#define KDB_VERSION_MAJOR      2
+/* File format 3.0 -- same story as the 1.x -> 2.0 break (see below), one
+ * more time: composite (multi-column) foreign keys need an array of
+ * table-name-sized strings per definition (KdbCompositeFkDef), nowhere
+ * close to fitting in 2.0's remaining ~63-byte padding budget the way
+ * every earlier same-major-version extension (KdbColumn.on_delete/
+ * on_update included) managed to. Every extension within one major
+ * version has stayed padding-carved so far specifically so
+ * kdb_storage_validate_header's version_major-only check stays honest
+ * (same struct layout across a whole major version); breaking that
+ * invariant without bumping the major version would make the version
+ * check silently lie. Caught the same way 1.x->2.0 already was: a clean,
+ * intentional "versions are incompatible" rejection, not a migration.
+ *
+ * 2.0 (previous): KdbColumn/KdbTableHeader both grew real fields (FK
+ * definitions, CHECK constraints, then on_delete/on_update) instead of
+ * carving them out of reserved padding the way every 1.x extension did;
+ * a foreign key alone needs a whole table-name-sized string, far more
+ * than 1.x's padding budget had left. Fine for this project (no deployed
+ * 1.x/2.x data to migrate); a real migration tool would read each older
+ * header layout explicitly and rewrite it forward. */
+#define KDB_VERSION_MAJOR      3
 #define KDB_VERSION_MINOR      0
 #define KDB_VERSION_PATCH      0
 
@@ -183,6 +193,30 @@ typedef struct {
     char     as_string[128];
 } KdbCheckDef;
 
+/* A composite (multi-column) foreign key -- added in file format 3.0 (see
+ * KDB_VERSION_MAJOR above). col_positions/n_cols name this table's side
+ * (by column position, same convention as KdbCompositeIndexDef); ref_table/
+ * ref_cols name the referenced table and its columns, in matching order
+ * (ref_cols[i] corresponds to the column at col_positions[i]). Unlike
+ * single-column FK (KdbColumn.has_fk), a composite FK can never reference
+ * the pseudo-columns id/created_at/updated_at -- it inherently deals with
+ * multiple real, user-defined stored columns on both sides, and "id" isn't
+ * meaningful as one piece of a multi-column key. Enforcement uses MATCH
+ * SIMPLE semantics: if any referenced-side column is NULL (or the row is
+ * missing that field), the whole check is skipped for that row. n_cols==0
+ * means an unused slot. on_delete/on_update reuse KdbFkAction, same
+ * RESTRICT/CASCADE/SET_NULL semantics and cascade depth cap as single-
+ * column FK. */
+typedef struct {
+    uint8_t col_positions[KDB_MAX_COMPOSITE_COLS];
+    uint8_t n_cols;
+    char    ref_table[KDB_MAX_NAME_LEN];
+    char    ref_cols[KDB_MAX_COMPOSITE_COLS][KDB_MAX_NAME_LEN];
+    uint8_t on_delete;
+    uint8_t on_update;
+} KdbCompositeFkDef;
+#define KDB_MAX_COMPOSITE_FKS 4
+
 typedef struct {
     uint32_t magic;
     uint8_t  version_major;
@@ -212,6 +246,12 @@ typedef struct {
     KdbCheckDef checks[KDB_MAX_CHECK_CONSTRAINTS];
     uint8_t     n_checks;
     uint8_t     _pad2[63]; /* reserved for a future 2.x minor extension */
+    /* Added in file format 3.0, a real struct growth (see KDB_VERSION_MAJOR
+     * above) -- composite foreign keys, alongside 2.0's single-column FK
+     * fields and CHECK constraints. */
+    KdbCompositeFkDef composite_fks[KDB_MAX_COMPOSITE_FKS];
+    uint8_t           n_composite_fks;
+    uint8_t           _pad3[63]; /* reserved for a future 3.x minor extension, same discipline as _pad2 */
     KdbColumn columns[KDB_MAX_COLUMNS];
 } KdbTableHeader;
 

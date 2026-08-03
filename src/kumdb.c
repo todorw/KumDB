@@ -1059,6 +1059,16 @@ static KdbStatus kdb__find_fk_referencers(KumDB *db, const char *ref_table_name,
 static KdbStatus kdb__enforce_fk_referential_actions(KumDB *db, KdbTable *tbl, const KdbResult *affected,
                                                       const KdbRecord *patch, int depth);
 
+/* Same idea for the composite (multi-column) FK counterpart, defined
+ * further below -- kdb__enforce_fk_referential_actions' DELETE CASCADE
+ * branch also runs composite checks against the rows it's about to
+ * cascade-delete (a table can have both single-column and composite FKs
+ * pointing elsewhere), and kdb__cascade_set_composite_fields needs to
+ * recurse into it the same way kdb__cascade_set_one_field recurses into
+ * the single-column version. */
+static KdbStatus kdb__enforce_composite_fk_referential_actions(KumDB *db, KdbTable *tbl, const KdbResult *affected,
+                                                                const KdbRecord *patch, int depth);
+
 /* Runs a single-field KdbRecord patch (col_name = val, or NULL for SET
  * NULL) through kdb_table_update directly -- used for CASCADE (propagate
  * the new referenced value) and SET NULL, neither of which needs (or
@@ -1208,6 +1218,8 @@ static KdbStatus kdb__enforce_fk_referential_actions(KumDB *db, KdbTable *tbl, c
                         qst = kdb_query_execute(rt, &q, &casc_affected);
                         if (qst == KDB_OK) {
                             qst = kdb__enforce_fk_referential_actions(db, rt, &casc_affected, NULL, depth + 1);
+                            if (qst == KDB_OK)
+                                qst = kdb__enforce_composite_fk_referential_actions(db, rt, &casc_affected, NULL, depth + 1);
                             kdb_result_free(&casc_affected);
                         }
                         if (qst == KDB_OK) {
@@ -1219,6 +1231,325 @@ static KdbStatus kdb__enforce_fk_referential_actions(KumDB *db, KdbTable *tbl, c
                 kdb_query_free(&q);
                 if (qst != KDB_OK) return qst;
             }
+        }
+    }
+    return KDB_OK;
+}
+
+/* Child-side composite FK enforcement for INSERT: for every composite FK
+ * definition on tbl, if r has a non-NULL value for every one of its
+ * columns (MATCH SIMPLE -- any NULL/missing component skips the whole
+ * check, same as a NULL single-column FK value is never checked), the
+ * referenced table must already have a row matching all of them at once. */
+static KdbStatus kdb__check_composite_fk_child(KumDB *db, KdbTable *tbl, const KdbRecord *r) {
+    for (uint8_t d = 0; d < tbl->header.n_composite_fks; d++) {
+        const KdbCompositeFkDef *def = &tbl->header.composite_fks[d];
+        KdbValue vals[KDB_MAX_COMPOSITE_COLS];
+        int ok = 1;
+        for (uint8_t k = 0; k < def->n_cols; k++) {
+            const char *col_name = tbl->header.columns[def->col_positions[k]].name;
+            const KdbRecordField *f = kdb_record_get_field(r, col_name);
+            if (!f || f->value.type == KDB_TYPE_NULL) { ok = 0; break; }
+            vals[k] = f->value;
+        }
+        if (!ok) continue;
+
+        KdbTable *ref_tbl = kdb__get_table(db, def->ref_table);
+        if (!ref_tbl) {
+            kdb_set_error(KDB_ERR_VALIDATION,
+                "Composite foreign key on '%s' references table '%s', which doesn't exist (or couldn't be opened).",
+                tbl->name, def->ref_table);
+            return KDB_ERR_VALIDATION;
+        }
+
+        KdbQuery q;
+        kdb_query_init(&q);
+        KdbStatus st = KDB_OK;
+        for (uint8_t k = 0; k < def->n_cols && st == KDB_OK; k++) {
+            st = kdb_query_add_filter_value(&q, def->ref_cols[k], KDB_OP_EQ, &vals[k], NULL);
+        }
+        if (st != KDB_OK) { kdb_query_free(&q); return st; }
+        size_t count = 0;
+        st = kdb_query_count(ref_tbl, &q, &count);
+        kdb_query_free(&q);
+        if (st != KDB_OK) return st;
+
+        if (count == 0) {
+            kdb_set_error(KDB_ERR_VALIDATION,
+                "Composite foreign key violation: '%s' has no matching row in '%s'.", tbl->name, def->ref_table);
+            return KDB_ERR_VALIDATION;
+        }
+    }
+    return KDB_OK;
+}
+
+/* Same idea for UPDATE's would-be result. Unlike the single-column
+ * version, a composite key's other components might not be in patch at
+ * all (only one column of the key is being changed) -- affected carries
+ * each row's pre-patch values so the untouched components can be filled
+ * in from there. Only definitions where at least one column is actually
+ * in patch are checked (an untouched key can't become invalid). */
+static KdbStatus kdb__check_composite_fk_child_update(KumDB *db, KdbTable *tbl, const KdbResult *affected,
+                                                       const KdbRecord *patch) {
+    for (uint8_t d = 0; d < tbl->header.n_composite_fks; d++) {
+        const KdbCompositeFkDef *def = &tbl->header.composite_fks[d];
+
+        int any_touched = 0;
+        for (uint8_t k = 0; k < def->n_cols && !any_touched; k++) {
+            const char *col_name = tbl->header.columns[def->col_positions[k]].name;
+            for (uint32_t f = 0; f < patch->field_count; f++) {
+                if (strcmp(patch->fields[f].col_name, col_name) == 0) { any_touched = 1; break; }
+            }
+        }
+        if (!any_touched) continue;
+
+        KdbTable *ref_tbl = kdb__get_table(db, def->ref_table);
+        if (!ref_tbl) {
+            kdb_set_error(KDB_ERR_VALIDATION,
+                "Composite foreign key on '%s' references table '%s', which doesn't exist (or couldn't be opened).",
+                tbl->name, def->ref_table);
+            return KDB_ERR_VALIDATION;
+        }
+
+        for (size_t r = 0; r < affected->count; r++) {
+            KdbValue vals[KDB_MAX_COMPOSITE_COLS];
+            int ok = 1;
+            for (uint8_t k = 0; k < def->n_cols; k++) {
+                const char *col_name = tbl->header.columns[def->col_positions[k]].name;
+                const KdbRecordField *pf = NULL;
+                for (uint32_t f = 0; f < patch->field_count; f++) {
+                    if (strcmp(patch->fields[f].col_name, col_name) == 0) { pf = &patch->fields[f]; break; }
+                }
+                const KdbValue *v = pf ? &pf->value : NULL;
+                if (!v) {
+                    const KdbRecordField *cf = kdb_record_get_field(&affected->rows[r], col_name);
+                    if (cf) v = &cf->value;
+                }
+                if (!v || v->type == KDB_TYPE_NULL) { ok = 0; break; }
+                vals[k] = *v;
+            }
+            if (!ok) continue;
+
+            KdbQuery q;
+            kdb_query_init(&q);
+            KdbStatus st = KDB_OK;
+            for (uint8_t k = 0; k < def->n_cols && st == KDB_OK; k++) {
+                st = kdb_query_add_filter_value(&q, def->ref_cols[k], KDB_OP_EQ, &vals[k], NULL);
+            }
+            if (st != KDB_OK) { kdb_query_free(&q); return st; }
+            size_t count = 0;
+            st = kdb_query_count(ref_tbl, &q, &count);
+            kdb_query_free(&q);
+            if (st != KDB_OK) return st;
+
+            if (count == 0) {
+                kdb_set_error(KDB_ERR_VALIDATION,
+                    "Composite foreign key violation: '%s' has no matching row in '%s'.", tbl->name, def->ref_table);
+                return KDB_ERR_VALIDATION;
+            }
+        }
+    }
+    return KDB_OK;
+}
+
+typedef struct {
+    char    table[KDB_MAX_NAME_LEN];
+    uint8_t col_positions[KDB_MAX_COMPOSITE_COLS]; /* referencing table's own column positions */
+    uint8_t n_cols;
+    char    ref_cols[KDB_MAX_COMPOSITE_COLS][KDB_MAX_NAME_LEN]; /* names on tbl (the referenced side), same order */
+    uint8_t on_delete;
+    uint8_t on_update;
+} KdbCompositeFkReferencer;
+
+#define KDB_MAX_COMPOSITE_FK_REFERENCERS 16
+
+/* Every (table, composite FK def) anywhere in the data directory whose
+ * ref_table is ref_table_name -- same scanning approach as
+ * kdb__find_fk_referencers (every table's own schema, not just already-
+ * open ones). */
+static KdbStatus kdb__find_composite_fk_referencers(KumDB *db, const char *ref_table_name,
+                                                     KdbCompositeFkReferencer *out, uint32_t max_out, uint32_t *count_out) {
+    *count_out = 0;
+    char names[KDB_MAX_TABLES][KDB_MAX_NAME_LEN];
+    uint32_t n = 0;
+    KdbStatus st = kdb_storage_list_tables(db->data_dir, names, &n);
+    if (st != KDB_OK) return st;
+
+    for (uint32_t i = 0; i < n && *count_out < max_out; i++) {
+        KdbTable *t = kdb__get_table(db, names[i]);
+        if (!t) continue;
+        for (uint8_t d = 0; d < t->header.n_composite_fks && *count_out < max_out; d++) {
+            const KdbCompositeFkDef *def = &t->header.composite_fks[d];
+            if (strcmp(def->ref_table, ref_table_name) != 0) continue;
+            KdbCompositeFkReferencer *o = &out[*count_out];
+            memset(o, 0, sizeof(*o));
+            snprintf(o->table, sizeof(o->table), "%.127s", names[i]);
+            o->n_cols = def->n_cols;
+            for (uint8_t k = 0; k < def->n_cols; k++) {
+                o->col_positions[k] = def->col_positions[k];
+                snprintf(o->ref_cols[k], sizeof(o->ref_cols[k]), "%.127s", def->ref_cols[k]);
+            }
+            o->on_delete = def->on_delete;
+            o->on_update = def->on_update;
+            (*count_out)++;
+        }
+    }
+    return KDB_OK;
+}
+
+/* Composite counterpart of kdb__cascade_set_one_field -- sets n_cols
+ * fields at once (col_names[i] = vals[i], or NULL for SET NULL on every
+ * one of them) via a single kdb_table_update patch, so a composite CASCADE
+ * propagates all of a key's components together atomically rather than
+ * field-by-field. */
+static KdbStatus kdb__cascade_set_composite_fields(KumDB *db, KdbTable *tbl, const KdbQuery *q,
+                                                   char col_names[][KDB_MAX_NAME_LEN], uint8_t n_cols,
+                                                   const KdbValue *vals, int depth) {
+    if (depth > KDB_FK_MAX_CASCADE_DEPTH) {
+        kdb_set_error(KDB_ERR_VALIDATION, "Foreign key cascade chain too deep (max %d) -- check for a cycle.", KDB_FK_MAX_CASCADE_DEPTH);
+        return KDB_ERR_VALIDATION;
+    }
+
+    KdbRecordField pf[KDB_MAX_COMPOSITE_COLS];
+    memset(pf, 0, sizeof(pf));
+    KdbStatus st = KDB_OK;
+    uint8_t built = 0;
+    for (; built < n_cols; built++) {
+        KDB_STRLCPY(pf[built].col_name, col_names[built], KDB_MAX_NAME_LEN);
+        st = vals ? kdb_value_copy(&vals[built], &pf[built].value) : kdb_value_from_null(&pf[built].value);
+        if (st != KDB_OK) break;
+    }
+    if (st != KDB_OK) {
+        for (uint8_t i = 0; i < built; i++) kdb_value_free(&pf[i].value);
+        return st;
+    }
+
+    KdbRecord patch;
+    memset(&patch, 0, sizeof(patch));
+    patch.fields = pf;
+    patch.field_count = n_cols;
+
+    KdbResult affected;
+    st = kdb_query_execute(tbl, q, &affected);
+    if (st != KDB_OK) { for (uint8_t i = 0; i < n_cols; i++) kdb_value_free(&pf[i].value); return st; }
+    st = kdb__enforce_fk_referential_actions(db, tbl, &affected, &patch, depth);
+    if (st == KDB_OK) st = kdb__enforce_composite_fk_referential_actions(db, tbl, &affected, &patch, depth);
+    kdb_result_free(&affected);
+    if (st == KDB_OK) {
+        size_t updated = 0;
+        st = kdb_table_update(tbl, q, &patch, &updated);
+    }
+    for (uint8_t i = 0; i < n_cols; i++) kdb_value_free(&pf[i].value);
+    return st;
+}
+
+/* Composite counterpart of kdb__enforce_fk_referential_actions -- same
+ * RESTRICT/CASCADE/SET_NULL dispatch, but keyed off a whole composite key
+ * at once rather than one column: a referencer is only relevant to an
+ * UPDATE if at least one of its ref_cols is actually in patch, and every
+ * row's full set of ref_cols values (post-patch, untouched components
+ * filled in from affected) must be non-NULL for the check to apply at all
+ * (MATCH SIMPLE). Never touches pseudo-columns -- composite FK can't
+ * reference id/created_at/updated_at (see KdbCompositeFkDef). */
+static KdbStatus kdb__enforce_composite_fk_referential_actions(KumDB *db, KdbTable *tbl, const KdbResult *affected,
+                                                                const KdbRecord *patch, int depth) {
+    if (depth > KDB_FK_MAX_CASCADE_DEPTH) {
+        kdb_set_error(KDB_ERR_VALIDATION, "Foreign key cascade chain too deep (max %d) -- check for a cycle.", KDB_FK_MAX_CASCADE_DEPTH);
+        return KDB_ERR_VALIDATION;
+    }
+
+    KdbCompositeFkReferencer refs[KDB_MAX_COMPOSITE_FK_REFERENCERS];
+    uint32_t nrefs = 0;
+    KdbStatus st = kdb__find_composite_fk_referencers(db, tbl->name, refs, KDB_MAX_COMPOSITE_FK_REFERENCERS, &nrefs);
+    if (st != KDB_OK) return st;
+    if (nrefs == 0) return KDB_OK;
+
+    for (uint32_t ri = 0; ri < nrefs; ri++) {
+        if (patch) {
+            int any_touched = 0;
+            for (uint8_t k = 0; k < refs[ri].n_cols && !any_touched; k++) {
+                for (uint32_t f = 0; f < patch->field_count; f++) {
+                    if (strcmp(patch->fields[f].col_name, refs[ri].ref_cols[k]) == 0) { any_touched = 1; break; }
+                }
+            }
+            if (!any_touched) continue;
+        }
+
+        KdbTable *rt = kdb__get_table(db, refs[ri].table);
+        if (!rt) continue;
+
+        char rt_col_names[KDB_MAX_COMPOSITE_COLS][KDB_MAX_NAME_LEN];
+        int positions_ok = 1;
+        for (uint8_t k = 0; k < refs[ri].n_cols; k++) {
+            if (refs[ri].col_positions[k] >= rt->header.column_count) { positions_ok = 0; break; }
+            KDB_STRLCPY(rt_col_names[k], rt->header.columns[refs[ri].col_positions[k]].name, KDB_MAX_NAME_LEN);
+        }
+        if (!positions_ok) continue; /* shouldn't happen -- defensive, schema drift protection */
+
+        KdbFkAction action = (KdbFkAction)(patch ? refs[ri].on_update : refs[ri].on_delete);
+
+        for (size_t r = 0; r < affected->count; r++) {
+            KdbValue vals[KDB_MAX_COMPOSITE_COLS];
+            int ok = 1;
+            for (uint8_t k = 0; k < refs[ri].n_cols; k++) {
+                const KdbRecordField *f = kdb_record_get_field(&affected->rows[r], refs[ri].ref_cols[k]);
+                if (!f || f->value.type == KDB_TYPE_NULL) { ok = 0; break; }
+                vals[k] = f->value;
+            }
+            if (!ok) continue;
+
+            KdbQuery q;
+            kdb_query_init(&q);
+            KdbStatus qst = KDB_OK;
+            for (uint8_t k = 0; k < refs[ri].n_cols && qst == KDB_OK; k++) {
+                qst = kdb_query_add_filter_value(&q, rt_col_names[k], KDB_OP_EQ, &vals[k], NULL);
+            }
+            if (qst != KDB_OK) { kdb_query_free(&q); return qst; }
+
+            if (action == KDB_FK_RESTRICT) {
+                size_t count = 0;
+                qst = kdb_query_count(rt, &q, &count);
+                kdb_query_free(&q);
+                if (qst != KDB_OK) return qst;
+                if (count > 0) {
+                    kdb_set_error(KDB_ERR_VALIDATION,
+                        "Foreign key violation: '%s' row(s) referenced by composite foreign key on '%s' can't be %s.",
+                        tbl->name, refs[ri].table, patch ? "changed" : "deleted");
+                    return KDB_ERR_VALIDATION;
+                }
+                continue;
+            }
+
+            if (action == KDB_FK_SET_NULL) {
+                qst = kdb__cascade_set_composite_fields(db, rt, &q, rt_col_names, refs[ri].n_cols, NULL, depth + 1);
+            } else { /* KDB_FK_CASCADE */
+                if (patch) {
+                    KdbValue new_vals[KDB_MAX_COMPOSITE_COLS];
+                    for (uint8_t k = 0; k < refs[ri].n_cols; k++) {
+                        const KdbRecordField *pf = NULL;
+                        for (uint32_t f = 0; f < patch->field_count; f++) {
+                            if (strcmp(patch->fields[f].col_name, refs[ri].ref_cols[k]) == 0) { pf = &patch->fields[f]; break; }
+                        }
+                        new_vals[k] = pf ? pf->value : vals[k]; /* untouched component keeps its current value */
+                    }
+                    qst = kdb__cascade_set_composite_fields(db, rt, &q, rt_col_names, refs[ri].n_cols, new_vals, depth + 1);
+                } else {
+                    KdbResult casc_affected;
+                    qst = kdb_query_execute(rt, &q, &casc_affected);
+                    if (qst == KDB_OK) {
+                        qst = kdb__enforce_fk_referential_actions(db, rt, &casc_affected, NULL, depth + 1);
+                        if (qst == KDB_OK)
+                            qst = kdb__enforce_composite_fk_referential_actions(db, rt, &casc_affected, NULL, depth + 1);
+                        kdb_result_free(&casc_affected);
+                    }
+                    if (qst == KDB_OK) {
+                        size_t deleted = 0;
+                        qst = kdb_table_delete(rt, &q, &deleted);
+                    }
+                }
+            }
+            kdb_query_free(&q);
+            if (qst != KDB_OK) return qst;
         }
     }
     return KDB_OK;
@@ -1263,6 +1594,7 @@ KdbStatus kdb_add_validated(KumDB            *db,
     }
 
     KdbStatus fkst = kdb__check_fk_child(db, tbl, r);
+    if (fkst == KDB_OK) fkst = kdb__check_composite_fk_child(db, tbl, r);
     if (fkst != KDB_OK) { kdb_record_free(r); return fkst; }
 
     KdbStatus st = kdb_table_insert(tbl, r);
@@ -2136,14 +2468,18 @@ KdbStatus kdb_update(KumDB            *db,
     st = kdb__check_fk_child_update(db, tbl, patch);
     if (st != KDB_OK) { kdb_record_free(patch); kdb_query_free(&q); return st; }
 
-    /* Referential actions (RESTRICT/CASCADE/SET NULL): fetch exactly the
-     * rows this UPDATE matches before anything is mutated, so kdb__
-     * enforce_fk_referential_actions can see each one's current
-     * (pre-patch) value for any column another table's FK depends on. */
+    /* Referential actions (RESTRICT/CASCADE/SET NULL), plus composite FK
+     * child-side validation: fetch exactly the rows this UPDATE matches
+     * before anything is mutated, so both can see each row's current
+     * (pre-patch) values -- kdb__enforce_fk_referential_actions for any
+     * column another table's FK depends on, kdb__check_composite_fk_child_
+     * update for a composite key's components patch doesn't touch. */
     KdbResult affected;
     st = kdb_query_execute(tbl, &q, &affected);
     if (st != KDB_OK) { kdb_record_free(patch); kdb_query_free(&q); return st; }
-    st = kdb__enforce_fk_referential_actions(db, tbl, &affected, patch, 0);
+    st = kdb__check_composite_fk_child_update(db, tbl, &affected, patch);
+    if (st == KDB_OK) st = kdb__enforce_fk_referential_actions(db, tbl, &affected, patch, 0);
+    if (st == KDB_OK) st = kdb__enforce_composite_fk_referential_actions(db, tbl, &affected, patch, 0);
     kdb_result_free(&affected);
     if (st != KDB_OK) { kdb_record_free(patch); kdb_query_free(&q); return st; }
 
@@ -2181,6 +2517,7 @@ KdbStatus kdb_delete(KumDB       *db,
     st = kdb_query_execute(tbl, &q, &affected);
     if (st != KDB_OK) { kdb_query_free(&q); return st; }
     st = kdb__enforce_fk_referential_actions(db, tbl, &affected, NULL, 0);
+    if (st == KDB_OK) st = kdb__enforce_composite_fk_referential_actions(db, tbl, &affected, NULL, 0);
     kdb_result_free(&affected);
     if (st != KDB_OK) { kdb_query_free(&q); return st; }
 
@@ -2443,6 +2780,56 @@ KdbStatus kdb_drop_foreign_key(KumDB *db, const char *table_name, const char *co
     KdbTable *tbl = kdb__get_table(db, table_name);
     if (!tbl) return kdb_last_status();
     return kdb_table_drop_foreign_key(tbl, col_name);
+}
+
+KdbStatus kdb_add_composite_foreign_key(KumDB *db, const char *table_name,
+                                        const char **col_names, uint32_t n_cols,
+                                        const char *ref_table, const char **ref_cols, uint32_t n_ref_cols,
+                                        KdbFkAction on_delete, KdbFkAction on_update) {
+    if (!db || !table_name || !col_names || !ref_table || !ref_cols) {
+        kdb_err_null_arg("db/table_name/col_names/ref_table/ref_cols", "kdb_add_composite_foreign_key");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+
+    /* Validated here, not in kdb_table_add_composite_foreign_key -- a bare
+     * KdbTable* handle has no way to look up another table by name. Unlike
+     * single-column FK, ref_cols must all be real columns on ref_table --
+     * a composite key referencing id/created_at/updated_at as one of its
+     * components doesn't make sense (see KdbCompositeFkDef). */
+    KdbTable *ref_tbl = kdb__get_table(db, ref_table);
+    if (!ref_tbl) {
+        kdb_set_error(KDB_ERR_NOT_FOUND, "Composite foreign key on '%s' references table '%s', which doesn't exist.",
+                      table_name, ref_table);
+        return KDB_ERR_NOT_FOUND;
+    }
+    for (uint32_t i = 0; i < n_ref_cols; i++) {
+        if (!kdb_table_has_column(ref_tbl, ref_cols[i])) {
+            kdb_set_error(KDB_ERR_NOT_FOUND, "Composite foreign key on '%s' references column '%s.%s', which doesn't exist.",
+                          table_name, ref_table, ref_cols[i]);
+            return KDB_ERR_NOT_FOUND;
+        }
+    }
+    return kdb_table_add_composite_foreign_key(tbl, col_names, n_cols, ref_table, ref_cols, n_ref_cols, on_delete, on_update);
+}
+
+KdbStatus kdb_drop_composite_foreign_key(KumDB *db, const char *table_name, const char **col_names, uint32_t n_cols) {
+    if (!db || !table_name || !col_names) {
+        kdb_err_null_arg("db/table_name/col_names", "kdb_drop_composite_foreign_key");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+    return kdb_table_drop_composite_foreign_key(tbl, col_names, n_cols);
 }
 
 KdbStatus kdb_add_check_constraint(KumDB *db, const char *table_name, const char *col_name,

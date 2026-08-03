@@ -17,12 +17,12 @@ extern "C" {
  *
  * Supported:
  *   CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2) [ON DELETE|UPDATE action]], ...
- *                   [, FOREIGN KEY (col) REFERENCES t2(col2) [ON DELETE|UPDATE action]]* [, CHECK (col OP literal)]*)
+ *                   [, FOREIGN KEY (col[, col...]) REFERENCES t2(col2[, col2...]) [ON DELETE|UPDATE action]]* [, CHECK (col OP literal)]*)
  *   ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2) [ON DELETE|UPDATE action]]
- *   ALTER TABLE t ADD FOREIGN KEY (col) REFERENCES t2(col2) [ON DELETE action] [ON UPDATE action]  -- action: RESTRICT | CASCADE | SET NULL
+ *   ALTER TABLE t ADD FOREIGN KEY (col[, col...]) REFERENCES t2(col2[, col2...]) [ON DELETE action] [ON UPDATE action]  -- action: RESTRICT | CASCADE | SET NULL; 2+ columns on each side is a composite FK
  *   ALTER TABLE t ADD CHECK (col OP literal)
  *   ALTER TABLE t DROP [COLUMN] col
- *   ALTER TABLE t DROP FOREIGN KEY (col)
+ *   ALTER TABLE t DROP FOREIGN KEY (col[, col...])
  *   ALTER TABLE t RENAME COLUMN col TO new_col
  *   ALTER TABLE t ALTER [COLUMN] col TYPE newtype | SET NOT NULL | DROP NOT NULL | SET UNIQUE | DROP UNIQUE
  *   ALTER TABLE t RENAME [TO] new_name
@@ -460,12 +460,32 @@ extern "C" {
  * capped at a fixed depth to catch a cycle rather than recurse forever.
  * col2 can be a real column or one of the id/created_at/updated_at
  * pseudo-columns (referencing a table's own auto id is the most common
- * case, even though it's not a "real" schema column). One FK per column;
- * no composite (multi-column) foreign keys. ALTER TABLE t ADD FOREIGN
- * KEY (col) REFERENCES t2(col2) [ON DELETE ...] [ON UPDATE ...] adds one
- * after the fact (same validation and enforcement); ALTER TABLE t DROP
- * FOREIGN KEY (col) removes it. Dropping col itself drops its FK along
- * with it.
+ * case, even though it's not a "real" schema column). One FK per column.
+ * ALTER TABLE t ADD FOREIGN KEY (col) REFERENCES t2(col2) [ON DELETE ...]
+ * [ON UPDATE ...] adds one after the fact (same validation and
+ * enforcement); ALTER TABLE t DROP FOREIGN KEY (col) removes it. Dropping
+ * col itself drops its FK along with it.
+ *
+ * FOREIGN KEY (col1, col2, ...) REFERENCES t2(c1, c2, ...) with 2 or more
+ * columns on each side (only as a table-level item -- not as a column
+ * modifier, which only ever names one column) is a composite (multi-
+ * column) foreign key: the two sides must list the same number of
+ * columns, matched positionally (col1 corresponds to c1, col2 to c2, and
+ * so on). Unlike a single-column FK, c1/c2/... must all be real columns
+ * on t2 -- a composite key can't reference the id/created_at/updated_at
+ * pseudo-columns. The whole tuple (col1, col2, ...) is checked together:
+ * if EVERY one of them is non-NULL, some row on t2 must match all of them
+ * at once (MATCH SIMPLE semantics -- any NULL/missing component, on
+ * either side, skips the check entirely for that row). Same ON DELETE/ON
+ * UPDATE actions as single-column FK (RESTRICT/CASCADE/SET NULL,
+ * independent of each other, chainable across tables up to the same
+ * cascade depth cap), applied to the whole key at once: a CASCADE update
+ * propagates every changed component together in one patch; SET NULL
+ * requires every column of the key to be nullable, not just some of
+ * them. ALTER TABLE t ADD FOREIGN KEY (col1, col2, ...) REFERENCES
+ * t2(c1, c2, ...) [ON DELETE ...] [ON UPDATE ...] adds one after the
+ * fact; ALTER TABLE t DROP FOREIGN KEY (col1, col2, ...) removes it
+ * (matching the column set, any order).
  *
  * CHECK (col OP literal), as its own table-level item in CREATE TABLE or
  * via ALTER TABLE t ADD CHECK (col OP literal), restricts col's values --

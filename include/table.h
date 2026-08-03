@@ -95,6 +95,25 @@ KdbStatus kdb_table_add_foreign_key(KdbTable *tbl, const char *col_name,
 /* Clears col_name's FK metadata. KDB_ERR_NOT_FOUND if it doesn't have one. */
 KdbStatus kdb_table_drop_foreign_key(KdbTable *tbl, const char *col_name);
 
+/* A composite (multi-column) foreign key -- one constraint spanning
+ * n_cols columns (2..KDB_MAX_COMPOSITE_COLS) matched positionally against
+ * n_ref_cols columns on ref_table (n_cols must equal n_ref_cols). Doesn't
+ * verify ref_table/ref_cols exist (this handle can't look up another
+ * table; kdb_add_composite_foreign_key in kumdb.c does that first).
+ * KDB_ERR_EXISTS if a composite FK on exactly this column set (any order)
+ * already exists; KDB_ERR_FULL past KDB_MAX_COMPOSITE_FKS. on_delete/
+ * on_update are KDB_FK_RESTRICT/CASCADE/SET_NULL -- KDB_ERR_BAD_ARG if
+ * either is SET_NULL but not every column in col_names is nullable.
+ * Never references the pseudo-columns id/created_at/updated_at on either
+ * side, unlike single-column FK. */
+KdbStatus kdb_table_add_composite_foreign_key(KdbTable *tbl, const char **col_names, uint32_t n_cols,
+                                              const char *ref_table, const char **ref_cols, uint32_t n_ref_cols,
+                                              KdbFkAction on_delete, KdbFkAction on_update);
+
+/* Drops a composite foreign key matching exactly this column set (any
+ * order) -- KDB_ERR_NOT_FOUND if none does. */
+KdbStatus kdb_table_drop_composite_foreign_key(KdbTable *tbl, const char **col_names, uint32_t n_cols);
+
 /* Adds a CHECK (col_name op literal) constraint -- op must be one of
  * KDB_OP_EQ/NEQ/GT/GTE/LT/LTE, literal one of INT/FLOAT/BOOL/STRING.
  * Enforced from here on (kdb_table_insert/kdb_table_update reject a

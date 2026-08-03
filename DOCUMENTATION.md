@@ -313,15 +313,17 @@ rows that already violate the new rule aren't retroactively checked or
 rewritten.
 
 `kdb_add_foreign_key(db, table, col, ref_table, ref_col, on_delete,
-on_update)` and `kdb_add_check_constraint(db, table, col, op, literal)`
-add real, enforced constraints the same way from the C API directly
-(`kdb_drop_foreign_key` removes one) — see `ALTER TABLE`'s
-`REFERENCES`/`FOREIGN KEY`/`CHECK` forms below for the full semantics
-(`on_delete`/`on_update` are `KDB_FK_RESTRICT`/`KDB_FK_CASCADE`/
-`KDB_FK_SET_NULL`; the six-comparison-operator CHECK; both enforced by
-`kdb_add`/`kdb_update`/`kdb_delete` regardless of whether they were
-declared from SQL or here). `kdb_batch_import` bypasses both, same as it bypasses NOT
-NULL/UNIQUE.
+on_update)`, `kdb_add_composite_foreign_key(db, table, col_names, n_cols,
+ref_table, ref_cols, n_ref_cols, on_delete, on_update)`, and
+`kdb_add_check_constraint(db, table, col, op, literal)` add real,
+enforced constraints the same way from the C API directly
+(`kdb_drop_foreign_key`/`kdb_drop_composite_foreign_key` remove one) —
+see `ALTER TABLE`'s `REFERENCES`/`FOREIGN KEY`/`CHECK` forms below for
+the full semantics (`on_delete`/`on_update` are `KDB_FK_RESTRICT`/
+`KDB_FK_CASCADE`/`KDB_FK_SET_NULL`; the six-comparison-operator CHECK;
+all enforced by `kdb_add`/`kdb_update`/`kdb_delete` regardless of whether
+they were declared from SQL or here). `kdb_batch_import` bypasses all of
+them, same as it bypasses NOT NULL/UNIQUE.
 
 ### Errors, printing, misc
 
@@ -560,12 +562,12 @@ kdb_exec_sql_params(db, "SELECT * FROM employees WHERE age >= ? AND dept = ?",
 
 ```sql
 CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2) [ON DELETE|UPDATE action]], ...
-                [, FOREIGN KEY (col) REFERENCES t2(col2) [ON DELETE|UPDATE action]]* [, CHECK (col op literal)]*)
+                [, FOREIGN KEY (col[, col...]) REFERENCES t2(col2[, col2...]) [ON DELETE|UPDATE action]]* [, CHECK (col op literal)]*)
 ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2) [ON DELETE|UPDATE action]]
-ALTER TABLE t ADD FOREIGN KEY (col) REFERENCES t2(col2) [ON DELETE action] [ON UPDATE action]  -- action: RESTRICT | CASCADE | SET NULL
+ALTER TABLE t ADD FOREIGN KEY (col[, col...]) REFERENCES t2(col2[, col2...]) [ON DELETE action] [ON UPDATE action]  -- action: RESTRICT | CASCADE | SET NULL; 2+ columns each side is composite
 ALTER TABLE t ADD CHECK (col op literal)
 ALTER TABLE t DROP [COLUMN] col
-ALTER TABLE t DROP FOREIGN KEY (col)
+ALTER TABLE t DROP FOREIGN KEY (col[, col...])
 ALTER TABLE t RENAME COLUMN col TO new_col
 ALTER TABLE t ALTER [COLUMN] col TYPE newtype | SET NOT NULL | DROP NOT NULL | SET UNIQUE | DROP UNIQUE
 ALTER TABLE t RENAME [TO] new_name
@@ -795,12 +797,48 @@ forever. `col2` can be a real column or one of the `id`/`created_at`/
 above) is the most common case, even though `id` isn't a "real" schema
 column (`kdb_table_has_column` is false for it — a plain `SELECT id`
 doesn't project it back out either, a separate, pre-existing gap; use
-`RETURNING id` to get it after an `INSERT`). One foreign key per column,
-no composite (multi-column) foreign keys. `ALTER TABLE t ADD FOREIGN KEY
-(col) REFERENCES t2(col2) [ON DELETE action] [ON UPDATE action]` adds
-one after the fact, same validation and enforcement; `ALTER TABLE t DROP
-FOREIGN KEY (col)` removes it. Dropping `col` itself takes its foreign
-key with it.
+`RETURNING id` to get it after an `INSERT`). One foreign key per column.
+`ALTER TABLE t ADD FOREIGN KEY (col) REFERENCES t2(col2) [ON DELETE
+action] [ON UPDATE action]` adds one after the fact, same validation and
+enforcement; `ALTER TABLE t DROP FOREIGN KEY (col)` removes it. Dropping
+`col` itself takes its foreign key with it.
+
+**Composite (multi-column) foreign keys** — `FOREIGN KEY (col1, col2, ...)
+REFERENCES t2(c1, c2, ...)`, with 2 or more columns on each side (only as
+a table-level item — a column modifier only ever names one column), spans
+several columns matched positionally (`col1` corresponds to `c1`, `col2`
+to `c2`, and so on — the two sides must list the same count):
+
+```sql
+CREATE TABLE parts (maker TEXT, model TEXT)
+CREATE TABLE orders (part_maker TEXT, part_model TEXT, qty INT,
+                      FOREIGN KEY (part_maker, part_model) REFERENCES parts(maker, model) ON DELETE CASCADE)
+```
+
+Unlike a single-column FK, `c1`/`c2`/... must all be real stored columns
+on `t2` — a composite key can't reference the `id`/`created_at`/
+`updated_at` pseudo-columns, since referencing a table's own auto `id` as
+one piece of a multi-column key doesn't make sense. The whole tuple is
+checked together with MATCH SIMPLE semantics: if every one of `col1`,
+`col2`, ... is non-`NULL`, some `t2` row must match all of them at once;
+if even one component is `NULL` or missing, the check is skipped entirely
+for that row (a half-filled key never gets rejected, but also never
+matches). `ON DELETE`/`ON UPDATE` take the same `RESTRICT`/`CASCADE`/
+`SET NULL` actions as single-column FK, applied to the whole key at
+once — a `CASCADE` update propagates every changed component together in
+a single patch (so `UPDATE parts SET model = 'x2' WHERE maker = 'acme'`
+correctly moves every referencing `orders` row's `part_model` even though
+`part_maker` didn't change); `SET NULL` requires every column of the key
+to be nullable, not just some of them. `ALTER TABLE t ADD FOREIGN KEY
+(col1, col2, ...) REFERENCES t2(c1, c2, ...) [ON DELETE action] [ON
+UPDATE action]` adds one after the fact; `ALTER TABLE t DROP FOREIGN KEY
+(col1, col2, ...)` removes it (matching the column set, any order). A
+composite foreign key needs real per-definition storage (an array of
+table-name-sized strings, one per referenced column) far past what file
+format 2.0's remaining reserved padding could hold, so it bumped the
+on-disk format to 3.0 — another real, intentional break from anything
+older, same reasoning and the same clear "versions are incompatible"
+rejection as the 1.x → 2.0 bump before it.
 
 **`CHECK (col op literal)`** — as its own table-level item in
 `CREATE TABLE`, or via `ALTER TABLE t ADD CHECK (col op literal)` —
