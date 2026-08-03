@@ -1088,6 +1088,115 @@ static void test_text_search(void) {
     teardown(db);
 }
 
+static void test_geo_queries(void) {
+    KumDB *db;
+    setup(&db);
+
+    /* NYC ~ (40.7128, -74.0060), Boston ~ (42.3601, -71.0589),
+     * LA ~ (34.0522, -118.2437), London ~ (51.5074, -0.1278) */
+    KdbField f1[] = { kdb_field_string("name", "NYC"),    kdb_field_float("lat", 40.7128), kdb_field_float("lon", -74.0060),  kdb_field_end() };
+    KdbField f2[] = { kdb_field_string("name", "Boston"), kdb_field_float("lat", 42.3601), kdb_field_float("lon", -71.0589),  kdb_field_end() };
+    KdbField f3[] = { kdb_field_string("name", "LA"),     kdb_field_float("lat", 34.0522), kdb_field_float("lon", -118.2437), kdb_field_end() };
+    KdbField f4[] = { kdb_field_string("name", "London"), kdb_field_float("lat", 51.5074), kdb_field_float("lon", -0.1278),   kdb_field_end() };
+    ASSERT_OK(kdb_add(db, "cities", f1));
+    ASSERT_OK(kdb_add(db, "cities", f2));
+    ASSERT_OK(kdb_add(db, "cities", f3));
+    ASSERT_OK(kdb_add(db, "cities", f4));
+
+    /* Haversine sanity: known real-world distances, and a point to itself is ~0 */
+    {
+        double d = kdb_geo_distance_km(40.7128, -74.0060, 42.3601, -71.0589);
+        ASSERT(d > 290.0 && d < 320.0); /* NYC-Boston is ~306km */
+        double d_self = kdb_geo_distance_km(40.7128, -74.0060, 40.7128, -74.0060);
+        ASSERT(d_self < 0.01);
+    }
+
+    /* kdb_geo_near with a radius cap, sorted nearest-first, "_distance_km" attached */
+    {
+        KdbGeoNearOpts opts = { .lat_field = "lat", .lon_field = "lon",
+                                 .center_lat = 40.7128, .center_lon = -74.0060, .max_distance_km = 500 };
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_geo_near(db, "cities", &opts, &rows));
+        ASSERT(rows && rows->count == 2u); /* NYC itself + Boston, LA/London too far */
+        if (rows && rows->count == 2) {
+            const char *first = NULL;
+            double d0 = -1, d1 = -1;
+            ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &first));
+            ASSERT_OK(kdb_row_get_float(&rows->rows[0], "_distance_km", &d0));
+            ASSERT_OK(kdb_row_get_float(&rows->rows[1], "_distance_km", &d1));
+            ASSERT_STR(first, "NYC"); /* nearest first */
+            ASSERT(d0 <= d1);
+        }
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* no radius cap: every row with valid coordinates, still sorted by distance */
+    {
+        KdbGeoNearOpts opts = { .lat_field = "lat", .lon_field = "lon", .center_lat = 40.7128, .center_lon = -74.0060 };
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_geo_near(db, "cities", &opts, &rows));
+        ASSERT(rows && rows->count == 4u);
+        if (rows && rows->count == 4) {
+            const char *farthest = NULL;
+            ASSERT_OK(kdb_row_get_string(&rows->rows[3], "name", &farthest));
+            ASSERT_STR(farthest, "London");
+        }
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* limit */
+    {
+        KdbGeoNearOpts opts = { .lat_field = "lat", .lon_field = "lon", .center_lat = 40.7128, .center_lon = -74.0060, .limit = 1 };
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_geo_near(db, "cities", &opts, &rows));
+        ASSERT(rows && rows->count == 1u);
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* kdb_geo_within_box: a US bounding box excludes London */
+    {
+        KdbGeoBoxOpts opts = { .lat_field = "lat", .lon_field = "lon",
+                                .min_lat = 20.0, .max_lat = 50.0, .min_lon = -130.0, .max_lon = -60.0 };
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_geo_within_box(db, "cities", &opts, &rows));
+        ASSERT(rows && rows->count == 3u); /* NYC, Boston, LA -- not London */
+        if (rows) {
+            for (size_t i = 0; i < rows->count; i++) {
+                const char *name = NULL;
+                ASSERT_OK(kdb_row_get_string(&rows->rows[i], "name", &name));
+                ASSERT(strcmp(name, "London") != 0);
+            }
+            kdb_rows_free(rows);
+        }
+    }
+
+    /* a row missing lat/lon is silently excluded, not an error */
+    {
+        KdbField f5[] = { kdb_field_string("name", "NoCoords"), kdb_field_end() };
+        ASSERT_OK(kdb_add(db, "cities", f5));
+        KdbGeoNearOpts opts = { .lat_field = "lat", .lon_field = "lon" };
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_geo_near(db, "cities", &opts, &rows));
+        ASSERT(rows && rows->count == 4u); /* still just the 4 with real coordinates */
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* error paths */
+    {
+        KdbGeoNearOpts bad_lat = { .lat_field = "lat", .lon_field = "lon", .center_lat = 999.0 };
+        KdbRows *rows = NULL;
+        ASSERT_ERR(kdb_geo_near(db, "cities", &bad_lat, &rows));
+
+        KdbGeoBoxOpts bad_box = { .lat_field = "lat", .lon_field = "lon", .min_lat = 50, .max_lat = 10, .min_lon = -1, .max_lon = 1 };
+        ASSERT_ERR(kdb_geo_within_box(db, "cities", &bad_box, &rows));
+
+        KdbGeoNearOpts plain_opts = { .lat_field = "lat", .lon_field = "lon" };
+        ASSERT_ERR(kdb_geo_near(db, "nonexistent", &plain_opts, &rows));
+    }
+
+    teardown(db);
+}
+
 int main(void) {
     printf("=== test_core ===\n");
 
@@ -1118,6 +1227,7 @@ int main(void) {
     test_list_tables_repeated();
     test_aggregate_pipeline();
     test_text_search();
+    test_geo_queries();
 
     printf("passed=%d  failed=%d\n", passed, failed);
     return failed > 0 ? 1 : 0;

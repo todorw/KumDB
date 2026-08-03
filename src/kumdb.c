@@ -3,6 +3,7 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
+#include <math.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -1666,6 +1667,46 @@ static void kdb__text_count_field(const char *text, char terms[][KDB_TEXT_MAX_TE
     }
 }
 
+/* Deep-copies src into filtered with one extra FLOAT field appended
+ * (col_name=extra_name, value=extra_value) -- shared by kdb_text_search's
+ * "_score" and kdb_geo_near's "_distance_km", the two places a computed
+ * per-row ranking value needs to ride along with the row's own fields. */
+static KdbStatus kdb__append_row_with_extra_float(KdbResult *filtered, const KdbRecord *src,
+                                                  const char *extra_name, double extra_value) {
+    uint32_t nf_count = src->field_count + 1;
+    KdbRecordField *nf = (KdbRecordField *)calloc(nf_count, sizeof(KdbRecordField));
+    if (!nf) { kdb_err_oom("row-with-extra-field output"); return KDB_ERR_OOM; }
+
+    uint32_t copied = 0;
+    int ok = 1;
+    for (uint32_t k = 0; k < src->field_count && ok; k++) {
+        KDB_STRLCPY(nf[k].col_name, src->fields[k].col_name, KDB_MAX_NAME_LEN);
+        if (kdb_value_copy(&src->fields[k].value, &nf[k].value) != KDB_OK) { ok = 0; break; }
+        copied++;
+    }
+
+    KdbStatus st;
+    if (ok) {
+        KDB_STRLCPY(nf[src->field_count].col_name, extra_name, KDB_MAX_NAME_LEN);
+        kdb_value_from_float(extra_value, &nf[src->field_count].value);
+        copied++;
+
+        KdbRecord orow;
+        memset(&orow, 0, sizeof(orow));
+        orow.id          = src->id;
+        orow.created_at  = src->created_at;
+        orow.updated_at  = src->updated_at;
+        orow.fields      = nf;
+        orow.field_count = nf_count;
+        st = kdb_result_append(filtered, &orow);
+    } else {
+        st = KDB_ERR_OOM;
+    }
+    for (uint32_t k = 0; k < copied; k++) kdb_value_free(&nf[k].value);
+    free(nf);
+    return st;
+}
+
 typedef struct { size_t idx; double score; } KdbTextHit;
 
 /* qsort context, same single-threaded precedent every other sort
@@ -1763,39 +1804,148 @@ KdbStatus kdb_text_search(KumDB *db, const char *table_name, const char *query,
     if (st != KDB_OK) { free(hits); kdb_result_free(&all); return st; }
 
     for (size_t i = 0; i < n_hits && st == KDB_OK; i++) {
-        KdbRecord *src = &all.rows[hits[i].idx];
-        uint32_t nf_count = src->field_count + 1;
-        KdbRecordField *nf = (KdbRecordField *)calloc(nf_count, sizeof(KdbRecordField));
-        if (!nf) { st = KDB_ERR_OOM; kdb_err_oom("text search output fields"); break; }
-
-        uint32_t copied = 0;
-        int ok = 1;
-        for (uint32_t k = 0; k < src->field_count && ok; k++) {
-            KDB_STRLCPY(nf[k].col_name, src->fields[k].col_name, KDB_MAX_NAME_LEN);
-            if (kdb_value_copy(&src->fields[k].value, &nf[k].value) != KDB_OK) { ok = 0; break; }
-            copied++;
-        }
-        if (ok) {
-            KDB_STRLCPY(nf[src->field_count].col_name, "_score", KDB_MAX_NAME_LEN);
-            kdb_value_from_float(hits[i].score, &nf[src->field_count].value);
-            copied++;
-
-            KdbRecord orow;
-            memset(&orow, 0, sizeof(orow));
-            orow.id         = src->id;
-            orow.created_at = src->created_at;
-            orow.updated_at = src->updated_at;
-            orow.fields     = nf;
-            orow.field_count = nf_count;
-            st = kdb_result_append(&filtered, &orow);
-        } else {
-            st = KDB_ERR_OOM;
-        }
-        for (uint32_t k = 0; k < copied; k++) kdb_value_free(&nf[k].value);
-        free(nf);
+        st = kdb__append_row_with_extra_float(&filtered, &all.rows[hits[i].idx], "_score", hits[i].score);
     }
 
     free(hits);
+    kdb_result_free(&all);
+    if (st != KDB_OK) { kdb_result_free(&filtered); return st; }
+
+    *rows_out = kdb__result_to_rows(&filtered);
+    return *rows_out ? KDB_OK : kdb_last_status();
+}
+
+#define KDB_GEO_EARTH_RADIUS_KM 6371.0088
+#define KDB_GEO_DEG_TO_RAD (3.14159265358979323846 / 180.0)
+
+/* Great-circle (Haversine) distance in kilometers -- the standard
+ * spherical-earth formula for real-world GPS coordinates; a flat-plane
+ * (Pythagorean) approximation on raw lat/lon degrees breaks down badly
+ * once two points are more than a few km apart, since a degree of
+ * longitude covers less real distance the further from the equator you
+ * get. */
+double kdb_geo_distance_km(double lat1, double lon1, double lat2, double lon2) {
+    double dlat = (lat2 - lat1) * KDB_GEO_DEG_TO_RAD;
+    double dlon = (lon2 - lon1) * KDB_GEO_DEG_TO_RAD;
+    double a = sin(dlat / 2.0) * sin(dlat / 2.0) +
+               cos(lat1 * KDB_GEO_DEG_TO_RAD) * cos(lat2 * KDB_GEO_DEG_TO_RAD) * sin(dlon / 2.0) * sin(dlon / 2.0);
+    double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+    return KDB_GEO_EARTH_RADIUS_KM * c;
+}
+
+typedef struct { size_t idx; double distance_km; } KdbGeoHit;
+
+static const KdbResult *kdb__geo_ctx_all = NULL;
+static int kdb__geo_hit_cmp(const void *a, const void *b) {
+    const KdbGeoHit *ha = (const KdbGeoHit *)a;
+    const KdbGeoHit *hb = (const KdbGeoHit *)b;
+    if (ha->distance_km != hb->distance_km) return ha->distance_km < hb->distance_km ? -1 : 1;
+    uint64_t ida = kdb__geo_ctx_all->rows[ha->idx].id;
+    uint64_t idb = kdb__geo_ctx_all->rows[hb->idx].id;
+    if (ida != idb) return ida < idb ? -1 : 1;
+    return 0;
+}
+
+KdbStatus kdb_geo_near(KumDB *db, const char *table_name, const KdbGeoNearOpts *opts, KdbRows **rows_out) {
+    if (!db || !table_name || !opts || !opts->lat_field || !opts->lon_field || !rows_out) {
+        kdb_err_null_arg("db/table_name/opts/rows_out", "kdb_geo_near");
+        return KDB_ERR_BAD_ARG;
+    }
+    *rows_out = NULL;
+    if (opts->center_lat < -90.0 || opts->center_lat > 90.0 || opts->center_lon < -180.0 || opts->center_lon > 180.0) {
+        kdb_set_error(KDB_ERR_BAD_ARG, "kdb_geo_near: center_lat must be -90..90 and center_lon -180..180");
+        return KDB_ERR_BAD_ARG;
+    }
+
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+
+    KdbQuery empty_q;
+    kdb_query_init(&empty_q);
+    KdbResult all;
+    KdbStatus st = kdb_query_execute(tbl, &empty_q, &all);
+    kdb_query_free(&empty_q);
+    if (st != KDB_OK) return st;
+
+    KdbGeoHit *hits = (KdbGeoHit *)calloc(all.count > 0 ? all.count : 1, sizeof(KdbGeoHit));
+    if (!hits) { kdb_result_free(&all); kdb_err_oom("geo near hits"); return KDB_ERR_OOM; }
+    size_t n_hits = 0;
+
+    for (size_t r = 0; r < all.count; r++) {
+        const KdbRecordField *latf = kdb_record_get_field(&all.rows[r], opts->lat_field);
+        const KdbRecordField *lonf = kdb_record_get_field(&all.rows[r], opts->lon_field);
+        double lat, lon;
+        if (!latf || !lonf) continue;
+        if (!kdb__agg_value_to_double(&latf->value, &lat)) continue;
+        if (!kdb__agg_value_to_double(&lonf->value, &lon)) continue;
+
+        double d = kdb_geo_distance_km(opts->center_lat, opts->center_lon, lat, lon);
+        if (opts->max_distance_km > 0.0 && d > opts->max_distance_km) continue;
+        hits[n_hits].idx = r;
+        hits[n_hits].distance_km = d;
+        n_hits++;
+    }
+
+    kdb__geo_ctx_all = &all;
+    qsort(hits, n_hits, sizeof(KdbGeoHit), kdb__geo_hit_cmp);
+    kdb__geo_ctx_all = NULL;
+
+    if (opts->limit > 0 && n_hits > opts->limit) n_hits = opts->limit;
+
+    KdbResult filtered;
+    st = kdb_result_init(&filtered, n_hits > 0 ? n_hits : 1);
+    if (st != KDB_OK) { free(hits); kdb_result_free(&all); return st; }
+
+    for (size_t i = 0; i < n_hits && st == KDB_OK; i++) {
+        st = kdb__append_row_with_extra_float(&filtered, &all.rows[hits[i].idx], "_distance_km", hits[i].distance_km);
+    }
+
+    free(hits);
+    kdb_result_free(&all);
+    if (st != KDB_OK) { kdb_result_free(&filtered); return st; }
+
+    *rows_out = kdb__result_to_rows(&filtered);
+    return *rows_out ? KDB_OK : kdb_last_status();
+}
+
+KdbStatus kdb_geo_within_box(KumDB *db, const char *table_name, const KdbGeoBoxOpts *opts, KdbRows **rows_out) {
+    if (!db || !table_name || !opts || !opts->lat_field || !opts->lon_field || !rows_out) {
+        kdb_err_null_arg("db/table_name/opts/rows_out", "kdb_geo_within_box");
+        return KDB_ERR_BAD_ARG;
+    }
+    *rows_out = NULL;
+    if (opts->min_lat > opts->max_lat || opts->min_lon > opts->max_lon ||
+        opts->min_lat < -90.0 || opts->max_lat > 90.0 || opts->min_lon < -180.0 || opts->max_lon > 180.0) {
+        kdb_set_error(KDB_ERR_BAD_ARG,
+            "kdb_geo_within_box: min_lat/max_lat must be -90..90 (min<=max) and min_lon/max_lon -180..180 (min<=max)");
+        return KDB_ERR_BAD_ARG;
+    }
+
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+
+    KdbQuery empty_q;
+    kdb_query_init(&empty_q);
+    KdbResult all;
+    KdbStatus st = kdb_query_execute(tbl, &empty_q, &all);
+    kdb_query_free(&empty_q);
+    if (st != KDB_OK) return st;
+
+    KdbResult filtered;
+    st = kdb_result_init(&filtered, all.count > 0 ? all.count : 1);
+    if (st != KDB_OK) { kdb_result_free(&all); return st; }
+
+    for (size_t r = 0; r < all.count && st == KDB_OK; r++) {
+        const KdbRecordField *latf = kdb_record_get_field(&all.rows[r], opts->lat_field);
+        const KdbRecordField *lonf = kdb_record_get_field(&all.rows[r], opts->lon_field);
+        double lat, lon;
+        if (!latf || !lonf) continue;
+        if (!kdb__agg_value_to_double(&latf->value, &lat)) continue;
+        if (!kdb__agg_value_to_double(&lonf->value, &lon)) continue;
+        if (lat < opts->min_lat || lat > opts->max_lat || lon < opts->min_lon || lon > opts->max_lon) continue;
+        st = kdb_result_append(&filtered, &all.rows[r]);
+    }
+
     kdb_result_free(&all);
     if (st != KDB_OK) { kdb_result_free(&filtered); return st; }
 

@@ -171,6 +171,50 @@ typedef struct {
 KdbStatus kdb_text_search(KumDB *db, const char *table_name, const char *query,
                           const KdbTextSearchOpts *opts, KdbRows **rows_out);
 
+/* Geospatial queries: a location is just two plain FLOAT (or INT/BOOL,
+ * coerced) fields on a document, lat/lon by whatever names you choose --
+ * no dedicated point type, no persistent spatial index (an R-tree or
+ * similar), same "scan and compute in memory" scope kdb_aggregate/kdb_
+ * text_search already accept. Great-circle (Haversine) distance in
+ * kilometers, on the WGS-84-ish spherical approximation real-world GPS
+ * coordinates use (not a flat-plane approximation, which breaks down
+ * badly over any real distance). */
+double kdb_geo_distance_km(double lat1, double lon1, double lat2, double lon2);
+
+typedef struct {
+    const char *lat_field;
+    const char *lon_field;
+    double      center_lat;      /* -90..90 */
+    double      center_lon;      /* -180..180 */
+    double      max_distance_km; /* 0 = no radius cap, just sort every row by distance */
+    size_t      limit;           /* 0 = no limit */
+} KdbGeoNearOpts;
+
+/* Rows within max_distance_km of (center_lat, center_lon) (or every row
+ * with valid coordinates, if max_distance_km is 0), sorted nearest
+ * first (ties broken by id), each carrying its distance in an extra
+ * "_distance_km" FLOAT field. A row missing lat_field/lon_field, or
+ * holding a non-numeric value in either, is silently excluded -- same
+ * "soft skip" convention kdb_aggregate's $group already follows for a
+ * missing group-by field. */
+KdbStatus kdb_geo_near(KumDB *db, const char *table_name,
+                       const KdbGeoNearOpts *opts, KdbRows **rows_out);
+
+typedef struct {
+    const char *lat_field;
+    const char *lon_field;
+    double      min_lat, max_lat; /* -90..90, min_lat <= max_lat */
+    double      min_lon, max_lon; /* -180..180, min_lon <= max_lon */
+} KdbGeoBoxOpts;
+
+/* Rows whose (lat_field, lon_field) falls inside the rectangular
+ * lat/lon box (inclusive on all four edges) -- a map-viewport-style
+ * query, not distance-ranked (no "_distance_km" field added). Same
+ * silent-exclusion rule as kdb_geo_near for a missing/non-numeric
+ * coordinate. */
+KdbStatus kdb_geo_within_box(KumDB *db, const char *table_name,
+                             const KdbGeoBoxOpts *opts, KdbRows **rows_out);
+
 KdbStatus kdb_update(KumDB          *db,
                      const char     *table_name,
                      const char    **where_filters,

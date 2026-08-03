@@ -195,6 +195,56 @@ does have one, just none picked up by the default "every `STRING`
 field" scan — which shouldn't normally happen, but a column added since
 the table was created some other way is worth knowing about).
 
+### Geospatial queries
+
+A location is just two plain fields on a document — `FLOAT` (or `INT`/
+`BOOL`, coerced) latitude and longitude, whatever names you choose, no
+dedicated point type. `kdb_geo_distance_km()` is the great-circle
+(Haversine) distance between two coordinates, in kilometers — the
+standard formula for real-world GPS coordinates, not a flat-plane
+approximation (which breaks down badly once two points are more than a
+few km apart, since a degree of longitude covers less real distance the
+further from the equator you get):
+
+```c
+double km = kdb_geo_distance_km(40.7128, -74.0060, 42.3601, -71.0589); // NYC to Boston, ~306km
+```
+
+`kdb_geo_near()` finds rows within a radius of a center point, nearest
+first:
+
+```c
+KdbGeoNearOpts opts = { .lat_field = "lat", .lon_field = "lon",
+                         .center_lat = 40.7128, .center_lon = -74.0060,
+                         .max_distance_km = 500, .limit = 20 };
+KdbRows *rows = NULL;
+kdb_geo_near(db, "cities", &opts, &rows);
+```
+
+`max_distance_km` of `0` means no radius cap — every row with valid
+coordinates comes back, just sorted by distance (ties broken by `id`).
+Each result row carries its distance in an extra `"_distance_km"`
+`FLOAT` field.
+
+`kdb_geo_within_box()` is the map-viewport-style counterpart — a
+rectangular lat/lon bounding box (inclusive on all four edges), not
+distance-ranked, no extra field added:
+
+```c
+KdbGeoBoxOpts opts = { .lat_field = "lat", .lon_field = "lon",
+                        .min_lat = 20.0, .max_lat = 50.0,
+                        .min_lon = -130.0, .max_lon = -60.0 };
+kdb_geo_within_box(db, "cities", &opts, &rows);
+```
+
+A row missing `lat_field`/`lon_field`, or holding a non-numeric value in
+either, is silently excluded from either query — same "soft skip"
+convention `kdb_aggregate`'s `$group` already follows for a missing
+group-by field. There's no persistent spatial index (an R-tree or
+similar) behind either function: both scan and compute distance/bounds
+for the whole table in memory, the same scope `kdb_aggregate`/`kdb_
+text_search` already accept.
+
 ### Reading a row's fields
 
 ```c
