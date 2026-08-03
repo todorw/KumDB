@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <ctype.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -1614,6 +1615,191 @@ KdbStatus kdb_aggregate(KumDB *db, const char *table_name,
     if (st != KDB_OK) { kdb_result_free(&cur); return st; }
 
     *rows_out = kdb__result_to_rows(&cur);
+    return *rows_out ? KDB_OK : kdb_last_status();
+}
+
+#define KDB_TEXT_MAX_TERMS    16
+#define KDB_TEXT_MAX_TERM_LEN 64
+
+/* Splits text into lowercased alphanumeric words, writing up to
+ * max_terms of them into out (each NUL-terminated, truncated to
+ * KDB_TEXT_MAX_TERM_LEN-1 if longer) -- shared by query tokenizing and
+ * (via kdb__text_count_field) row-field tokenizing, so both sides
+ * normalize identically. */
+static size_t kdb__text_tokenize(const char *text, char out[][KDB_TEXT_MAX_TERM_LEN], size_t max_terms) {
+    size_t n = 0;
+    size_t i = 0;
+    size_t len = strlen(text);
+    while (i < len && n < max_terms) {
+        while (i < len && !isalnum((unsigned char)text[i])) i++;
+        if (i >= len) break;
+        size_t start = i;
+        while (i < len && isalnum((unsigned char)text[i])) i++;
+        size_t wlen = i - start;
+        if (wlen >= KDB_TEXT_MAX_TERM_LEN) wlen = KDB_TEXT_MAX_TERM_LEN - 1;
+        for (size_t k = 0; k < wlen; k++) out[n][k] = (char)tolower((unsigned char)text[start + k]);
+        out[n][wlen] = '\0';
+        n++;
+    }
+    return n;
+}
+
+/* Tokenizes text the same way kdb__text_tokenize does, but instead of
+ * collecting words just tallies, for each of terms[0..n_terms), how many
+ * times it occurs as a whole word in text -- term-frequency scoring
+ * against one field's value, added into hits[] (already tallying other
+ * fields/rows, not reset here). */
+static void kdb__text_count_field(const char *text, char terms[][KDB_TEXT_MAX_TERM_LEN], size_t n_terms, int *hits) {
+    size_t len = strlen(text);
+    size_t i = 0;
+    while (i < len) {
+        while (i < len && !isalnum((unsigned char)text[i])) i++;
+        if (i >= len) break;
+        size_t start = i;
+        while (i < len && isalnum((unsigned char)text[i])) i++;
+        size_t wlen = i - start;
+        char word[KDB_TEXT_MAX_TERM_LEN];
+        if (wlen >= KDB_TEXT_MAX_TERM_LEN) wlen = KDB_TEXT_MAX_TERM_LEN - 1;
+        for (size_t k = 0; k < wlen; k++) word[k] = (char)tolower((unsigned char)text[start + k]);
+        word[wlen] = '\0';
+        for (size_t t = 0; t < n_terms; t++) if (strcmp(word, terms[t]) == 0) hits[t]++;
+    }
+}
+
+typedef struct { size_t idx; double score; } KdbTextHit;
+
+/* qsort context, same single-threaded precedent every other sort
+ * comparator in this codebase already follows. Sorted by score
+ * descending, ties broken by id ascending for a deterministic order
+ * (qsort itself isn't guaranteed stable). */
+static const KdbResult *kdb__text_ctx_all = NULL;
+static int kdb__text_hit_cmp(const void *a, const void *b) {
+    const KdbTextHit *ha = (const KdbTextHit *)a;
+    const KdbTextHit *hb = (const KdbTextHit *)b;
+    if (ha->score != hb->score) return ha->score > hb->score ? -1 : 1;
+    uint64_t ida = kdb__text_ctx_all->rows[ha->idx].id;
+    uint64_t idb = kdb__text_ctx_all->rows[hb->idx].id;
+    if (ida != idb) return ida < idb ? -1 : 1;
+    return 0;
+}
+
+KdbStatus kdb_text_search(KumDB *db, const char *table_name, const char *query,
+                          const KdbTextSearchOpts *opts, KdbRows **rows_out) {
+    if (!db || !table_name || !query || !rows_out) {
+        kdb_err_null_arg("db/table_name/query/rows_out", "kdb_text_search");
+        return KDB_ERR_BAD_ARG;
+    }
+    *rows_out = NULL;
+
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+
+    KdbTextMatchMode mode = opts ? opts->mode : KDB_TEXT_MATCH_ALL;
+    size_t limit = opts ? opts->limit : 0;
+
+    char search_fields[KDB_MAX_COLUMNS][KDB_MAX_NAME_LEN];
+    size_t n_search_fields = 0;
+    if (opts && opts->fields) {
+        for (size_t i = 0; opts->fields[i] && n_search_fields < KDB_MAX_COLUMNS; i++)
+            snprintf(search_fields[n_search_fields++], KDB_MAX_NAME_LEN, "%.127s", opts->fields[i]);
+    } else {
+        for (uint32_t i = 0; i < tbl->header.column_count && n_search_fields < KDB_MAX_COLUMNS; i++) {
+            if (tbl->header.columns[i].type == KDB_TYPE_STRING)
+                snprintf(search_fields[n_search_fields++], KDB_MAX_NAME_LEN, "%.127s", tbl->header.columns[i].name);
+        }
+    }
+    if (n_search_fields == 0) {
+        kdb_set_error(KDB_ERR_BAD_ARG,
+            "kdb_text_search: table '%s' has no STRING field to search -- name them explicitly via opts->fields if it does",
+            table_name);
+        return KDB_ERR_BAD_ARG;
+    }
+
+    char terms[KDB_TEXT_MAX_TERMS][KDB_TEXT_MAX_TERM_LEN];
+    size_t n_terms = kdb__text_tokenize(query, terms, KDB_TEXT_MAX_TERMS);
+    if (n_terms == 0) {
+        /* an empty/punctuation-only query matches nothing */
+        *rows_out = (KdbRows *)calloc(1, sizeof(KdbRows));
+        if (!*rows_out) { kdb_err_oom("KdbRows"); return KDB_ERR_OOM; }
+        return KDB_OK;
+    }
+
+    KdbQuery empty_q;
+    kdb_query_init(&empty_q);
+    KdbResult all;
+    KdbStatus st = kdb_query_execute(tbl, &empty_q, &all);
+    kdb_query_free(&empty_q);
+    if (st != KDB_OK) return st;
+
+    KdbTextHit *hits = (KdbTextHit *)calloc(all.count > 0 ? all.count : 1, sizeof(KdbTextHit));
+    if (!hits) { kdb_result_free(&all); kdb_err_oom("text search hits"); return KDB_ERR_OOM; }
+    size_t n_hits = 0;
+
+    for (size_t r = 0; r < all.count; r++) {
+        int term_hits[KDB_TEXT_MAX_TERMS];
+        memset(term_hits, 0, sizeof(term_hits));
+        for (size_t f = 0; f < n_search_fields; f++) {
+            const KdbRecordField *field = kdb_record_get_field(&all.rows[r], search_fields[f]);
+            if (!field || field->value.type != KDB_TYPE_STRING || !field->value.v.as_string.data) continue;
+            kdb__text_count_field(field->value.v.as_string.data, terms, n_terms, term_hits);
+        }
+        int n_matched_terms = 0;
+        double score = 0.0;
+        for (size_t t = 0; t < n_terms; t++) {
+            if (term_hits[t] > 0) { n_matched_terms++; score += term_hits[t]; }
+        }
+        int included = (mode == KDB_TEXT_MATCH_ALL) ? (n_matched_terms == (int)n_terms) : (n_matched_terms > 0);
+        if (included) { hits[n_hits].idx = r; hits[n_hits].score = score; n_hits++; }
+    }
+
+    kdb__text_ctx_all = &all;
+    qsort(hits, n_hits, sizeof(KdbTextHit), kdb__text_hit_cmp);
+    kdb__text_ctx_all = NULL;
+
+    if (limit > 0 && n_hits > limit) n_hits = limit;
+
+    KdbResult filtered;
+    st = kdb_result_init(&filtered, n_hits > 0 ? n_hits : 1);
+    if (st != KDB_OK) { free(hits); kdb_result_free(&all); return st; }
+
+    for (size_t i = 0; i < n_hits && st == KDB_OK; i++) {
+        KdbRecord *src = &all.rows[hits[i].idx];
+        uint32_t nf_count = src->field_count + 1;
+        KdbRecordField *nf = (KdbRecordField *)calloc(nf_count, sizeof(KdbRecordField));
+        if (!nf) { st = KDB_ERR_OOM; kdb_err_oom("text search output fields"); break; }
+
+        uint32_t copied = 0;
+        int ok = 1;
+        for (uint32_t k = 0; k < src->field_count && ok; k++) {
+            KDB_STRLCPY(nf[k].col_name, src->fields[k].col_name, KDB_MAX_NAME_LEN);
+            if (kdb_value_copy(&src->fields[k].value, &nf[k].value) != KDB_OK) { ok = 0; break; }
+            copied++;
+        }
+        if (ok) {
+            KDB_STRLCPY(nf[src->field_count].col_name, "_score", KDB_MAX_NAME_LEN);
+            kdb_value_from_float(hits[i].score, &nf[src->field_count].value);
+            copied++;
+
+            KdbRecord orow;
+            memset(&orow, 0, sizeof(orow));
+            orow.id         = src->id;
+            orow.created_at = src->created_at;
+            orow.updated_at = src->updated_at;
+            orow.fields     = nf;
+            orow.field_count = nf_count;
+            st = kdb_result_append(&filtered, &orow);
+        } else {
+            st = KDB_ERR_OOM;
+        }
+        for (uint32_t k = 0; k < copied; k++) kdb_value_free(&nf[k].value);
+        free(nf);
+    }
+
+    free(hits);
+    kdb_result_free(&all);
+    if (st != KDB_OK) { kdb_result_free(&filtered); return st; }
+
+    *rows_out = kdb__result_to_rows(&filtered);
     return *rows_out ? KDB_OK : kdb_last_status();
 }
 

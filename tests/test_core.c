@@ -987,6 +987,107 @@ static void test_aggregate_pipeline(void) {
     teardown(db);
 }
 
+static void test_text_search(void) {
+    KumDB *db;
+    setup(&db);
+
+    KdbField f1[] = { kdb_field_string("title", "The Quick Brown Fox"), kdb_field_string("body", "jumps over the lazy dog"), kdb_field_end() };
+    KdbField f2[] = { kdb_field_string("title", "Lazy Cats"), kdb_field_string("body", "cats are lazy and quick sometimes"), kdb_field_end() };
+    KdbField f3[] = { kdb_field_string("title", "Dogs and Foxes"), kdb_field_string("body", "the fox and the dog are friends"), kdb_field_end() };
+    KdbField f4[] = { kdb_field_string("title", "Unrelated"), kdb_field_string("body", "nothing relevant here at all"), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, "articles", f1));
+    ASSERT_OK(kdb_add(db, "articles", f2));
+    ASSERT_OK(kdb_add(db, "articles", f3));
+    ASSERT_OK(kdb_add(db, "articles", f4));
+
+    /* default KDB_TEXT_MATCH_ALL: every term must appear somewhere */
+    {
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_text_search(db, "articles", "fox dog", NULL, &rows));
+        ASSERT(rows && rows->count == 2u); /* article 1 (title+body) and article 3 (title+body) */
+        if (rows) {
+            for (size_t i = 0; i < rows->count; i++) {
+                double score = 0;
+                ASSERT_OK(kdb_row_get_float(&rows->rows[i], "_score", &score));
+                ASSERT(score > 0.0);
+            }
+            kdb_rows_free(rows);
+        }
+    }
+
+    /* KDB_TEXT_MATCH_ANY: at least one term */
+    {
+        KdbTextSearchOpts opts = { .mode = KDB_TEXT_MATCH_ANY };
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_text_search(db, "articles", "fox cats", &opts, &rows));
+        ASSERT(rows && rows->count == 3u); /* 1(fox), 2(cats), 3(fox) */
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* case-insensitive, whole-word (not substring) matching */
+    {
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_text_search(db, "articles", "QUICK", NULL, &rows));
+        ASSERT(rows && rows->count == 2u); /* article1 title, article2 body */
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* relevance ranking: higher term frequency sorts first */
+    {
+        KdbField rep[] = { kdb_field_string("title", "dog dog dog"), kdb_field_string("body", "just dog"), kdb_field_end() };
+        ASSERT_OK(kdb_add(db, "articles", rep));
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_text_search(db, "articles", "dog", NULL, &rows));
+        ASSERT(rows && rows->count > 0);
+        if (rows && rows->count > 0) {
+            const char *title = NULL;
+            ASSERT_OK(kdb_row_get_string(&rows->rows[0], "title", &title));
+            ASSERT_STR(title, "dog dog dog");
+        }
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* opts->fields restricts which fields are searched */
+    {
+        const char *only_title[] = { "title", NULL };
+        KdbTextSearchOpts opts = { .fields = only_title };
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_text_search(db, "articles", "jumps", &opts, &rows));
+        ASSERT(rows && rows->count == 0u); /* "jumps" is only in a body field */
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* limit */
+    {
+        KdbTextSearchOpts opts = { .mode = KDB_TEXT_MATCH_ANY, .limit = 1 };
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_text_search(db, "articles", "dog fox cats", &opts, &rows));
+        ASSERT(rows && rows->count == 1u);
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* an empty/punctuation-only query matches nothing */
+    {
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_text_search(db, "articles", "   ", NULL, &rows));
+        ASSERT(rows && rows->count == 0u);
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* error paths */
+    {
+        KdbField nsf[] = { kdb_field_int("x", 1), kdb_field_end() };
+        ASSERT_OK(kdb_add(db, "nostrings", nsf));
+    }
+    {
+        KdbRows *rows = NULL;
+        ASSERT_ERR(kdb_text_search(db, "nostrings", "x", NULL, &rows));    /* no STRING field to search */
+        ASSERT_ERR(kdb_text_search(db, "nonexistent", "x", NULL, &rows)); /* table doesn't exist */
+    }
+
+    teardown(db);
+}
+
 int main(void) {
     printf("=== test_core ===\n");
 
@@ -1016,6 +1117,7 @@ int main(void) {
     test_nested_survives_reopen();
     test_list_tables_repeated();
     test_aggregate_pipeline();
+    test_text_search();
 
     printf("passed=%d  failed=%d\n", passed, failed);
     return failed > 0 ? 1 : 0;

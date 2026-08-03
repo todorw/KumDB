@@ -156,6 +156,45 @@ memory over the whole table (`kdb_aggregate` fetches it all up front,
 same as `sql__exec_select_core` does under the hood for SQL) — fine at
 the row counts this engine targets, not optimized for huge tables.
 
+### Full-text search
+
+`kdb_text_search()` tokenizes a query into lowercased, alphanumeric words
+(no stemming, no stop-word removal, no quoted-phrase search — every
+space-separated word is its own independent term) and scans a table's
+`STRING` fields, ranking rows by how many times each term occurs as a
+whole word (not a substring):
+
+```c
+KdbRows *rows = NULL;
+kdb_text_search(db, "articles", "fox dog", NULL, &rows);
+```
+
+With no `opts`, every `STRING` field on the table is searched and a row
+is kept only if **every** query term appears somewhere in it
+(`KDB_TEXT_MATCH_ALL`, the default — `mode`'s zero value). Pass
+`KDB_TEXT_MATCH_ANY` to keep a row if **any** term matches instead, name
+specific fields via `opts->fields` (a `NULL`-terminated list) instead of
+searching every `STRING` field, and/or cap the result count via
+`opts->limit`:
+
+```c
+const char *title_only[] = { "title", NULL };
+KdbTextSearchOpts opts = { .fields = title_only, .mode = KDB_TEXT_MATCH_ANY, .limit = 10 };
+kdb_text_search(db, "articles", "fox dog", &opts, &rows);
+```
+
+Results come back sorted by relevance (total term occurrences across the
+searched fields, descending; ties broken by `id` ascending), each row
+carrying its score in an extra `"_score"` `FLOAT` field. Matching is
+case-insensitive and whole-word — searching `"fox"` doesn't match a field
+containing only `"foxes"`. There's no persistent index behind this: every
+call re-tokenizes the whole table in memory, the same scope `kdb_
+aggregate` already accepts. `KDB_ERR_BAD_ARG` if the table has no
+`STRING` field to search (name one explicitly via `opts->fields` if it
+does have one, just none picked up by the default "every `STRING`
+field" scan — which shouldn't normally happen, but a column added since
+the table was created some other way is worth knowing about).
+
 ### Reading a row's fields
 
 ```c

@@ -148,6 +148,29 @@ KdbStatus kdb_aggregate(KumDB *db, const char *table_name,
                         const KdbStage *stages, size_t n_stages,
                         KdbRows **rows_out);
 
+/* Full-text search: tokenizes query into lowercased, alphanumeric words
+ * (no stemming, no stop-word removal, no quoted-phrase search -- every
+ * space-separated word is its own independent term) and scans every row
+ * of table_name, counting how many times each term appears (as a whole
+ * word, not a substring) across the searched STRING fields. KDB_TEXT_
+ * MATCH_ALL (the default) keeps a row only if every term appears
+ * somewhere in it; KDB_TEXT_MATCH_ANY keeps it if at least one does.
+ * Results come back sorted by relevance (total term occurrences,
+ * descending; ties broken by id ascending), each row carrying its score
+ * in an extra "_score" FLOAT field. No persistent index -- every call
+ * re-tokenizes the whole table in memory, same "fine at the row counts
+ * this engine targets" scope kdb_aggregate already accepts. */
+typedef enum { KDB_TEXT_MATCH_ALL, KDB_TEXT_MATCH_ANY } KdbTextMatchMode;
+
+typedef struct {
+    const char       **fields; /* NULL-terminated STRING fields to search; NULL = every STRING field on the table */
+    KdbTextMatchMode   mode;   /* default (zero value) is KDB_TEXT_MATCH_ALL */
+    size_t             limit;  /* 0 = no limit */
+} KdbTextSearchOpts;
+
+KdbStatus kdb_text_search(KumDB *db, const char *table_name, const char *query,
+                          const KdbTextSearchOpts *opts, KdbRows **rows_out);
+
 KdbStatus kdb_update(KumDB          *db,
                      const char     *table_name,
                      const char    **where_filters,
