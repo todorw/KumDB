@@ -298,6 +298,7 @@ typedef struct {
     uint64_t       record_count;
     uint64_t       next_id;
     int            aborted;
+    int            transform_failed; /* transform_fn returned negative -- its own error is already set */
 } KdbRewriteCtx;
 
 static int kdb__rewrite_scan_cb(const KdbRecord *r_const, void *ud) {
@@ -308,6 +309,7 @@ static int kdb__rewrite_scan_cb(const KdbRecord *r_const, void *ud) {
     if (!r) { ctx->aborted = 1; return 0; }
 
     int keep = ctx->transform_fn(r, ctx->user_data);
+    if (keep < 0) { ctx->transform_failed = 1; kdb_record_free(r); return 0; }
     if (keep && !r->deleted) {
         if (kdb_record_write(r, ctx->out_fp) != KDB_OK) {
             ctx->aborted = 1;
@@ -368,6 +370,11 @@ KdbStatus kdb_storage_rewrite(KdbTable      *tbl,
     if (scan_st != KDB_OK) {
         fclose(out_fp); unlink(tmp_path);
         return scan_st;
+    }
+    if (ctx.transform_failed) {
+
+        fclose(out_fp); unlink(tmp_path);
+        return kdb_last_status(); /* transform_fn already set a specific error before aborting */
     }
     if (ctx.aborted) {
 

@@ -1400,6 +1400,20 @@ KdbStatus kdb_alter_column_unique(KumDB *db, const char *table_name, const char 
     return kdb_table_set_unique(tbl, col_name, unique);
 }
 
+KdbStatus kdb_alter_column_type(KumDB *db, const char *table_name, const char *col_name, KdbFieldType new_type) {
+    if (!db || !table_name || !col_name) {
+        kdb_err_null_arg("db/table_name/col_name", "kdb_alter_column_type");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+    return kdb_table_alter_column_type(tbl, col_name, new_type);
+}
+
 /* Renames the table itself: evicts any cached handle (closing its fd --
  * an already-open fd would otherwise keep referencing the old inode,
  * same reasoning kdb__evict_table's own doc comment gives for every

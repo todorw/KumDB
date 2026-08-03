@@ -285,6 +285,18 @@ KdbStatus kdb_alter_column_nullable(KumDB *db, const char *table_name, const cha
  * (a unique column always needs a real index to check against). */
 KdbStatus kdb_alter_column_unique(KumDB *db, const char *table_name, const char *col_name, int unique);
 
+/* Converts every existing row's value for col_name to new_type (a real
+ * data migration, not just a metadata flip) and updates the column's
+ * declared type. Uses the same coercions CAST(x AS type) does in SQL
+ * (NULL stays NULL; otherwise INT/FLOAT/BOOL/STRING conversions); an
+ * existing value that doesn't convert (e.g. a STRING column holding
+ * "abc" changed to INT) aborts the whole change with KDB_ERR_BAD_TYPE
+ * and leaves the table completely untouched -- never left
+ * half-migrated. Rebuilds any index on this column afterward (its old
+ * hash buckets no longer match the new-typed values). A no-op if
+ * new_type is already the column's current type. */
+KdbStatus kdb_alter_column_type(KumDB *db, const char *table_name, const char *col_name, KdbFieldType new_type);
+
 /* Renames the table itself (the file on disk, and the header's own
  * stored name). KDB_ERR_EXISTS if new_name already names a table. */
 KdbStatus kdb_rename_table(KumDB *db, const char *old_name, const char *new_name);

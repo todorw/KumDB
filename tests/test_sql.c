@@ -2274,6 +2274,85 @@ static void test_alter_table(void) {
     teardown(db);
 }
 
+static void test_alter_column_type(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (name TEXT, age TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, age) VALUES ('alice', '30')"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, age) VALUES ('bob', '25')"));
+
+    KdbRows *rows = NULL;
+
+    /* real migration: every existing row's value actually converts, not
+     * just the declared type */
+    ASSERT_OK(sql(db, "ALTER TABLE t ALTER COLUMN age TYPE INT"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM t WHERE age > 26", &rows, NULL));
+    ASSERT(rows && rows->count == 1u); /* only alice (30); a string compare would've matched differently (or not filtered at all) */
+    if (rows && rows->count == 1) {
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &name));
+        ASSERT_STR(name, "alice");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT age FROM t WHERE name = 'alice'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const KdbField *af = kdb_row_get(&rows->rows[0], "age");
+        ASSERT(af && af->type == KDB_TYPE_INT);
+        ASSERT_EQ(af->v.as_int, 30);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* schema reflects the new type persistently, across a reopen */
+    kdb_close(db);
+    db = kdb_open(TEST_DIR);
+    ASSERT(db != NULL);
+    {
+        KdbColumnInfo cols[16];
+        uint32_t ncols = 0;
+        ASSERT_OK(kdb_get_schema(db, "t", cols, 16, &ncols));
+        int found = 0;
+        for (uint32_t i = 0; i < ncols; i++) {
+            if (strcmp(cols[i].name, "age") == 0) { found = 1; ASSERT_EQ(cols[i].type, KDB_TYPE_INT); }
+        }
+        ASSERT(found);
+    }
+
+    /* a no-op when the type is already what's asked for */
+    ASSERT_OK(sql(db, "ALTER TABLE t ALTER COLUMN age TYPE INT"));
+
+    /* a migration that would fail is fully rejected -- the table (schema
+     * and every row) is left completely untouched, not half-migrated */
+    ASSERT_OK(sql(db, "INSERT INTO t (name, age) VALUES ('carol', 99)"));
+    ASSERT_ERR(sql(db, "ALTER TABLE t ALTER COLUMN name TYPE INT")); /* 'alice'/'bob'/'carol' don't convert */
+    {
+        KdbColumnInfo cols[16];
+        uint32_t ncols = 0;
+        ASSERT_OK(kdb_get_schema(db, "t", cols, 16, &ncols));
+        for (uint32_t i = 0; i < ncols; i++) {
+            if (strcmp(cols[i].name, "name") == 0) ASSERT_EQ(cols[i].type, KDB_TYPE_STRING);
+        }
+        ASSERT_EQ(count_all(db, "t"), 3);
+    }
+
+    /* an index on the migrated column still works correctly after being
+     * rebuilt for the new type */
+    ASSERT_OK(sql(db, "ALTER TABLE t ALTER COLUMN age SET UNIQUE"));
+    ASSERT_OK(sql(db, "ALTER TABLE t ALTER COLUMN age TYPE FLOAT"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM t WHERE age = 30", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+    ASSERT_ERR(sql(db, "INSERT INTO t (name, age) VALUES ('dave', 30)")); /* still enforced post-migration */
+
+    /* error paths */
+    ASSERT_ERR(sql(db, "ALTER TABLE t ALTER COLUMN nope TYPE INT"));
+    ASSERT_ERR(sql(db, "ALTER TABLE nope ALTER COLUMN name TYPE INT"));
+    ASSERT_ERR(sql(db, "ALTER TABLE t ALTER COLUMN name TYPE NOTATYPE"));
+
+    teardown(db);
+}
+
 static void test_unique_not_null_constraints(void) {
     KumDB *db;
     setup(&db);
@@ -2522,7 +2601,9 @@ static void test_alter_table_rename(void) {
     ASSERT_OK(sql(db, "ALTER TABLE t ALTER COLUMN name SET NOT NULL"));
     ASSERT_OK(sql(db, "ALTER TABLE t ALTER COLUMN name DROP NOT NULL"));
 
-    /* changing a column's type isn't supported */
+    /* ALTER COLUMN TYPE is a real migration -- rejected here because
+     * 'alice'/'bob' don't convert to INT, not because it's unsupported
+     * (see test_alter_column_type for the working case) */
     ASSERT_ERR(sql(db, "ALTER TABLE t ALTER COLUMN name TYPE INT"));
 
     /* RENAME TO -- the table itself, data and index intact */
@@ -3767,6 +3848,7 @@ int main(void) {
     test_case_when();
     test_distinct();
     test_alter_table();
+    test_alter_column_type();
     test_unique_not_null_constraints();
     test_create_drop_index();
     test_composite_indexes();

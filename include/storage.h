@@ -32,6 +32,13 @@ KdbStatus kdb_storage_scan(KdbTable      *tbl,
                            KdbScanCallback callback,
                            void           *user_data);
 
+/* Return 1 to keep the record, 0 to drop it (soft-delete/skip), or a
+ * negative value to abort the whole rewrite -- the original table file is
+ * left completely untouched (the half-written replacement is discarded),
+ * and kdb_storage_rewrite returns whatever status/message the transform
+ * itself already set via kdb_set_error before returning negative (e.g.
+ * kdb_table_alter_column_type aborting because one existing value can't
+ * convert to the new type). */
 typedef int (*KdbTransformFn)(KdbRecord *r, void *user_data);
 
 KdbStatus kdb_storage_rewrite(KdbTable      *tbl,

@@ -475,6 +475,82 @@ KdbStatus kdb_table_set_unique(KdbTable *tbl, const char *col_name, int unique) 
 }
 
 
+typedef struct { const char *col_name; KdbType new_type; } KdbAlterTypeCtx;
+
+static int kdb__alter_column_type_transform(KdbRecord *r, void *ud) {
+    KdbAlterTypeCtx *ctx = (KdbAlterTypeCtx *)ud;
+    if (!r) return 1;
+    for (uint32_t i = 0; i < r->field_count; i++) {
+        if (strcmp(r->fields[i].col_name, ctx->col_name) != 0) continue;
+        KdbValue converted;
+        if (kdb_value_cast(&r->fields[i].value, ctx->new_type, &converted) != KDB_OK) {
+            kdb_set_error(KDB_ERR_BAD_TYPE,
+                "can't change column '%s' to %s -- record id %llu currently has a %s value that "
+                "doesn't convert; original table left untouched",
+                ctx->col_name, kdb_type_name(ctx->new_type),
+                (unsigned long long)r->id, kdb_type_name(r->fields[i].value.type));
+            return -1;
+        }
+        kdb_value_free(&r->fields[i].value);
+        r->fields[i].value = converted;
+        break;
+    }
+    return !r->deleted;
+}
+
+/* Converts every existing row's value for col_name to new_type (via
+ * kdb_value_cast -- NULL stays NULL, otherwise the usual INT/FLOAT/BOOL/
+ * STRING coercions, same rules CAST(x AS type) uses in SQL) and updates
+ * the column's declared type -- a real data migration, not just a
+ * metadata flip. If even one existing value can't convert, the whole
+ * change is aborted and the original table file is left completely
+ * untouched (kdb_storage_rewrite's transform-abort path) -- never left
+ * half-migrated. Any index touching this column (single-column or
+ * composite) is rebuilt afterward, since its hash buckets were built
+ * from the old-typed values. */
+KdbStatus kdb_table_alter_column_type(KdbTable *tbl, const char *col_name, KdbType new_type) {
+    if (!tbl || !col_name) {
+        kdb_err_null_arg("tbl/col_name", "kdb_table_alter_column_type");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (!kdb_table_has_column(tbl, col_name)) {
+        kdb_err_field_not_found(col_name, tbl->name);
+        return KDB_ERR_NOT_FOUND;
+    }
+
+    KdbColumn *col = NULL;
+    for (uint32_t i = 0; i < tbl->header.column_count; i++) {
+        if (strcmp(tbl->header.columns[i].name, col_name) == 0) { col = &tbl->header.columns[i]; break; }
+    }
+    if (col->type == new_type) return KDB_OK; /* no-op: nothing to migrate */
+
+    KdbType old_type = col->type;
+    col->type = new_type; /* kdb_storage_rewrite writes tbl->header (already updated) into the new file */
+
+    KdbAlterTypeCtx ctx = { col_name, new_type };
+    KdbStatus st = kdb_storage_rewrite(tbl, kdb__alter_column_type_transform, &ctx);
+    if (st != KDB_OK) {
+        col->type = old_type; /* rewrite aborted -- the file was untouched, keep in-memory state matching it */
+        return st;
+    }
+
+    for (uint32_t i = 0; i < tbl->index_count; i++) {
+        KdbIndex *idx = tbl->indices[i];
+        if (!idx) continue;
+        int touches = strcmp(idx->col_name, col_name) == 0;
+        for (uint32_t e = 0; !touches && e < idx->n_extra_cols; e++) {
+            if (strcmp(idx->extra_cols[e], col_name) == 0) touches = 1;
+        }
+        if (touches) {
+            KdbStatus ist = kdb_index_rebuild(idx, tbl);
+            if (ist != KDB_OK) return ist;
+        }
+    }
+
+    tbl->dirty = 1;
+    return kdb_storage_flush_header(tbl);
+}
+
 const char *kdb__drop_col_name = NULL;
 
 int kdb__drop_column_transform(KdbRecord *r, void *ud) {

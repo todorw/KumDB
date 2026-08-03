@@ -405,7 +405,7 @@ CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX], ...)
 ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX]
 ALTER TABLE t DROP [COLUMN] col
 ALTER TABLE t RENAME COLUMN col TO new_col
-ALTER TABLE t ALTER [COLUMN] col SET NOT NULL | DROP NOT NULL | SET UNIQUE | DROP UNIQUE
+ALTER TABLE t ALTER [COLUMN] col TYPE newtype | SET NOT NULL | DROP NOT NULL | SET UNIQUE | DROP UNIQUE
 ALTER TABLE t RENAME [TO] new_name
 DROP TABLE t
 
@@ -573,14 +573,25 @@ nullable/unique flags — both really enforced from that point on
 `ALTER`; existing rows that already violate the new rule aren't
 retroactively checked or rewritten. `SET UNIQUE` also indexes the column
 if it wasn't already (a unique column always needs a real index to check
-against). Changing a column's *type* isn't supported — that would mean
-converting every existing row's value, a real data migration this engine
-doesn't attempt, not just an oversight.
+against).
+
+**`ALTER TABLE t ALTER [COLUMN] col TYPE newtype`** is a real data
+migration, not just a metadata flip: every existing row's value for
+`col` is converted to `newtype` using the same coercions `CAST(x AS
+type)` uses in `SELECT` (`NULL` stays `NULL`; otherwise the usual INT/
+FLOAT/BOOL/STRING conversions), and any index on the column is rebuilt
+afterward (its old hash buckets were built from the old-typed values and
+no longer match). If even one existing value doesn't convert — a STRING
+column holding `"abc"` changed to `INT`, say — the whole change is
+rejected and the table (schema and every row) is left completely
+untouched, never half-migrated. A no-op if `newtype` is already the
+column's current type.
 
 ```sql
 ALTER TABLE employees RENAME COLUMN dept TO department
 ALTER TABLE employees RENAME TO staff
 ALTER TABLE staff ALTER COLUMN email SET NOT NULL
+ALTER TABLE staff ALTER COLUMN zip_code TYPE INT
 ```
 
 Renaming a column or table that another one already has that name

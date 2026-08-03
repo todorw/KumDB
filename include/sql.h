@@ -20,7 +20,7 @@ extern "C" {
  *   ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX]
  *   ALTER TABLE t DROP [COLUMN] col
  *   ALTER TABLE t RENAME COLUMN col TO new_col
- *   ALTER TABLE t ALTER [COLUMN] col SET NOT NULL | DROP NOT NULL | SET UNIQUE | DROP UNIQUE
+ *   ALTER TABLE t ALTER [COLUMN] col TYPE newtype | SET NOT NULL | DROP NOT NULL | SET UNIQUE | DROP UNIQUE
  *   ALTER TABLE t RENAME [TO] new_name
  *   DROP TABLE t
  *   CREATE VIEW v AS SELECT ...
@@ -419,9 +419,16 @@ extern "C" {
  * TABLE column definition), but only for rows written after the ALTER;
  * existing rows that already violate the new rule aren't retroactively
  * checked or rewritten. SET UNIQUE also indexes the column if it wasn't
- * already. Changing a column's type isn't supported -- that would mean
- * converting every existing row's value, a real data migration this
- * engine doesn't attempt. Renaming a column or table to a name that's
+ * already. ALTER TABLE t ALTER [COLUMN] col TYPE newtype is a real data
+ * migration, not just a metadata flip: every existing row's value is
+ * converted to newtype using the same coercions CAST(x AS type) uses
+ * (NULL stays NULL; INT/FLOAT/BOOL/STRING otherwise), and any index on
+ * the column is rebuilt afterward (its old hash buckets no longer match
+ * the new-typed values). If even one existing value can't convert (e.g.
+ * a STRING column holding "abc" changed to INT), the whole change is
+ * rejected and the table -- schema and every row -- is left completely
+ * untouched, never half-migrated. A no-op if newtype is already the
+ * column's current type. Renaming a column or table to a name that's
  * already taken errors rather than colliding silently.
  *
  * WHERE conditions: col = val, != / <>, >, >=, <, <=, BETWEEN a AND b,

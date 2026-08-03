@@ -1730,11 +1730,31 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
          * kdb_table_check_insert_constraints/kdb_table_check_update_
          * constraints in table.c) -- SET only affects rows written after
          * this statement, existing rows aren't retroactively checked or
-         * rewritten. Changing a column's TYPE would mean converting every
-         * existing row's value, a real data migration this file doesn't
-         * attempt -- deliberately not supported, not just unimplemented,
-         * same "honest about scope" call as composite indexes and
-         * ROLLUP/CUBE elsewhere in this push. */
+         * rewritten. TYPE is a real data migration (kdb_table_alter_
+         * column_type): every existing row's value is converted via the
+         * same coercions CAST(x AS type) uses, and any index on the
+         * column is rebuilt -- if even one existing value doesn't
+         * convert, the whole change aborts and the table is left
+         * untouched, not half-migrated. */
+        if (sql__kw_is(&p->cur, "TYPE")) {
+            sql__advance(p);
+            const char *type_ident;
+            if (!sql__ident_text(&p->cur, &type_ident)) return sql__err("expected a type after ALTER COLUMN %s TYPE", col_name);
+            KdbFieldType ftype;
+            if (sql__type_from_ident(type_ident, &ftype) != KDB_OK)
+                return sql__err("unknown type '%s' for column '%s' -- use INT, FLOAT, BOOL, TEXT, or BLOB", type_ident, col_name);
+            sql__advance(p);
+
+            if (p->cur.type == SQLTOK_LPAREN) {
+                sql__advance(p);
+                if (p->cur.type != SQLTOK_NUMBER) return sql__err("expected a number in the length spec for '%s'", col_name);
+                sql__advance(p);
+                if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing the length spec for '%s'", col_name);
+                sql__advance(p);
+            }
+
+            return kdb_alter_column_type(db, table_name, col_name, ftype);
+        }
         if (sql__kw_is(&p->cur, "SET")) {
             sql__advance(p);
             if (sql__kw_is(&p->cur, "NOT")) {
@@ -1763,7 +1783,7 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
             }
             return sql__err("expected NOT NULL or UNIQUE after ALTER COLUMN %s DROP", col_name);
         }
-        return sql__err("ALTER COLUMN only supports SET|DROP NOT NULL or SET|DROP UNIQUE -- changing a column's type isn't supported");
+        return sql__err("ALTER COLUMN only supports TYPE, SET|DROP NOT NULL, or SET|DROP UNIQUE");
     }
 
     return sql__err("expected ADD [COLUMN], DROP [COLUMN], RENAME, or ALTER [COLUMN] after ALTER TABLE %s", table_name);

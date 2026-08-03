@@ -73,6 +73,15 @@ KdbStatus kdb_table_set_nullable(KdbTable *tbl, const char *col_name, int nullab
  * the column indexed too (see KdbColumnDef.unique). */
 KdbStatus kdb_table_set_unique(KdbTable *tbl, const char *col_name, int unique);
 
+/* Converts every existing row's value for col_name to new_type (via
+ * kdb_value_cast) and updates the column's declared type -- a real data
+ * migration, same cost as kdb_table_drop_column/kdb_compact. If any
+ * existing value can't convert, the whole change is aborted and the
+ * table is left completely untouched (KDB_ERR_BAD_TYPE). Rebuilds any
+ * index touching this column afterward. A no-op (KDB_OK, no rewrite) if
+ * new_type is already the column's type. */
+KdbStatus kdb_table_alter_column_type(KdbTable *tbl, const char *col_name, KdbType new_type);
+
 const KdbColumn *kdb_table_get_column(const KdbTable *tbl,
                                       const char     *col_name);
 
