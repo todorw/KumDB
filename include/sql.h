@@ -304,6 +304,37 @@ extern "C" {
 KdbStatus kdb_exec_sql(KumDB *db, const char *sql,
                        KdbRows **rows_out, size_t *affected_out);
 
+/*
+ * Same as kdb_exec_sql, but sql may contain bound-parameter placeholders:
+ * '?' (positional -- the first '?' takes params[0], the second params[1],
+ * and so on) and/or '$1', '$2', ... (explicit 1-based index into params,
+ * so a param can be reused or referenced out of order). Both forms can be
+ * mixed in one statement. A placeholder inside a string literal or a
+ * comment is just text, not a placeholder.
+ *
+ * Each placeholder is replaced with a properly-escaped SQL literal
+ * rendering of the corresponding param before the statement is parsed --
+ * safe against injection through the bound values themselves (a string
+ * param containing a quote doesn't need any caller-side escaping), but
+ * this is substitution-then-parse, not a real prepared-statement/bytecode
+ * cache -- the same one-shot "build query text, run it" cost as
+ * kdb_exec_sql, just with the substitution done for you instead of by
+ * hand with snprintf. params[i].name is ignored (params are positional
+ * only). A param's type follows the same rule as an INSERT/UPDATE
+ * literal: INT/FLOAT/BOOL/STRING/NULL all render directly; BLOB/ARRAY/
+ * OBJECT have no SQL literal syntax (same as kdb_exec_sql's own limit) and
+ * fail with an error naming which param.
+ *
+ *   int64_t min_age = 21;
+ *   const char *dept = "eng";
+ *   KdbField params[] = { kdb_field_int(NULL, min_age), kdb_field_string(NULL, dept) };
+ *   kdb_exec_sql_params(db, "SELECT * FROM employees WHERE age >= ? AND dept = ?",
+ *                       params, 2, &rows, NULL);
+ */
+KdbStatus kdb_exec_sql_params(KumDB *db, const char *sql,
+                              const KdbField *params, size_t nparams,
+                              KdbRows **rows_out, size_t *affected_out);
+
 #ifdef __cplusplus
 }
 #endif

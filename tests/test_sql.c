@@ -672,6 +672,111 @@ static void test_regexp_and_ilike(void) {
     teardown(db);
 }
 
+static void test_bound_params(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (name TEXT, age INT, active BOOL)"));
+
+    KdbRows *rows = NULL;
+    size_t affected = 0;
+
+    /* positional '?' placeholders */
+    {
+        KdbField params[] = {
+            kdb_field_string(NULL, "alice"),
+            kdb_field_int(NULL, 30),
+            kdb_field_bool(NULL, 1),
+        };
+        ASSERT_OK(kdb_exec_sql_params(db, "INSERT INTO t (name, age, active) VALUES (?, ?, ?)",
+                                       params, 3, NULL, &affected));
+        ASSERT_EQ(affected, 1u);
+    }
+
+    /* a string param containing a quote needs no caller-side escaping */
+    {
+        KdbField params[] = {
+            kdb_field_string(NULL, "O'Brien"),
+            kdb_field_int(NULL, 45),
+            kdb_field_bool(NULL, 0),
+        };
+        ASSERT_OK(kdb_exec_sql_params(db, "INSERT INTO t (name, age, active) VALUES (?, ?, ?)",
+                                       params, 3, NULL, NULL));
+    }
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM t WHERE name = 'O''Brien'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* a NULL param */
+    {
+        KdbField params[] = { kdb_field_null(NULL), kdb_field_int(NULL, 5), kdb_field_bool(NULL, 0) };
+        ASSERT_OK(kdb_exec_sql_params(db, "INSERT INTO t (name, age, active) VALUES (?, ?, ?)",
+                                       params, 3, NULL, NULL));
+    }
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM t WHERE name IS NULL", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* explicit '$N' index, and reusing the same param twice */
+    {
+        KdbField params[] = { kdb_field_int(NULL, 30) };
+        ASSERT_OK(kdb_exec_sql_params(db, "SELECT name FROM t WHERE age = $1 OR age = $1",
+                                       params, 1, &rows, NULL));
+        ASSERT(rows && rows->count == 1u);
+        if (rows) { kdb_rows_free(rows); rows = NULL; }
+    }
+
+    /* '?' and '$N' mixed in one statement */
+    {
+        KdbField params[] = { kdb_field_int(NULL, 45), kdb_field_string(NULL, "O'Brien") };
+        ASSERT_OK(kdb_exec_sql_params(db, "SELECT name FROM t WHERE age = ? AND name = $2",
+                                       params, 2, &rows, NULL));
+        ASSERT(rows && rows->count == 1u);
+        if (rows) { kdb_rows_free(rows); rows = NULL; }
+    }
+
+    /* a '?'/'$1' that's just text inside a string literal or a comment
+     * isn't treated as a placeholder */
+    {
+        KdbField params[] = { kdb_field_bool(NULL, 1) };
+        ASSERT_OK(kdb_exec_sql_params(db,
+            "INSERT INTO t (name, age, active) VALUES ('literal ? mark', 1, ?) -- trailing $1 comment",
+            params, 1, NULL, NULL));
+    }
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM t WHERE name = 'literal ? mark'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* UPDATE ... RETURNING with bound params */
+    {
+        KdbField params[] = { kdb_field_int(NULL, 99), kdb_field_string(NULL, "alice") };
+        ASSERT_OK(kdb_exec_sql_params(db, "UPDATE t SET age = ? WHERE name = ? RETURNING name, age",
+                                       params, 2, &rows, NULL));
+        ASSERT(rows && rows->count == 1u);
+        if (rows && rows->count == 1) {
+            int64_t age = 0;
+            ASSERT_OK(kdb_row_get_int(&rows->rows[0], "age", &age));
+            ASSERT_EQ(age, 99);
+        }
+        if (rows) { kdb_rows_free(rows); rows = NULL; }
+    }
+
+    /* error paths: too few params, a $0 index, and a BLOB param (no SQL
+     * literal form) all fail with a message, not a crash */
+    {
+        KdbField params[] = { kdb_field_int(NULL, 1) };
+        ASSERT_ERR(kdb_exec_sql_params(db, "SELECT * FROM t WHERE age = ? AND active = ?",
+                                        params, 1, &rows, NULL));
+        ASSERT_ERR(kdb_exec_sql_params(db, "SELECT * FROM t WHERE age = $0", params, 1, &rows, NULL));
+    }
+    {
+        KdbField params[] = { kdb_field_blob(NULL, "xy", 2) };
+        ASSERT_ERR(kdb_exec_sql_params(db, "SELECT * FROM t WHERE name = ?", params, 1, &rows, NULL));
+    }
+    ASSERT_ERR(kdb_exec_sql_params(NULL, "SELECT 1", NULL, 0, NULL, NULL));
+
+    teardown(db);
+}
+
 static void test_or(void) {
     KumDB *db;
     setup(&db);
@@ -2675,6 +2780,7 @@ int main(void) {
     test_update_delete();
     test_where_operators();
     test_regexp_and_ilike();
+    test_bound_params();
     test_or();
     test_parenthesized_where();
     test_group_by_and_aggregates();

@@ -2648,6 +2648,104 @@ static int sql__render_sql_literal(const KdbField *f, char *buf, size_t buf_size
     }
 }
 
+/* Scans sql char-by-char (skipping over string literals and comments with
+ * the same rules sql__lex_next itself uses, so a '?'/'$3' inside either of
+ * those is left alone) and replaces every bare '?' (positional, consumed
+ * left to right) or '$N' (1-based, explicit index) placeholder with a
+ * literal rendering of params[idx] -- same "substitute away, then run the
+ * now-self-contained text through the normal parser" idea as
+ * sql__substitute_outer_refs above, just against caller-supplied bound
+ * values instead of an outer row. Unlike that function this doesn't
+ * re-tokenize the rest of the text (copies it through verbatim), since
+ * there's no need to reconstruct anything other than the placeholders
+ * themselves. On success *out_sql is a heap string the caller owns;
+ * on failure it's left untouched and the returned status's detail is
+ * already set via sql__err/kdb_err_oom. */
+static int sql__bindbuf_append(char **out, size_t *cap, size_t *len, const char *chunk, size_t chunk_len) {
+    if (*len + chunk_len + 1 > *cap) {
+        size_t newcap = *cap;
+        while (newcap < *len + chunk_len + 1) newcap *= 2;
+        char *grown = realloc(*out, newcap);
+        if (!grown) { kdb_err_oom("parameter-bound SQL text"); return 0; }
+        *out = grown;
+        *cap = newcap;
+    }
+    memcpy(*out + *len, chunk, chunk_len);
+    *len += chunk_len;
+    return 1;
+}
+
+static KdbStatus sql__bind_params(const char *sql, const KdbField *params, size_t nparams, char **out_sql) {
+    size_t cap = strlen(sql) + 256;
+    char *out = malloc(cap);
+    if (!out) { kdb_err_oom("parameter-bound SQL text"); return KDB_ERR_OOM; }
+    size_t len = 0;
+    size_t implicit_idx = 0;
+
+    size_t i = 0;
+    while (sql[i]) {
+        char c = sql[i];
+
+        if (c == '\'' || c == '"') {
+            char quote = c;
+            size_t j = i + 1;
+            while (sql[j] && !(sql[j] == quote && sql[j + 1] != quote)) {
+                if (sql[j] == quote) j += 2; else j++;
+            }
+            if (sql[j]) j++; /* consume the closing quote; unterminated just runs to EOF */
+            if (!sql__bindbuf_append(&out, &cap, &len, sql + i, j - i)) { free(out); return KDB_ERR_OOM; }
+            i = j;
+            continue;
+        }
+
+        if ((c == '-' && sql[i + 1] == '-') || (c == '/' && sql[i + 1] == '*')) {
+            size_t j = i + 2;
+            if (c == '-') { while (sql[j] && sql[j] != '\n') j++; }
+            else { while (sql[j] && !(sql[j] == '*' && sql[j + 1] == '/')) j++; if (sql[j]) j += 2; }
+            if (!sql__bindbuf_append(&out, &cap, &len, sql + i, j - i)) { free(out); return KDB_ERR_OOM; }
+            i = j;
+            continue;
+        }
+
+        if (c == '?' || (c == '$' && isdigit((unsigned char)sql[i + 1]))) {
+            size_t idx;
+            if (c == '?') {
+                idx = implicit_idx++;
+                i += 1;
+            } else {
+                size_t j = i + 1;
+                size_t n = 0;
+                while (isdigit((unsigned char)sql[j])) { n = n * 10 + (size_t)(sql[j] - '0'); j++; }
+                if (n == 0) { free(out); return sql__err("parameter placeholder $0 is invalid -- placeholders are 1-based"); }
+                idx = n - 1;
+                i = j;
+            }
+            if (idx >= nparams) {
+                free(out);
+                return sql__err("not enough bound parameters (statement needs at least %zu, got %zu)",
+                                 idx + 1, nparams);
+            }
+
+            char piece[KDB_MAX_STRING_LEN * 2 + 16];
+            if (params[idx].type == KDB_TYPE_NULL) {
+                snprintf(piece, sizeof(piece), "NULL");
+            } else if (!sql__render_sql_literal(&params[idx], piece, sizeof(piece))) {
+                free(out);
+                return sql__err("bound parameter %zu has a type with no SQL literal form "
+                                 "(BLOB/ARRAY/OBJECT) -- set it through the C API instead", idx + 1);
+            }
+            if (!sql__bindbuf_append(&out, &cap, &len, piece, strlen(piece))) { free(out); return KDB_ERR_OOM; }
+            continue;
+        }
+
+        if (!sql__bindbuf_append(&out, &cap, &len, &c, 1)) { free(out); return KDB_ERR_OOM; }
+        i++;
+    }
+    out[len] = '\0';
+    *out_sql = out;
+    return KDB_OK;
+}
+
 /* Re-lexes inner_sql (EXISTS/NOT EXISTS's inner SELECT, verbatim source
  * text) and rebuilds it token by token, replacing every identifier of the
  * exact shape "<outer_alias>.<col>" with a literal rendering of that
@@ -5476,4 +5574,25 @@ KdbStatus kdb_exec_sql(KumDB *db, const char *sql, KdbRows **rows_out, size_t *a
         return sql__err("unexpected trailing content after the statement -- one statement per call");
 
     return KDB_OK;
+}
+
+KdbStatus kdb_exec_sql_params(KumDB *db, const char *sql,
+                              const KdbField *params, size_t nparams,
+                              KdbRows **rows_out, size_t *affected_out) {
+    if (!db || !sql) {
+        kdb_err_null_arg("db/sql", "kdb_exec_sql_params");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (nparams > 0 && !params) {
+        kdb_err_null_arg("params", "kdb_exec_sql_params");
+        return KDB_ERR_BAD_ARG;
+    }
+
+    char *bound = NULL;
+    KdbStatus st = sql__bind_params(sql, params, nparams, &bound);
+    if (st != KDB_OK) return st;
+
+    st = kdb_exec_sql(db, bound, rows_out, affected_out);
+    free(bound);
+    return st;
 }

@@ -309,6 +309,23 @@ meant for wrapping bulk operations on a huge one.
 `kdb_exec_sql(db, sql, &rows_out, &affected_out)` runs one statement and
 hits the exact same storage/query engine the NoSQL API uses.
 
+`kdb_exec_sql_params(db, sql, params, nparams, &rows_out, &affected_out)`
+is the same thing with bound-parameter placeholders: `?` (positional) and
+`$1`/`$2`/... (explicit 1-based index, so a param can be reused or
+referenced out of order) can appear anywhere a literal would, and get
+substituted with a properly-escaped rendering of the corresponding
+`KdbField` before the statement is parsed — a string param containing a
+quote needs no caller-side escaping. `params[i].name` is ignored (params
+are positional only). This is substitution-then-parse, not a real
+prepared-statement cache — same one-shot cost as `kdb_exec_sql`, just
+without hand-rolled `snprintf`/escaping on the caller's side:
+
+```c
+KdbField params[] = { kdb_field_int(NULL, min_age), kdb_field_string(NULL, "eng") };
+kdb_exec_sql_params(db, "SELECT * FROM employees WHERE age >= ? AND dept = ?",
+                    params, 2, &rows, NULL);
+```
+
 ```sql
 CREATE TABLE t (col TYPE [NOT NULL] [INDEX], ...)
 ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [INDEX]
