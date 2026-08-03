@@ -987,6 +987,109 @@ static void test_aggregate_pipeline(void) {
     teardown(db);
 }
 
+static void test_aggregate_lookup(void) {
+    KumDB *db;
+    setup(&db);
+
+    /* customers <- orders, one-to-many, customer_id is a plain field (no
+     * declared FK needed -- $lookup doesn't require one, same as SQL JOIN) */
+    KdbField c1[] = { kdb_field_string("name", "alice"), kdb_field_end() };
+    KdbField c2[] = { kdb_field_string("name", "bob"),   kdb_field_end() };
+    ASSERT_OK(kdb_add(db, "customers", c1));
+    ASSERT_OK(kdb_add(db, "customers", c2));
+
+    const char *filters[] = { "name=alice", NULL };
+    KdbRow *alice = kdb_find_one(db, "customers", filters);
+    ASSERT(alice != NULL);
+    int64_t alice_id = alice ? (int64_t)alice->id : -1;
+    if (alice) kdb_row_free(alice);
+
+    KdbField o1[] = { kdb_field_int("customer_id", alice_id), kdb_field_float("amount", 10.0), kdb_field_end() };
+    KdbField o2[] = { kdb_field_int("customer_id", alice_id), kdb_field_float("amount", 20.0), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, "orders", o1));
+    ASSERT_OK(kdb_add(db, "orders", o2));
+
+    /* alice's two orders get embedded as an array; bob's stays empty */
+    {
+        KdbStage stages[] = {{
+            .type = KDB_STAGE_LOOKUP,
+            .as = { .lookup = { .from_table = "orders", .local_field = "id",
+                                .foreign_field = "customer_id", .as_field = "orders" } }
+        }};
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_aggregate(db, "customers", stages, 1, &rows));
+        ASSERT(rows && rows->count == 2u);
+        if (rows) {
+            for (size_t i = 0; i < rows->count; i++) {
+                const char *name = NULL;
+                ASSERT_OK(kdb_row_get_string(&rows->rows[i], "name", &name));
+                const KdbField *items = NULL;
+                size_t count = 0;
+                ASSERT_OK(kdb_row_get_array(&rows->rows[i], "orders", &items, &count));
+                if (strcmp(name, "alice") == 0) {
+                    ASSERT_EQ(count, 2u);
+                    double sum = 0;
+                    for (size_t k = 0; k < count; k++) {
+                        ASSERT_EQ(items[k].type, KDB_TYPE_OBJECT);
+                        int saw_id = 0;
+                        for (const KdbField *sub = items[k].v.as_object; sub->name != NULL; sub++) {
+                            if (strcmp(sub->name, "id") == 0) saw_id = 1;
+                            if (strcmp(sub->name, "amount") == 0) sum += sub->v.as_float;
+                        }
+                        ASSERT(saw_id); /* embedded doc carries its own id */
+                    }
+                    ASSERT(sum > 29.9 && sum < 30.1);
+                } else {
+                    ASSERT_STR(name, "bob");
+                    ASSERT_EQ(count, 0u); /* no matching orders -- empty array, not an error */
+                }
+            }
+            kdb_rows_free(rows);
+        }
+    }
+
+    /* $lookup by a pseudo-column on the foreign side too (foreign_field="id") */
+    {
+        KdbField t1[] = { kdb_field_int("ref_id", alice_id), kdb_field_end() };
+        ASSERT_OK(kdb_add(db, "tickets", t1));
+
+        KdbStage stages[] = {{
+            .type = KDB_STAGE_LOOKUP,
+            .as = { .lookup = { .from_table = "customers", .local_field = "ref_id",
+                                .foreign_field = "id", .as_field = "customer" } }
+        }};
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_aggregate(db, "tickets", stages, 1, &rows));
+        ASSERT(rows && rows->count == 1u);
+        if (rows && rows->count == 1) {
+            const KdbField *items = NULL;
+            size_t count = 0;
+            ASSERT_OK(kdb_row_get_array(&rows->rows[0], "customer", &items, &count));
+            ASSERT_EQ(count, 1u);
+            if (count == 1) {
+                const char *name = NULL;
+                for (const KdbField *sub = items[0].v.as_object; sub->name != NULL; sub++)
+                    if (strcmp(sub->name, "name") == 0) name = sub->v.as_string;
+                ASSERT_STR(name, "alice");
+            }
+        }
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* from_table not existing is a real error, not a per-row soft skip */
+    {
+        KdbStage stages[] = {{
+            .type = KDB_STAGE_LOOKUP,
+            .as = { .lookup = { .from_table = "nonexistent", .local_field = "id",
+                                .foreign_field = "x", .as_field = "y" } }
+        }};
+        KdbRows *rows = NULL;
+        ASSERT_ERR(kdb_aggregate(db, "customers", stages, 1, &rows));
+    }
+
+    teardown(db);
+}
+
 static void test_text_search(void) {
     KumDB *db;
     setup(&db);
@@ -1226,6 +1329,7 @@ int main(void) {
     test_nested_survives_reopen();
     test_list_tables_repeated();
     test_aggregate_pipeline();
+    test_aggregate_lookup();
     test_text_search();
     test_geo_queries();
 

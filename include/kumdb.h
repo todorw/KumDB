@@ -83,18 +83,24 @@ KdbRows *kdb_find_ex(KumDB *db, const char *table_name, const char **filters,
 
 /* Aggregation pipeline: a sequence of stages run over a table's rows in
  * order, each stage's output feeding the next -- the NoSQL C API's
- * counterpart to SQL's WHERE/GROUP BY/ORDER BY/LIMIT (see sql.h), built
- * for direct C use with no SQL text involved. Every stage runs in memory
- * over the whole table (kdb_query_execute fetches it all up front, same
- * "fine at the row counts this engine targets" scope the rest of the
- * engine already accepts -- not optimized for huge tables). */
+ * counterpart to SQL's WHERE/GROUP BY/ORDER BY/LIMIT/JOIN (see sql.h),
+ * built for direct C use with no SQL text involved. Every stage runs in
+ * memory over the whole table (kdb_query_execute fetches it all up
+ * front, same "fine at the row counts this engine targets" scope the
+ * rest of the engine already accepts -- not optimized for huge tables).
+ * KDB_STAGE_LOOKUP additionally fetches (fully, same in-memory scope)
+ * every row of from_table matching each pipeline row, once per row --
+ * fine for the row counts this targets, but genuinely O(pipeline_rows *
+ * from_table size) unlike every other stage here, which is a single
+ * linear pass. */
 typedef enum {
     KDB_STAGE_MATCH,    /* keep only rows matching filters (same raw filter-string format kdb_find takes) */
     KDB_STAGE_GROUP,    /* group by field(s), reducing each group to one row via accumulators */
     KDB_STAGE_SORT,     /* multi-key sort, same semantics as KdbFindOpts.order_by generalized to several fields */
     KDB_STAGE_LIMIT,    /* cap the row count */
     KDB_STAGE_SKIP,     /* drop the first n rows */
-    KDB_STAGE_PROJECT   /* keep only the named fields (id/created_at/updated_at work too), in that order */
+    KDB_STAGE_PROJECT,  /* keep only the named fields (id/created_at/updated_at work too), in that order */
+    KDB_STAGE_LOOKUP    /* cross-collection join -- embeds matching rows from another table as an array field */
 } KdbStageType;
 
 typedef enum {
@@ -141,6 +147,12 @@ typedef struct {
         size_t       limit;
         size_t       skip;
         const char **project_fields; /* NULL-terminated */
+        struct {
+            const char *from_table;    /* the other table to join against */
+            const char *local_field;   /* this pipeline's own field (id/created_at/updated_at work here) */
+            const char *foreign_field; /* from_table's field to match against (id/created_at/updated_at work here too) */
+            const char *as_field;      /* output field name -- always set to an ARRAY, even when nothing matches */
+        } lookup;
     } as;
 } KdbStage;
 

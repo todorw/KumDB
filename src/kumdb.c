@@ -2001,6 +2001,115 @@ static KdbStatus kdb__agg_project(const KdbResult *cur, const char **fields, Kdb
     return st;
 }
 
+/* Builds one $lookup array element out of a matched foreign-table row --
+ * an OBJECT holding its id/created_at/updated_at folded in as regular
+ * fields (a nested object has no separate "row" metadata slot the way a
+ * top-level KdbRow does, so this is the only way to carry them along)
+ * plus every one of its stored fields. Caller must kdb_value_free() the
+ * result. */
+static KdbStatus kdb__build_lookup_object(const KdbRecord *r, KdbValue *out) {
+    uint32_t n = r->field_count + 3;
+    KdbRecordField *fields = (KdbRecordField *)calloc(n, sizeof(KdbRecordField));
+    if (!fields) { kdb_err_oom("$lookup object fields"); return KDB_ERR_OOM; }
+
+    KDB_STRLCPY(fields[0].col_name, "id", KDB_MAX_NAME_LEN);
+    kdb_value_from_int((int64_t)r->id, &fields[0].value);
+    KDB_STRLCPY(fields[1].col_name, "created_at", KDB_MAX_NAME_LEN);
+    kdb_value_from_int((int64_t)r->created_at, &fields[1].value);
+    KDB_STRLCPY(fields[2].col_name, "updated_at", KDB_MAX_NAME_LEN);
+    kdb_value_from_int((int64_t)r->updated_at, &fields[2].value);
+
+    KdbStatus st = KDB_OK;
+    uint32_t fi = 3;
+    for (uint32_t i = 0; i < r->field_count && st == KDB_OK; i++) {
+        KDB_STRLCPY(fields[fi].col_name, r->fields[i].col_name, KDB_MAX_NAME_LEN);
+        st = kdb_value_copy(&r->fields[i].value, &fields[fi].value);
+        if (st == KDB_OK) fi++;
+    }
+    if (st == KDB_OK) st = kdb_value_from_object(fields, fi, out);
+
+    for (uint32_t i = 0; i < fi; i++) kdb_value_free(&fields[i].value);
+    free(fields);
+    return st;
+}
+
+/* $lookup: for every row, finds every row in from_table where
+ * foreign_field equals this row's local_field value (pseudo-columns
+ * id/created_at/updated_at work on both sides, same as MATCH/GROUP/SORT
+ * fields elsewhere in this pipeline), and adds them as an ARRAY of OBJECT
+ * values under as_field -- always added, even when nothing matches (an
+ * empty array), same as MongoDB's $lookup. A row missing local_field (or
+ * holding NULL there) just gets an empty array -- no error, same "soft
+ * skip" convention kdb_geo_near/$group already follow for a missing
+ * field. from_table not existing IS an error (unlike a missing per-row
+ * field) -- that's a real misconfiguration, not a per-row data gap. */
+static KdbStatus kdb__agg_lookup(KumDB *db, const KdbResult *cur, const char *from_table,
+                                 const char *local_field, const char *foreign_field,
+                                 const char *as_field, KdbResult *out) {
+    KdbTable *from_tbl = kdb__get_table(db, from_table);
+    if (!from_tbl) {
+        kdb_set_error(KDB_ERR_NOT_FOUND, "$lookup: table '%s' doesn't exist (or couldn't be opened).", from_table);
+        return KDB_ERR_NOT_FOUND;
+    }
+
+    KdbStatus st = kdb_result_init(out, cur->count > 0 ? cur->count : 1);
+    if (st != KDB_OK) return st;
+
+    for (size_t r = 0; r < cur->count && st == KDB_OK; r++) {
+        KdbValue local_pseudo;
+        const KdbValue *local_val = NULL;
+        if (kdb__pseudo_column_value(&cur->rows[r], local_field, &local_pseudo)) {
+            local_val = &local_pseudo;
+        } else {
+            const KdbRecordField *f = kdb_record_get_field(&cur->rows[r], local_field);
+            if (f) local_val = &f->value;
+        }
+
+        KdbValue *items = NULL;
+        size_t n_items = 0;
+        if (local_val && local_val->type != KDB_TYPE_NULL) {
+            KdbQuery q;
+            kdb_query_init(&q);
+            st = kdb_query_add_filter_value(&q, foreign_field, KDB_OP_EQ, local_val, NULL);
+            if (st != KDB_OK) { kdb_query_free(&q); break; }
+
+            KdbResult matches;
+            st = kdb_query_execute(from_tbl, &q, &matches);
+            kdb_query_free(&q);
+            if (st != KDB_OK) break;
+
+            if (matches.count > 0) {
+                items = (KdbValue *)calloc(matches.count, sizeof(KdbValue));
+                if (!items) {
+                    kdb_result_free(&matches);
+                    kdb_err_oom("$lookup items");
+                    st = KDB_ERR_OOM;
+                    break;
+                }
+                for (size_t m = 0; m < matches.count && st == KDB_OK; m++) {
+                    st = kdb__build_lookup_object(&matches.rows[m], &items[n_items]);
+                    if (st == KDB_OK) n_items++;
+                }
+            }
+            kdb_result_free(&matches);
+            if (st != KDB_OK) { for (size_t m = 0; m < n_items; m++) kdb_value_free(&items[m]); free(items); break; }
+        }
+
+        KdbValue arr_val;
+        st = kdb_value_from_array(items, n_items, &arr_val);
+        for (size_t m = 0; m < n_items; m++) kdb_value_free(&items[m]);
+        free(items);
+        if (st != KDB_OK) break;
+
+        st = kdb_result_append(out, &cur->rows[r]);
+        if (st == KDB_OK) st = kdb_record_set_field(&out->rows[out->count - 1], as_field, &arr_val);
+        kdb_value_free(&arr_val);
+    }
+
+    if (st != KDB_OK) kdb_result_free(out);
+    return st;
+}
+
 KdbStatus kdb_aggregate(KumDB *db, const char *table_name,
                         const KdbStage *stages, size_t n_stages, KdbRows **rows_out) {
     if (!db || !table_name || !rows_out || (n_stages > 0 && !stages)) {
@@ -2047,6 +2156,13 @@ KdbStatus kdb_aggregate(KumDB *db, const char *table_name,
             case KDB_STAGE_PROJECT: {
                 KdbResult next;
                 st = kdb__agg_project(&cur, stage->as.project_fields, &next);
+                if (st == KDB_OK) { kdb_result_free(&cur); cur = next; }
+                break;
+            }
+            case KDB_STAGE_LOOKUP: {
+                KdbResult next;
+                st = kdb__agg_lookup(db, &cur, stage->as.lookup.from_table, stage->as.lookup.local_field,
+                                     stage->as.lookup.foreign_field, stage->as.lookup.as_field, &next);
                 if (st == KDB_OK) { kdb_result_free(&cur); cur = next; }
                 break;
             }

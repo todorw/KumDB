@@ -127,7 +127,7 @@ KdbRows *rows = NULL;
 kdb_aggregate(db, "sales", stages, 4, &rows);
 ```
 
-Six stage types, run in whatever order the array lists them (a pipeline
+Seven stage types, run in whatever order the array lists them (a pipeline
 can use the same stage type more than once — two `$match`es, `$sort`
 after `$group`, etc.):
 
@@ -147,14 +147,43 @@ after `$group`, etc.):
   the first `n` rows, same as `KdbFindOpts`.
 - **`KDB_STAGE_PROJECT`** — keeps only the named fields (a `NULL`-
   terminated list), in that order; a missing field is silently skipped.
+- **`KDB_STAGE_LOOKUP`** — cross-collection join: for every row, finds
+  every row in `from_table` where `foreign_field` equals this row's
+  `local_field` value, and embeds them as an `ARRAY` of `OBJECT`s under
+  `as_field` — always added, even as an empty array when nothing matches
+  (same as MongoDB's `$lookup`, and unlike SQL's `INNER JOIN`, which would
+  drop the row entirely). Each embedded document carries its own
+  `id`/`created_at`/`updated_at` folded in as regular object fields
+  (there's no separate "row" metadata slot for a nested object) alongside
+  its stored fields.
+
+```c
+KdbStage stages[] = {{
+    .type = KDB_STAGE_LOOKUP,
+    .as = { .lookup = { .from_table = "orders", .local_field = "id",
+                        .foreign_field = "customer_id", .as_field = "orders" } }
+}};
+kdb_aggregate(db, "customers", stages, 1, &rows);
+/* each customer row now has an "orders" ARRAY field with every matching order embedded */
+```
 
 `$group`'s `group_by`/accumulator `source_field`s and `$sort`'s fields
 must be real stored fields, not the `id`/`created_at`/`updated_at`
-pseudo-columns (`$match`'s filters and `$project`'s fields work fine with
-them, same as `kdb_find`/`kdb_find_ex` always have). Every stage runs in
-memory over the whole table (`kdb_aggregate` fetches it all up front,
-same as `sql__exec_select_core` does under the hood for SQL) — fine at
-the row counts this engine targets, not optimized for huge tables.
+pseudo-columns (`$match`'s filters, `$project`'s fields, and `$lookup`'s
+`local_field`/`foreign_field` all work fine with them, same as
+`kdb_find`/`kdb_find_ex` always have). Every stage runs in memory over
+the whole table (`kdb_aggregate` fetches it all up front, same as
+`sql__exec_select_core` does under the hood for SQL) — fine at the row
+counts this engine targets, not optimized for huge tables. `$lookup` is
+the one exception to "a single linear pass": it fetches `from_table`
+fresh for every pipeline row it processes, so it's genuinely
+`O(pipeline_rows × from_table size)`, not `O(pipeline_rows +
+from_table size)` — still fine at this engine's target scale, just worth
+knowing before chaining several of them. `from_table` not existing is a
+real error (`KDB_ERR_NOT_FOUND`); a row simply missing `local_field` (or
+holding `NULL` there) just gets an empty array, no error, same "soft
+skip" convention `$group`/`kdb_geo_near` already follow for a missing
+field.
 
 ### Full-text search
 
