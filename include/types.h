@@ -30,6 +30,18 @@ int kdb_value_matches(const KdbValue *field,
  * SQL_ROP_LIKE (the SQL layer's row-cond form of the same operator). */
 int kdb_like_match(const char *pattern, const char *text);
 
+/* Same wildcards as kdb_like_match, case-insensitively -- KDB_OP_ILIKE/
+ * SQL_ROP_ILIKE's matcher. */
+int kdb_ilike_match(const char *pattern, const char *text);
+
+/* A small, self-contained regex matcher (literals, '.', '*'/'+'/'?',
+ * '[...]'/'[^...]' classes, '\' escapes, optional '^'/'$' anchors; no
+ * alternation, groups, or bounded repetition -- see the definition in
+ * types.c for the full rationale) -- not a POSIX <regex.h> wrapper, which
+ * isn't available when cross-compiling for Windows via mingw-w64.
+ * KDB_OP_REGEXP/SQL_ROP_REGEXP's matcher. */
+int kdb_regex_match(const char *pattern, const char *text);
+
 const char *kdb_type_name(KdbType type);
 const char *kdb_op_name  (KdbOperator op);
 

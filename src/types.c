@@ -449,6 +449,135 @@ int kdb_like_match(const char *pattern, const char *text) {
     return *p == '\0';
 }
 
+/* Same algorithm as kdb_like_match, case-insensitively -- a separate
+ * small function rather than a flag on kdb_like_match's own signature,
+ * since that's public API already in use. */
+int kdb_ilike_match(const char *pattern, const char *text) {
+    if (!pattern || !text) return 0;
+    const char *p = pattern, *t = text;
+    const char *star_p = NULL, *star_t = NULL;
+
+    while (*t) {
+        if (*p == '_' || tolower((unsigned char)*p) == tolower((unsigned char)*t)) { p++; t++; }
+        else if (*p == '%') { star_p = p++; star_t = t; }
+        else if (star_p) { p = star_p + 1; t = ++star_t; }
+        else return 0;
+    }
+    while (*p == '%') p++;
+    return *p == '\0';
+}
+
+/* Whether c matches the atom at *pp (a literal, '.', a backslash-escaped
+ * literal, or a [...]/[^...] character class with 'a-z'-style ranges) --
+ * always advances *pp past the atom regardless of the match result, so
+ * callers that only want to skip an atom (during backtracking) can call
+ * this with any character and ignore the return value. */
+static int kdb__re_atom_matches(const char **pp, char c) {
+    const char *p = *pp;
+    if (*p == '.') { *pp = p + 1; return 1; }
+    if (*p == '[') {
+        p++;
+        int negate = 0;
+        if (*p == '^') { negate = 1; p++; }
+        int matched = 0;
+        int first = 1;
+        while (*p && (*p != ']' || first)) {
+            first = 0;
+            if (p[1] == '-' && p[2] && p[2] != ']') {
+                if ((unsigned char)c >= (unsigned char)p[0] && (unsigned char)c <= (unsigned char)p[2]) matched = 1;
+                p += 3;
+            } else if (*p == '\\' && p[1]) {
+                if (p[1] == c) matched = 1;
+                p += 2;
+            } else {
+                if (*p == c) matched = 1;
+                p++;
+            }
+        }
+        if (*p == ']') p++;
+        *pp = p;
+        return negate ? !matched : matched;
+    }
+    if (*p == '\\' && p[1]) {
+        int m = (p[1] == c);
+        *pp = p + 2;
+        return m;
+    }
+    int m = (*p == c);
+    *pp = p + 1;
+    return m;
+}
+
+static int kdb__re_match_here(const char *pat, const char *text);
+
+/* Greedy repetition (','*'/'+'): consumes as many repetitions of the atom
+ * at atom_start as possible, then backtracks one at a time until the
+ * rest of the pattern matches or the minimum repeat count is reached. */
+static int kdb__re_match_repeat(const char *atom_start, const char *pat_after_atom, const char *text, int min_count) {
+    const char *t = text;
+    int count = 0;
+    for (;;) {
+        const char *ap = atom_start;
+        if (!*t || !kdb__re_atom_matches(&ap, *t)) break;
+        t++;
+        count++;
+    }
+    while (count >= min_count) {
+        if (kdb__re_match_here(pat_after_atom, text + count)) return 1;
+        count--;
+    }
+    return 0;
+}
+
+static int kdb__re_match_here(const char *pat, const char *text) {
+    if (*pat == '\0') return 1;
+    if (*pat == '$' && pat[1] == '\0') return *text == '\0';
+
+    const char *atom_start = pat;
+    const char *after_atom = pat;
+    kdb__re_atom_matches(&after_atom, *text); /* advance-only; result unused here */
+
+    if (*after_atom == '*') return kdb__re_match_repeat(atom_start, after_atom + 1, text, 0);
+    if (*after_atom == '+') return kdb__re_match_repeat(atom_start, after_atom + 1, text, 1);
+    if (*after_atom == '?') {
+        if (*text) {
+            const char *ap = atom_start;
+            if (kdb__re_atom_matches(&ap, *text) && kdb__re_match_here(after_atom + 1, text + 1)) return 1;
+        }
+        return kdb__re_match_here(after_atom + 1, text);
+    }
+
+    if (*text == '\0') return 0;
+    const char *ap = atom_start;
+    if (!kdb__re_atom_matches(&ap, *text)) return 0;
+    return kdb__re_match_here(after_atom, text + 1);
+}
+
+/* A small, self-contained regex matcher -- not a POSIX <regex.h> wrapper,
+ * since that header isn't available when cross-compiling for Windows via
+ * mingw-w64 (this project stays portable there as a hard requirement).
+ * Supports literal characters, '.' (any character), '*'/'+'/'?'
+ * (quantifiers on the immediately preceding atom), '[...]'/'[^...]'
+ * character classes (with 'a-z'-style ranges), '\' to escape the next
+ * character literally, and optional '^'/'$' anchors (unanchored
+ * otherwise -- matches anywhere in text, same as SQL's REGEXP
+ * convention). Deliberately doesn't support alternation ('|'), groups or
+ * backreferences, or bounded repetition ('{n,m}') -- a real regex engine
+ * covering those would be a much bigger undertaking than this dialect's
+ * pattern-matching needs justify (LIKE's own wildcard matcher makes the
+ * same "cover the common case, not the whole spec" call). Backtracking,
+ * not NFA-based -- exponential worst case on a pathological pattern, but
+ * fine for the short patterns this engine's queries actually use. */
+int kdb_regex_match(const char *pattern, const char *text) {
+    if (!pattern || !text) return 0;
+    if (*pattern == '^') return kdb__re_match_here(pattern + 1, text);
+    const char *t = text;
+    do {
+        if (kdb__re_match_here(pattern, t)) return 1;
+    } while (*t++);
+    return 0;
+}
+
 int kdb_value_matches(const KdbValue *field,
                       KdbOperator     op,
                       const KdbValue *fv,
@@ -551,6 +680,16 @@ int kdb_value_matches(const KdbValue *field,
                 return 0;
             return kdb_like_match(fv->v.as_string.data, field->v.as_string.data);
 
+        case KDB_OP_ILIKE:
+            if (field->type != KDB_TYPE_STRING || !fv || fv->type != KDB_TYPE_STRING)
+                return 0;
+            return kdb_ilike_match(fv->v.as_string.data, field->v.as_string.data);
+
+        case KDB_OP_REGEXP:
+            if (field->type != KDB_TYPE_STRING || !fv || fv->type != KDB_TYPE_STRING)
+                return 0;
+            return kdb_regex_match(fv->v.as_string.data, field->v.as_string.data);
+
         default:
             return 0;
     }
@@ -587,6 +726,8 @@ const char *kdb_op_name(KdbOperator op) {
         case KDB_OP_IS_NULL:     return "isnull";
         case KDB_OP_IS_NOT_NULL: return "isnotnull";
         case KDB_OP_LIKE:        return "like";
+        case KDB_OP_ILIKE:       return "ilike";
+        case KDB_OP_REGEXP:      return "regexp";
         default:                 return "unknown";
     }
 }
@@ -635,9 +776,12 @@ KdbStatus kdb_parse_filter_key(const char  *key,
     if (strcmp(op_str, "isnull")      == 0) { *op_out = KDB_OP_IS_NULL;     return KDB_OK; }
     if (strcmp(op_str, "isnotnull")   == 0) { *op_out = KDB_OP_IS_NOT_NULL; return KDB_OK; }
     if (strcmp(op_str, "like")        == 0) { *op_out = KDB_OP_LIKE;        return KDB_OK; }
+    if (strcmp(op_str, "ilike")       == 0) { *op_out = KDB_OP_ILIKE;       return KDB_OK; }
+    if (strcmp(op_str, "regexp")      == 0) { *op_out = KDB_OP_REGEXP;      return KDB_OK; }
 
     kdb_err_bad_filter(key, "unknown operator suffix — valid: eq, neq, gt, gte, lt, lte, "
-                            "contains, startswith, endswith, in, between, isnull, isnotnull, like");
+                            "contains, startswith, endswith, in, between, isnull, isnotnull, like, "
+                            "ilike, regexp");
     return KDB_ERR_BAD_FILTER;
 }
 

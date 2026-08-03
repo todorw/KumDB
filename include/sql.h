@@ -284,7 +284,10 @@ extern "C" {
  * WHERE conditions: col = val, != / <>, >, >=, <, <=, BETWEEN a AND b,
  * IN (a, b, c), IS NULL, IS NOT NULL, LIKE 'pat' (standard SQL wildcards --
  * '%' any run of characters including none, '_' exactly one -- anywhere in
- * the pattern; no ESCAPE clause, no way to match a literal '%'/'_').
+ * the pattern; no ESCAPE clause, no way to match a literal '%'/'_'),
+ * ILIKE 'pat' (same wildcards, case-insensitive), REGEXP 'pat' (small
+ * hand-rolled matcher -- see kdb_regex_match in types.h for the supported
+ * subset; not POSIX <regex.h>, which mingw-w64 doesn't provide).
  *
  * String literals in SQL text are capped at a couple KB. There's no SQL
  * literal syntax for BLOB values -- set/read blob columns through the C

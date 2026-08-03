@@ -153,6 +153,20 @@ static void test_value_matches(void) {
     kdb_value_from_string("nomatch", KDB_TYPE_STRING, &fv);
     ASSERT(!kdb_value_matches(&field, KDB_OP_LIKE, &fv, NULL));
 
+    kdb_value_free(&fv);
+    kdb_value_from_string("HELLO WORLD", KDB_TYPE_STRING, &fv);
+    ASSERT(kdb_value_matches(&field, KDB_OP_ILIKE, &fv, NULL));
+    kdb_value_free(&fv);
+    kdb_value_from_string("hello world", KDB_TYPE_STRING, &fv);
+    ASSERT(kdb_value_matches(&field, KDB_OP_LIKE, &fv, NULL)); /* still exact-case matchable */
+
+    kdb_value_free(&fv);
+    kdb_value_from_string("^hello", KDB_TYPE_STRING, &fv);
+    ASSERT(kdb_value_matches(&field, KDB_OP_REGEXP, &fv, NULL));
+    kdb_value_free(&fv);
+    kdb_value_from_string("^world", KDB_TYPE_STRING, &fv);
+    ASSERT(!kdb_value_matches(&field, KDB_OP_REGEXP, &fv, NULL));
+
     kdb_value_free(&field);
     kdb_value_free(&fv);
 

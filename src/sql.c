@@ -567,6 +567,28 @@ static char *sql__parse_condition(SqlParser *p, KumDB *db, const char *corr_alia
         return buf;
     }
 
+    if (sql__kw_is(&p->cur, "ILIKE")) {
+        sql__advance(p);
+        if (p->cur.type != SQLTOK_STRING) { sql__err("expected a string pattern after ILIKE on '%s'", col_buf); return NULL; }
+        const char *pat = p->cur.text;
+        size_t need = strlen(col_buf) + strlen(pat) + 11;
+        char *buf = malloc(need);
+        if (buf) snprintf(buf, need, "%s__ilike=%s", col_buf, pat);
+        sql__advance(p);
+        return buf;
+    }
+
+    if (sql__kw_is(&p->cur, "REGEXP")) {
+        sql__advance(p);
+        if (p->cur.type != SQLTOK_STRING) { sql__err("expected a string pattern after REGEXP on '%s'", col_buf); return NULL; }
+        const char *pat = p->cur.text;
+        size_t need = strlen(col_buf) + strlen(pat) + 12;
+        char *buf = malloc(need);
+        if (buf) snprintf(buf, need, "%s__regexp=%s", col_buf, pat);
+        sql__advance(p);
+        return buf;
+    }
+
     const char *suffix = NULL;
     switch (p->cur.type) {
         case SQLTOK_EQ:  suffix = "";    break;
@@ -576,7 +598,7 @@ static char *sql__parse_condition(SqlParser *p, KumDB *db, const char *corr_alia
         case SQLTOK_LT:  suffix = "lt";  break;
         case SQLTOK_LTE: suffix = "lte"; break;
         default:
-            sql__err("expected a comparison operator, BETWEEN, LIKE, or IS [NOT] NULL after '%s'", col_buf);
+            sql__err("expected a comparison operator, BETWEEN, LIKE, ILIKE, REGEXP, or IS [NOT] NULL after '%s'", col_buf);
             return NULL;
     }
     sql__advance(p);
@@ -2453,7 +2475,8 @@ static int sql__cmp_matches_op(int cmp, SqlTokType op) {
 
 typedef enum {
     SQL_ROP_EQ, SQL_ROP_NEQ, SQL_ROP_GT, SQL_ROP_GTE, SQL_ROP_LT, SQL_ROP_LTE,
-    SQL_ROP_BETWEEN, SQL_ROP_IN, SQL_ROP_LIKE, SQL_ROP_ISNULL, SQL_ROP_ISNOTNULL
+    SQL_ROP_BETWEEN, SQL_ROP_IN, SQL_ROP_LIKE, SQL_ROP_ILIKE, SQL_ROP_REGEXP,
+    SQL_ROP_ISNULL, SQL_ROP_ISNOTNULL
 } SqlRowOp;
 
 typedef struct {
@@ -2500,6 +2523,8 @@ static int sql__parse_row_cond(const char *filter, SqlRowCond *out) {
         else if (strcmp(op_buf, "between")    == 0) out->op = SQL_ROP_BETWEEN;
         else if (strcmp(op_buf, "in")         == 0) out->op = SQL_ROP_IN;
         else if (strcmp(op_buf, "like")       == 0) out->op = SQL_ROP_LIKE;
+        else if (strcmp(op_buf, "ilike")      == 0) out->op = SQL_ROP_ILIKE;
+        else if (strcmp(op_buf, "regexp")     == 0) out->op = SQL_ROP_REGEXP;
         else if (strcmp(op_buf, "isnull")     == 0) out->op = SQL_ROP_ISNULL;
         else if (strcmp(op_buf, "isnotnull")  == 0) out->op = SQL_ROP_ISNOTNULL;
         else return 0;
@@ -2534,6 +2559,10 @@ static int sql__row_cond_matches(const KdbRow *row, const SqlRowCond *c) {
         case SQL_ROP_LTE: { int r = sql__field_cmp_text(f, c->value); return r != SQL_CMP_INCOMPARABLE && r <= 0; }
         case SQL_ROP_LIKE:
             return f->type == KDB_TYPE_STRING && f->v.as_string && kdb_like_match(c->value, f->v.as_string);
+        case SQL_ROP_ILIKE:
+            return f->type == KDB_TYPE_STRING && f->v.as_string && kdb_ilike_match(c->value, f->v.as_string);
+        case SQL_ROP_REGEXP:
+            return f->type == KDB_TYPE_STRING && f->v.as_string && kdb_regex_match(c->value, f->v.as_string);
         case SQL_ROP_BETWEEN: {
             const char *comma = strchr(c->value, ',');
             if (!comma) return 0;

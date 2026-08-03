@@ -575,6 +575,28 @@ static void test_where_operators(void) {
     ASSERT(rows && rows->count == 0u);
     if (rows) { kdb_rows_free(rows); rows = NULL; }
 
+    /* ILIKE: same wildcards as LIKE, case-insensitive */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE s ILIKE 'F%'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u); /* "five" */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE s LIKE 'F%'", &rows, NULL));
+    ASSERT(rows && rows->count == 0u); /* plain LIKE stays case-sensitive */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* REGEXP */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE s REGEXP '^(f|z)'", &rows, NULL));
+    ASSERT(rows && rows->count == 0u); /* alternation isn't supported -- treated as a literal '(f|z)' */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE s REGEXP '^f'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u); /* "five" */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE s REGEXP 'o.e'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u); /* "one" */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
     ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE n BETWEEN 1 AND 5", &rows, NULL));
     ASSERT(rows && rows->count == 2u);
     if (rows) { kdb_rows_free(rows); rows = NULL; }
@@ -591,6 +613,61 @@ static void test_where_operators(void) {
     ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE id = 1", &rows, NULL));
     ASSERT(rows && rows->count == 1u);
     if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    teardown(db);
+}
+
+static void test_regexp_and_ilike(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (name TEXT, email TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, email) VALUES ('Alice', 'alice@example.com')"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, email) VALUES ('bob', 'bob@test.org')"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name, email) VALUES ('Carol', 'not-an-email')"));
+
+    KdbRows *rows = NULL;
+
+    /* a reasonably real-world REGEXP: basic email shape */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name FROM t WHERE email REGEXP '^[a-z]+@[a-z]+\\.[a-z]+$' ORDER BY name ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const char *n0 = NULL, *n1 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &n0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "name", &n1));
+        ASSERT_STR(n0, "Alice");
+        ASSERT_STR(n1, "bob");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* ILIKE matches regardless of case; the parallel LIKE doesn't */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM t WHERE name ILIKE 'a%'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM t WHERE name LIKE 'a%'", &rows, NULL));
+    ASSERT(rows && rows->count == 0u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* REGEXP/ILIKE both work inside a parenthesized WHERE (the in-memory
+     * condition-tree evaluation path, not the flat filter-string
+     * pushdown path plain conditions normally take) */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name FROM t WHERE (name ILIKE 'a%' OR email REGEXP 'test') ORDER BY name ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const char *n0 = NULL, *n1 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &n0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "name", &n1));
+        ASSERT_STR(n0, "Alice");
+        ASSERT_STR(n1, "bob");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* only a string literal pattern is accepted, same rule LIKE follows */
+    ASSERT_ERR(sql(db, "SELECT * FROM t WHERE name REGEXP 5"));
+    ASSERT_ERR(sql(db, "SELECT * FROM t WHERE name ILIKE 5"));
 
     teardown(db);
 }
@@ -2597,6 +2674,7 @@ int main(void) {
     test_multi_column_order_by();
     test_update_delete();
     test_where_operators();
+    test_regexp_and_ilike();
     test_or();
     test_parenthesized_where();
     test_group_by_and_aggregates();

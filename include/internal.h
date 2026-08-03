@@ -138,7 +138,9 @@ typedef enum {
     KDB_OP_BETWEEN     = 10,  
     KDB_OP_IS_NULL     = 11,
     KDB_OP_IS_NOT_NULL = 12,
-    KDB_OP_LIKE        = 13
+    KDB_OP_LIKE        = 13,
+    KDB_OP_ILIKE       = 14,
+    KDB_OP_REGEXP      = 15
 } KdbOperator;
 
 

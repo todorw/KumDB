@@ -485,7 +485,8 @@ errors rather than silently colliding.
 `BETWEEN a AND b`, `IN (a, b, c)`, `IS [NOT] NULL`, `LIKE 'pat'`
 (standard SQL wildcards: `%` matches any run of characters including
 none, `_` matches exactly one, anywhere in the pattern — no `ESCAPE`
-clause, so there's no way to match a literal `%`/`_`), and
+clause, so there's no way to match a literal `%`/`_`), `ILIKE 'pat'`
+(same wildcards, case-insensitive), `REGEXP 'pat'`, and
 `AND`/`OR` at standard SQL precedence (`AND` binds tighter than `OR`:
 `a=1 AND b=2 OR c=3` means `(a=1 AND b=2) OR (c=3)`) — parenthesize to
 override that, nested as deep as you like (up to 16 levels):
@@ -505,6 +506,26 @@ rows, still exactly one column).
 ```sql
 SELECT name FROM employees WHERE salary = (SELECT MAX(salary) FROM employees)
 SELECT name FROM employees WHERE dept IN (SELECT dept FROM managers)
+```
+
+**`ILIKE`** is `LIKE` with the case sensitivity removed — same `%`/`_`
+wildcards, no `ESCAPE` clause, just an ASCII-case-insensitive comparison:
+`name ILIKE 'a%'` matches `"alice"` and `"Alice"` alike.
+
+**`REGEXP`** matches against a small, hand-rolled regex engine, not
+POSIX `<regex.h>` — that header isn't available when cross-compiling for
+Windows via mingw-w64, which this project targets alongside Linux. It
+supports literals, `.` (any character), `*`/`+`/`?` quantifiers,
+`[...]`/`[^...]` character classes (with `a-z`-style ranges), `\`
+escapes, and optional `^`/`$` anchors (unanchored otherwise — the pattern
+matches anywhere in the string, same as a substring search would). It
+does **not** support alternation (`|`), groups/capturing, backreferences,
+or bounded repetition (`{n,m}`) — those characters are treated as
+ordinary literals if you use them, not an error.
+
+```sql
+SELECT name FROM users WHERE name ILIKE 'a%'
+SELECT name FROM users WHERE email REGEXP '^[a-z]+@[a-z]+\.[a-z]+$'
 ```
 
 These can also be **correlated** — the inner query can reference the outer
