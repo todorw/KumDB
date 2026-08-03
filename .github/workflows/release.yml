@@ -1,0 +1,145 @@
+name: Release
+
+# Builds KumDB Studio for Windows/macOS/Linux. Pushing a tag like "v1.0.0"
+# also publishes the results to a GitHub Release; running it manually from
+# the Actions tab (workflow_dispatch) just builds and attaches the three
+# platform zips to that run (Actions tab -> this run -> Artifacts) without
+# creating a public release -- a way to sanity-check the pipeline first.
+#
+# Windows/macOS need windeployqt/macdeployqt to bundle the Qt runtime next
+# to the executable -- without that step the built app only runs on a
+# machine that already has the exact same Qt install, which defeats the
+# point of a downloadable release. Each platform's zip is built from that
+# deployed tree, so it's a genuine "unzip and run" download, not just a
+# bare exe that's missing its DLLs.
+#
+# Deliberately NOT using CPack's own NSIS/DragNDrop generators here: those
+# drive CMake's install() rules directly against the build tree, which
+# has no idea windeployqt/macdeployqt dropped extra runtime files next to
+# the binary -- the resulting installer would silently package an exe/app
+# missing its Qt DLLs/frameworks and just fail to launch, with nothing in
+# this pipeline catching that. A real NSIS/DMG installer is a reasonable
+# future improvement via Qt's qt_generate_deploy_app_script() CMake API
+# (Qt 6.3+), which is built for exactly this problem -- not added here
+# since it'd mean restructuring the existing, already-tested CMakeLists.txt
+# target definition in ways that can't be verified without a Windows/macOS
+# Qt install to test against.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # apt (not aqt) on purpose -- dpkg-shlibdeps needs Qt installed as a
+      # real system package for the .deb's dependency list to resolve to
+      # something an end user's apt can actually satisfy.
+      - name: Install Qt + build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qt6-base-dev cmake ninja-build build-essential
+
+      - name: Configure
+        run: cmake -S app -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Package (tar.gz + deb)
+        working-directory: build
+        run: cpack
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: kumdb-studio-linux
+          path: |
+            build/*.tar.gz
+            build/*.deb
+          if-no-files-found: warn
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.7.*'
+
+      - name: Configure
+        run: cmake -S app -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Stage install tree
+        run: cmake --install build --config Release --prefix stage
+
+      - name: Deploy Qt runtime
+        run: windeployqt --release stage\bin\kumdb_studio.exe
+
+      - name: Zip the deployed tree
+        run: Compress-Archive -Path stage\* -DestinationPath kumdb-studio-windows-x64.zip
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: kumdb-studio-windows
+          path: kumdb-studio-windows-x64.zip
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.7.*'
+
+      - name: Configure
+        run: cmake -S app -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Stage install tree
+        run: cmake --install build --config Release --prefix stage
+
+      - name: Deploy Qt runtime
+        run: macdeployqt stage/kumdb_studio.app
+
+      - name: Zip the deployed app
+        run: (cd stage && zip -r ../kumdb-studio-macos.zip kumdb_studio.app)
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: kumdb-studio-macos
+          path: kumdb-studio-macos.zip
+
+  release:
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          generate_release_notes: true
