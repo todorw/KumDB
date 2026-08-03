@@ -39,8 +39,8 @@ static void print_help(void) {
     printf("\nSQL:\n");
     printf("  sql <statement>                    Run one SQL statement against the open db\n");
     printf("                                      e.g. sql SELECT * FROM users WHERE age > 21\n");
-    printf("                                      Same engine as the commands above -- see README\n");
-    printf("                                      for what's supported (no JOIN/subqueries).\n");
+    printf("                                      Same engine as the commands above -- JOINs,\n");
+    printf("                                      subqueries, CTEs, and more -- see README/DOCUMENTATION.md.\n");
     printf("\nOther:\n");
     printf("  version                            Show CLI/engine version\n");
     printf("  help                               Show this help\n");

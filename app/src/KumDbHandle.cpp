@@ -119,6 +119,7 @@ QVector<KColumnMeta> KumDbHandle::schema(const QString &table) const {
         m.type = cols[i].type;
         m.nullable = cols[i].nullable != 0;
         m.indexed = cols[i].indexed != 0;
+        m.unique = cols[i].unique != 0;
         out.append(m);
     }
     return out;
@@ -139,7 +140,7 @@ bool KumDbHandle::createTable(const QString &name, const QVector<KColumnMeta> &c
         d.type = c.type;
         d.nullable = c.nullable ? 1 : 0;
         d.indexed  = c.indexed  ? 1 : 0;
-        d.unique   = 0; /* not exposed in the New Table dialog yet -- indexed/nullable only */
+        d.unique   = c.unique   ? 1 : 0;
         defs.append(d);
     }
 

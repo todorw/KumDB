@@ -3,19 +3,27 @@
 #include "QueryPanel.h"
 
 #include <QMenuBar>
+#include <QToolBar>
 #include <QStatusBar>
+#include <QStyle>
 #include <QSplitter>
 #include <QListWidget>
 #include <QTableView>
+#include <QTableWidget>
+#include <QHeaderView>
 #include <QTabWidget>
+#include <QStackedWidget>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QPushButton>
+#include <QToolButton>
+#include <QLineEdit>
 #include <QLabel>
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QInputDialog>
-#include <QHeaderView>
+#include <QFile>
+#include <QTextStream>
 
 extern "C" {
 #include "types.h" // for kdb_type_infer -- same inference the CLI/engine already use
@@ -33,14 +41,65 @@ static QVariant inferredVariant(const QString &raw) {
     }
 }
 
+static const char *typeName(KdbFieldType t) {
+    switch (t) {
+        case KDB_TYPE_INT:    return "INT";
+        case KDB_TYPE_FLOAT:  return "FLOAT";
+        case KDB_TYPE_BOOL:   return "BOOL";
+        case KDB_TYPE_STRING: return "TEXT";
+        case KDB_TYPE_BLOB:   return "BLOB";
+        case KDB_TYPE_ARRAY:  return "ARRAY";
+        case KDB_TYPE_OBJECT: return "OBJECT";
+        default:              return "?";
+    }
+}
+
+// Writes a model's visible rows/columns out as CSV (RFC 4180-ish: quotes
+// doubled, whole field quoted if it contains a comma/quote/newline) --
+// shared shape for both the datasheet and query-results exports.
+static bool writeModelToCsv(QAbstractItemModel *model, const QString &path, QString *errorOut) {
+    QFile f(path);
+    if (!f.open(QFile::WriteOnly | QFile::Truncate | QFile::Text)) {
+        if (errorOut) *errorOut = f.errorString();
+        return false;
+    }
+    QTextStream out(&f);
+    auto writeField = [&out](const QString &s) {
+        if (s.contains(',') || s.contains('"') || s.contains('\n')) {
+            QString escaped = s;
+            escaped.replace('"', "\"\"");
+            out << '"' << escaped << '"';
+        } else {
+            out << s;
+        }
+    };
+
+    int cols = model->columnCount();
+    for (int c = 0; c < cols; c++) {
+        if (c) out << ',';
+        writeField(model->headerData(c, Qt::Horizontal).toString());
+    }
+    out << '\n';
+    for (int r = 0; r < model->rowCount(); r++) {
+        for (int c = 0; c < cols; c++) {
+            if (c) out << ',';
+            writeField(model->index(r, c).data(Qt::DisplayRole).toString());
+        }
+        out << '\n';
+    }
+    return true;
+}
+
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     setWindowTitle("KumDB Studio");
-    resize(1000, 650);
+    resize(1100, 700);
 
     auto *menuFile = menuBar()->addMenu("&File");
     menuFile->addAction("&Open Database...", this, &MainWindow::openDatabase);
     menuFile->addAction("&New Database...", this, &MainWindow::newDatabase);
     menuFile->addAction("&Close Database", this, &MainWindow::closeDatabase);
+    menuFile->addSeparator();
+    menuFile->addAction("&Export Datasheet as CSV...", this, &MainWindow::exportDatasheetCsv);
     menuFile->addSeparator();
     menuFile->addAction("E&xit", this, &QWidget::close);
 
@@ -53,16 +112,78 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     auto *menuHelp = menuBar()->addMenu("&Help");
     menuHelp->addAction("&About KumDB Studio", this, &MainWindow::showAbout);
 
-    auto *splitter = new QSplitter(this);
+    QStyle *st = style();
+    auto *toolbar = addToolBar("Main");
+    toolbar->setMovable(false);
+    toolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    toolbar->addAction(st->standardIcon(QStyle::SP_DialogOpenButton), "Open", this, &MainWindow::openDatabase);
+    toolbar->addAction(st->standardIcon(QStyle::SP_FileDialogNewFolder), "New DB", this, &MainWindow::newDatabase);
+    toolbar->addAction(st->standardIcon(QStyle::SP_DialogCloseButton), "Close", this, &MainWindow::closeDatabase);
+    toolbar->addSeparator();
+    toolbar->addAction(st->standardIcon(QStyle::SP_FileIcon), "New Table", this, &MainWindow::newTable);
+    toolbar->addAction(st->standardIcon(QStyle::SP_TrashIcon), "Drop Table", this, &MainWindow::dropTable);
+    toolbar->addAction(st->standardIcon(QStyle::SP_BrowserReload), "Refresh", this, &MainWindow::refreshTables);
+
+    m_centralStack = new QStackedWidget(this);
+
+    // ---- Empty state: shown until a database is open ----
+    auto *welcomePage = new QWidget(m_centralStack);
+    auto *welcomeLayout = new QVBoxLayout(welcomePage);
+    welcomeLayout->addStretch();
+    auto *welcomeIcon = new QLabel(welcomePage);
+    welcomeIcon->setPixmap(st->standardIcon(QStyle::SP_DriveHDIcon).pixmap(64, 64));
+    welcomeIcon->setAlignment(Qt::AlignCenter);
+    welcomeLayout->addWidget(welcomeIcon);
+    auto *welcomeTitle = new QLabel("No database open", welcomePage);
+    welcomeTitle->setObjectName("emptyStateTitle");
+    welcomeTitle->setAlignment(Qt::AlignCenter);
+    welcomeLayout->addWidget(welcomeTitle);
+    auto *welcomeHint = new QLabel("Open an existing KumDB folder, or create a new one to get started.", welcomePage);
+    welcomeHint->setObjectName("emptyStateHint");
+    welcomeHint->setAlignment(Qt::AlignCenter);
+    welcomeLayout->addWidget(welcomeHint);
+    auto *welcomeButtons = new QHBoxLayout;
+    welcomeButtons->addStretch();
+    auto *openBtn = new QPushButton("Open Database...", welcomePage);
+    openBtn->setObjectName("primaryButton");
+    auto *newDbBtn = new QPushButton("New Database...", welcomePage);
+    welcomeButtons->addWidget(openBtn);
+    welcomeButtons->addWidget(newDbBtn);
+    welcomeButtons->addStretch();
+    welcomeLayout->addSpacing(12);
+    welcomeLayout->addLayout(welcomeButtons);
+    welcomeLayout->addStretch();
+    connect(openBtn, &QPushButton::clicked, this, &MainWindow::openDatabase);
+    connect(newDbBtn, &QPushButton::clicked, this, &MainWindow::newDatabase);
+    m_centralStack->addWidget(welcomePage);
+
+    // ---- Main workspace: shown once a database is open ----
+    auto *splitter = new QSplitter(m_centralStack);
 
     auto *leftPanel = new QWidget(splitter);
     auto *leftLayout = new QVBoxLayout(leftPanel);
-    leftLayout->addWidget(new QLabel("Tables", leftPanel));
+    auto *tablesHeaderRow = new QHBoxLayout;
+    auto *tablesHeader = new QLabel("TABLES", leftPanel);
+    tablesHeader->setObjectName("sectionHeader");
+    tablesHeaderRow->addWidget(tablesHeader);
+    tablesHeaderRow->addStretch();
+    m_tableCountLabel = new QLabel("0", leftPanel);
+    m_tableCountLabel->setObjectName("sectionHeader");
+    tablesHeaderRow->addWidget(m_tableCountLabel);
+    leftLayout->addLayout(tablesHeaderRow);
+
+    auto *filterEdit = new QLineEdit(leftPanel);
+    filterEdit->setPlaceholderText("Filter tables...");
+    filterEdit->setClearButtonEnabled(true);
+    leftLayout->addWidget(filterEdit);
+    connect(filterEdit, &QLineEdit::textChanged, this, &MainWindow::filterTableList);
+
     m_tableList = new QListWidget(leftPanel);
     leftLayout->addWidget(m_tableList);
     auto *leftButtons = new QHBoxLayout;
-    auto *newTableBtn = new QPushButton("New", leftPanel);
+    auto *newTableBtn = new QPushButton("+ New", leftPanel);
     auto *dropTableBtn = new QPushButton("Drop", leftPanel);
+    dropTableBtn->setObjectName("dangerButton");
     leftButtons->addWidget(newTableBtn);
     leftButtons->addWidget(dropTableBtn);
     leftLayout->addLayout(leftButtons);
@@ -72,31 +193,59 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 
     auto *tabs = new QTabWidget(splitter);
 
+    // Datasheet tab
     auto *datasheetPage = new QWidget(tabs);
     auto *datasheetLayout = new QVBoxLayout(datasheetPage);
     auto *datasheetButtons = new QHBoxLayout;
     auto *addRowBtn = new QPushButton("+ Add row", datasheetPage);
     auto *deleteRowBtn = new QPushButton("- Delete row", datasheetPage);
+    deleteRowBtn->setObjectName("dangerButton");
     auto *refreshBtn = new QPushButton("Refresh", datasheetPage);
+    auto *exportBtn = new QPushButton("Export CSV...", datasheetPage);
+    auto *compactBtn = new QPushButton("Compact", datasheetPage);
     datasheetButtons->addWidget(addRowBtn);
     datasheetButtons->addWidget(deleteRowBtn);
     datasheetButtons->addWidget(refreshBtn);
     datasheetButtons->addStretch();
+    datasheetButtons->addWidget(exportBtn);
+    datasheetButtons->addWidget(compactBtn);
     datasheetLayout->addLayout(datasheetButtons);
 
     m_datasheetModel = new RowTableModel(&m_db, this);
     m_datasheet = new QTableView(datasheetPage);
     m_datasheet->setModel(m_datasheetModel);
     m_datasheet->horizontalHeader()->setStretchLastSection(true);
+    m_datasheet->setAlternatingRowColors(true);
+    m_datasheet->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_datasheet->setSortingEnabled(false); // RowTableModel isn't a proxy-sortable model -- avoid a misleading sort arrow
     datasheetLayout->addWidget(m_datasheet);
     tabs->addTab(datasheetPage, "Datasheet");
 
     connect(addRowBtn, &QPushButton::clicked, this, &MainWindow::addRowViaDatasheet);
     connect(deleteRowBtn, &QPushButton::clicked, this, &MainWindow::deleteSelectedRow);
     connect(refreshBtn, &QPushButton::clicked, this, &MainWindow::reloadDatasheet);
+    connect(exportBtn, &QPushButton::clicked, this, &MainWindow::exportDatasheetCsv);
+    connect(compactBtn, &QPushButton::clicked, this, &MainWindow::compactTable);
     connect(m_datasheetModel, &RowTableModel::editFailed, this, [this](const QString &err) {
         QMessageBox::warning(this, "Edit failed", err);
     });
+
+    // Schema tab -- read-only view of a table's full column metadata,
+    // including constraints the datasheet grid has no room to show.
+    auto *schemaPage = new QWidget(tabs);
+    auto *schemaLayout = new QVBoxLayout(schemaPage);
+    m_schemaView = new QTableWidget(0, 5, schemaPage);
+    m_schemaView->setHorizontalHeaderLabels({"Column", "Type", "Nullable", "Indexed", "Unique"});
+    m_schemaView->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    m_schemaView->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    m_schemaView->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    m_schemaView->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    m_schemaView->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+    m_schemaView->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_schemaView->setAlternatingRowColors(true);
+    m_schemaView->verticalHeader()->setVisible(false);
+    schemaLayout->addWidget(m_schemaView);
+    tabs->addTab(schemaPage, "Schema");
 
     m_queryPanel = new QueryPanel(&m_db, tabs);
     tabs->addTab(m_queryPanel, "Query");
@@ -108,19 +257,38 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     splitter->addWidget(tabs);
     splitter->setStretchFactor(0, 0);
     splitter->setStretchFactor(1, 1);
-    splitter->setSizes({220, 780});
-    setCentralWidget(splitter);
+    splitter->setSizes({240, 860});
+    m_centralStack->addWidget(splitter);
+
+    setCentralWidget(m_centralStack);
 
     m_statusLabel = new QLabel("No database open.", this);
-    statusBar()->addWidget(m_statusLabel);
+    statusBar()->addWidget(m_statusLabel, 1);
+    m_connIndicator = new QLabel(this);
+    statusBar()->addPermanentWidget(m_connIndicator);
+    auto *versionLabel = new QLabel(QString("KumDB v%1").arg(QString::fromUtf8(kdb_version())), this);
+    versionLabel->setStyleSheet("color: #6b6e73;");
+    statusBar()->addPermanentWidget(versionLabel);
 
+    setConnectionIndicator(false);
     setDbLoadedState(false);
 }
 
+void MainWindow::setConnectionIndicator(bool connected, const QString &dir) {
+    if (connected) {
+        m_connIndicator->setObjectName("connIndicatorOn");
+        m_connIndicator->setText("● " + dir);
+    } else {
+        m_connIndicator->setObjectName("connIndicatorOff");
+        m_connIndicator->setText("○ Disconnected");
+    }
+    // objectName-based QSS rules only re-apply after a style polish
+    m_connIndicator->style()->unpolish(m_connIndicator);
+    m_connIndicator->style()->polish(m_connIndicator);
+}
+
 void MainWindow::setDbLoadedState(bool loaded) {
-    m_tableList->setEnabled(loaded);
-    m_datasheet->setEnabled(loaded);
-    m_queryPanel->setEnabled(loaded);
+    m_centralStack->setCurrentIndex(loaded ? 1 : 0);
 }
 
 void MainWindow::openDir(const QString &dir) {
@@ -130,6 +298,7 @@ void MainWindow::openDir(const QString &dir) {
         return;
     }
     setDbLoadedState(true);
+    setConnectionIndicator(true, dir);
     m_statusLabel->setText("Open: " + dir);
     refreshTables();
 }
@@ -150,7 +319,9 @@ void MainWindow::closeDatabase() {
     m_db.close();
     m_tableList->clear();
     m_datasheetModel->clear();
+    m_schemaView->setRowCount(0);
     setDbLoadedState(false);
+    setConnectionIndicator(false);
     m_statusLabel->setText("No database open.");
 }
 
@@ -158,12 +329,21 @@ void MainWindow::refreshTables() {
     if (!m_db.isOpen()) return;
     QString current = currentTableName();
     m_tableList->clear();
-    m_tableList->addItems(m_db.listTables());
+    QStringList tables = m_db.listTables();
+    m_tableList->addItems(tables);
+    m_tableCountLabel->setText(QString::number(tables.size()));
     if (!current.isEmpty()) {
         auto items = m_tableList->findItems(current, Qt::MatchExactly);
         if (!items.isEmpty()) m_tableList->setCurrentItem(items.first());
     }
     m_queryPanel->refreshTableList();
+}
+
+void MainWindow::filterTableList(const QString &text) {
+    for (int i = 0; i < m_tableList->count(); i++) {
+        QListWidgetItem *item = m_tableList->item(i);
+        item->setHidden(!text.isEmpty() && !item->text().contains(text, Qt::CaseInsensitive));
+    }
 }
 
 QString MainWindow::currentTableName() const {
@@ -173,6 +353,24 @@ QString MainWindow::currentTableName() const {
 
 void MainWindow::onTableSelected(QListWidgetItem *) {
     reloadDatasheet();
+    reloadSchemaView();
+}
+
+void MainWindow::reloadSchemaView() {
+    QString table = currentTableName();
+    m_schemaView->setRowCount(0);
+    if (table.isEmpty() || !m_db.isOpen()) return;
+
+    QVector<KColumnMeta> schema = m_db.schema(table);
+    m_schemaView->setRowCount(schema.size());
+    for (int i = 0; i < schema.size(); i++) {
+        const auto &c = schema[i];
+        m_schemaView->setItem(i, 0, new QTableWidgetItem(c.name));
+        m_schemaView->setItem(i, 1, new QTableWidgetItem(typeName(c.type)));
+        m_schemaView->setItem(i, 2, new QTableWidgetItem(c.nullable ? "yes" : "no"));
+        m_schemaView->setItem(i, 3, new QTableWidgetItem(c.indexed ? "yes" : "no"));
+        m_schemaView->setItem(i, 4, new QTableWidgetItem(c.unique ? "yes" : "no"));
+    }
 }
 
 void MainWindow::reloadDatasheet() {
@@ -263,6 +461,23 @@ void MainWindow::deleteSelectedRow() {
     reloadDatasheet();
 }
 
+void MainWindow::exportDatasheetCsv() {
+    if (m_datasheetModel->rowCount() == 0) {
+        QMessageBox::information(this, "Export CSV", "Nothing to export -- select a table with rows first.");
+        return;
+    }
+    QString path = QFileDialog::getSaveFileName(this, "Export Datasheet as CSV",
+                                                 currentTableName() + ".csv", "CSV files (*.csv)");
+    if (path.isEmpty()) return;
+
+    QString err;
+    if (!writeModelToCsv(m_datasheetModel, path, &err)) {
+        QMessageBox::warning(this, "Export CSV", err);
+        return;
+    }
+    m_statusLabel->setText("Exported to " + path);
+}
+
 void MainWindow::newTable() {
     if (!m_db.isOpen()) { QMessageBox::information(this, "New Table", "Open a database first."); return; }
 
@@ -291,6 +506,7 @@ void MainWindow::dropTable() {
         return;
     }
     m_datasheetModel->clear();
+    m_schemaView->setRowCount(0);
     refreshTables();
 }
 
@@ -311,7 +527,8 @@ void MainWindow::showAbout() {
     QMessageBox::about(this, "About KumDB Studio",
         QString("<b>KumDB Studio</b><br>"
                 "A desktop front end for KumDB (engine v%1) -- browse and edit tables, "
-                "run NoSQL filters or SQL, all against the same embedded database file.<br><br>"
-                "No JOINs, no subqueries -- same limits as the engine itself.")
+                "run NoSQL filters or full SQL against the same embedded database file.<br><br>"
+                "SQL supports JOINs, subqueries, CTEs, window functions, transactions, and more -- "
+                "use the Query tab's SQL mode for anything the datasheet grid doesn't cover.")
             .arg(QString::fromUtf8(kdb_version())));
 }

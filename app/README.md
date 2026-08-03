@@ -15,13 +15,20 @@ cover custom forms or printed reports.
 
 - **Datasheet view**: pick a table on the left, see/edit its rows in a grid.
   Editing a cell writes through immediately (same as Access's datasheet view
-  — there's no separate save step). Add/delete rows from the toolbar.
+  — there's no separate save step). Add/delete rows from the toolbar, or
+  export the whole grid to CSV.
+- **Schema view**: a read-only breakdown of a table's columns — type,
+  nullable, indexed, unique — for whatever the datasheet grid doesn't have
+  room to show inline.
 - **Query console**: toggle between NoSQL (pick a table, type filter lines
-  like `age__gt=21`) and SQL (type a whole statement). Same engine either
-  way — see [DOCUMENTATION.md](../DOCUMENTATION.md) for what each syntax
-  supports.
+  like `age__gt=21`) and SQL (type a whole statement, including JOINs,
+  subqueries, CTEs, window functions, and transactions). Same engine either
+  way — see [DOCUMENTATION.md](../DOCUMENTATION.md) for the full syntax.
+  Recent queries (either mode) are kept in a history dropdown; results can
+  be exported to CSV too.
 - **New Table dialog**: define a table's columns (name, type, NOT NULL,
-  indexed) before inserting anything, same as `CREATE TABLE` in SQL.
+  indexed, unique) before inserting anything, same as `CREATE TABLE` in SQL.
+- Dark theme, applied app-wide via a Qt stylesheet (`resources/style.qss`).
 
 ## Building
 

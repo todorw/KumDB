@@ -16,11 +16,11 @@ static const char *kTypeNames[] = {"TEXT", "INT", "FLOAT", "BOOL", "BLOB"};
 static const KdbFieldType kTypeValues[] = {KDB_TYPE_STRING, KDB_TYPE_INT, KDB_TYPE_FLOAT, KDB_TYPE_BOOL, KDB_TYPE_BLOB};
 static const int kTypeCount = 5;
 
-enum { ColName = 0, ColType = 1, ColNotNull = 2, ColIndexed = 3, ColCount = 4 };
+enum { ColName = 0, ColType = 1, ColNotNull = 2, ColIndexed = 3, ColUnique = 4, ColCount = 5 };
 
 NewTableDialog::NewTableDialog(QWidget *parent) : QDialog(parent) {
     setWindowTitle("New Table");
-    resize(520, 360);
+    resize(600, 380);
 
     auto *layout = new QVBoxLayout(this);
 
@@ -31,11 +31,13 @@ NewTableDialog::NewTableDialog(QWidget *parent) : QDialog(parent) {
     layout->addLayout(form);
 
     m_colTable = new QTableWidget(0, ColCount, this);
-    m_colTable->setHorizontalHeaderLabels({"Column", "Type", "NOT NULL", "Indexed"});
+    m_colTable->setHorizontalHeaderLabels({"Column", "Type", "NOT NULL", "Indexed", "Unique"});
     m_colTable->horizontalHeader()->setSectionResizeMode(ColName, QHeaderView::Stretch);
     m_colTable->horizontalHeader()->setSectionResizeMode(ColType, QHeaderView::ResizeToContents);
     m_colTable->horizontalHeader()->setSectionResizeMode(ColNotNull, QHeaderView::ResizeToContents);
     m_colTable->horizontalHeader()->setSectionResizeMode(ColIndexed, QHeaderView::ResizeToContents);
+    m_colTable->horizontalHeader()->setSectionResizeMode(ColUnique, QHeaderView::ResizeToContents);
+    m_colTable->setAlternatingRowColors(true);
     layout->addWidget(m_colTable);
 
     auto *rowButtons = new QHBoxLayout;
@@ -91,6 +93,15 @@ void NewTableDialog::addColumnRow() {
     indexedLayout->setAlignment(Qt::AlignCenter);
     indexedLayout->setContentsMargins(0, 0, 0, 0);
     m_colTable->setCellWidget(row, ColIndexed, indexedWrap);
+
+    auto *uniqueBox = new QCheckBox(m_colTable);
+    uniqueBox->setToolTip("A UNIQUE column is always indexed too, even without checking Indexed separately.");
+    auto *uniqueWrap = new QWidget(m_colTable);
+    auto *uniqueLayout = new QHBoxLayout(uniqueWrap);
+    uniqueLayout->addWidget(uniqueBox);
+    uniqueLayout->setAlignment(Qt::AlignCenter);
+    uniqueLayout->setContentsMargins(0, 0, 0, 0);
+    m_colTable->setCellWidget(row, ColUnique, uniqueWrap);
 }
 
 void NewTableDialog::removeSelectedColumnRow() {
@@ -112,14 +123,17 @@ QVector<KColumnMeta> NewTableDialog::columns() const {
         auto *typeBox = qobject_cast<QComboBox *>(m_colTable->cellWidget(row, ColType));
         auto *notNullWrap = m_colTable->cellWidget(row, ColNotNull);
         auto *indexedWrap = m_colTable->cellWidget(row, ColIndexed);
+        auto *uniqueWrap = m_colTable->cellWidget(row, ColUnique);
         auto *notNullBox = notNullWrap ? notNullWrap->findChild<QCheckBox *>() : nullptr;
         auto *indexedBox = indexedWrap ? indexedWrap->findChild<QCheckBox *>() : nullptr;
+        auto *uniqueBox = uniqueWrap ? uniqueWrap->findChild<QCheckBox *>() : nullptr;
 
         KColumnMeta c;
         c.name = name;
         c.type = typeBox ? kTypeValues[typeBox->currentIndex()] : KDB_TYPE_STRING;
         c.nullable = notNullBox ? !notNullBox->isChecked() : true;
         c.indexed = indexedBox ? indexedBox->isChecked() : false;
+        c.unique = uniqueBox ? uniqueBox->isChecked() : false;
         out.append(c);
     }
     return out;

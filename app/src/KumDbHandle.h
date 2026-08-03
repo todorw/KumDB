@@ -16,6 +16,7 @@ struct KColumnMeta {
     KdbFieldType type = KDB_TYPE_STRING;
     bool         nullable = true;
     bool         indexed = false;
+    bool         unique = false;
 };
 
 struct KRow {

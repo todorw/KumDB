@@ -11,6 +11,7 @@ class QLineEdit;
 class QLabel;
 class QTableView;
 class QStackedWidget;
+class QPushButton;
 
 // Run a query either the NoSQL way (pick a table, type filter lines like
 // "age__gt=21") or the SQL way (type a whole statement) -- same engine
@@ -28,14 +29,20 @@ signals:
 private slots:
     void runQuery();
     void onModeChanged(int index);
+    void exportResultsCsv();
+    void onHistoryPicked(int index);
 
 private:
+    void rememberHistory(int mode, const QString &table, const QString &text);
+
     KumDbHandle    *m_db;
     QComboBox      *m_modeBox;
     QStackedWidget *m_inputStack;
     QComboBox      *m_tableBox;
     QPlainTextEdit *m_filterEdit;
     QPlainTextEdit *m_sqlEdit;
+    QComboBox      *m_historyBox; // items carry {mode,table,text} in Qt::UserRole
+    QPushButton    *m_exportBtn;
     QTableView     *m_resultsView;
     RowTableModel  *m_resultsModel;
     QLabel         *m_infoLabel;

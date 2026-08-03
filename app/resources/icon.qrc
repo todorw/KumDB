@@ -7,4 +7,7 @@
         <file alias="icon_128.png">../../assets/icon/icon_128.png</file>
         <file alias="icon_256.png">../../assets/icon/icon_256.png</file>
     </qresource>
+    <qresource prefix="/theme">
+        <file alias="style.qss">style.qss</file>
+    </qresource>
 </RCC>
