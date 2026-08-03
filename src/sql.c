@@ -61,6 +61,13 @@ static KdbStatus sql__build_returning_rows_from_filter(KumDB *db, const char *ta
 static char *sql__build_id_in_filter_from_rows(const KdbRows *rows);
 static void sql__free_row_fields(KdbRow *row);
 
+/* Forward declarations: WITH RECURSIVE's iterative fixpoint loop (defined
+ * well before the set-operator row-combining helpers further down, which
+ * are the natural place for these to live since UNION/INTERSECT/EXCEPT
+ * are their main callers). */
+static int sql__append_rows(KdbRows *dst, KdbRows *src);
+static void sql__except_rows(KdbRows *dst, const KdbRows *src, int keep_all);
+
 static KdbStatus sql__err(const char *fmt, ...) {
     char buf[512];
     va_list args;
@@ -1102,6 +1109,219 @@ static KdbStatus sql__exec_drop_view(SqlParser *p, KumDB *db) {
 }
 
 #define KDB_SQL_MAX_CTES 8
+#define KDB_SQL_MAX_RECURSIVE_ITERS 10000
+
+/* Same column names, same order (values not compared) -- used to catch a
+ * WITH RECURSIVE recursive term whose projected columns don't line up
+ * with the base case's (e.g. a missing "AS alias" giving a function-call
+ * item its auto-generated default name instead) before it silently
+ * materializes rows with the wrong field names into the CTE's table. */
+static int sql__row_shape_matches(const KdbRow *a, const KdbRow *b) {
+    if (a->field_count != b->field_count) return 0;
+    for (uint32_t i = 0; i < a->field_count; i++) {
+        const char *an = a->fields[i].name, *bn = b->fields[i].name;
+        if (strcmp(an ? an : "", bn ? bn : "") != 0) return 0;
+    }
+    return 1;
+}
+
+/* Inserts every row of rows into table_name via kdb_add (which infers the
+ * table's schema from the first row if it doesn't exist yet, same as
+ * always) -- keeps each row's own field names, unlike INSERT ... SELECT's
+ * column-list remapping above, since a materialized CTE keeps whatever
+ * column names its SELECT produced. Returns the first kdb_add failure, or
+ * KDB_OK; whatever's already inserted when one fails stays (same no-
+ * implicit-rollback convention as everywhere else in this file). */
+static KdbStatus sql__materialize_rows(KumDB *db, const char *table_name, const KdbRows *rows) {
+    for (size_t r = 0; r < rows->count; r++) {
+        const KdbRow *row = &rows->rows[r];
+        KdbField fields[KDB_SQL_MAX_COLUMNS + 1];
+        uint32_t n = row->field_count < KDB_SQL_MAX_COLUMNS ? row->field_count : KDB_SQL_MAX_COLUMNS;
+        for (uint32_t i = 0; i < n; i++) {
+            fields[i].name = row->fields[i].name;
+            fields[i].type = row->fields[i].type;
+            fields[i].v    = row->fields[i].v;
+        }
+        fields[n] = kdb_field_end();
+        KdbStatus st = kdb_add(db, table_name, fields);
+        if (st != KDB_OK) return st;
+    }
+    return KDB_OK;
+}
+
+/* WITH RECURSIVE name AS (base_select UNION [ALL] recursive_select)
+ * SELECT ... -- scoped to exactly one CTE (no mixing with other, non-
+ * recursive CTEs in the same WITH -- issue those as a separate statement,
+ * or nest this one inside a derived table if you need both) with exactly
+ * the standard base-UNION-recursive shape (no more than two arms).
+ *
+ * Real recursive evaluation needs the recursive term's reference to the
+ * CTE's own name to resolve to just the *previous round's new rows*
+ * ("semi-naive" evaluation -- re-deriving from the whole accumulated
+ * result every round would be both slower and, for the usual "each new
+ * row comes from exactly the rows just added" recursive term, produce
+ * duplicates real engines don't), not the full running total. Since this
+ * engine resolves a name by literally looking it up, that means the same
+ * name has to mean two different things at two different times: a REAL
+ * table named exactly cte_name is created, and its *contents* mean
+ * "current working set" for the whole loop below (so the recursive
+ * term's own "FROM cte_name" sees just that), then get replaced with the
+ * FULL accumulated result right before the trailing SELECT runs (so
+ * *that* query's "FROM cte_name" sees everything) -- same table, two
+ * meanings, one after the other, cleaned up (dropped) before returning
+ * either way.
+ *
+ * Base case must return at least one row -- there's no table-level schema
+ * to fall back on for materializing zero rows (a SELECT result's columns
+ * only exist as row data here, not a separate resultset schema; unlike a
+ * real table's structural header). Bounded to
+ * KDB_SQL_MAX_RECURSIVE_ITERS rounds so a recursive term that never
+ * shrinks to zero new rows (forgot a base case that narrows, or WHERE
+ * that stops it) errors instead of hanging. p is positioned right after
+ * "RECURSIVE" (already consumed by the caller). */
+static KdbStatus sql__exec_with_recursive_stmt(SqlParser *p, KumDB *db, KdbRows **rows_out) {
+    const char *cname;
+    if (!sql__ident_text(&p->cur, &cname)) return sql__err("expected a CTE name after WITH RECURSIVE");
+    char cte_name[KDB_SQL_IDENT_BUF];
+    snprintf(cte_name, sizeof(cte_name), "%.255s", cname);
+    sql__advance(p);
+
+    if (kdb_table_exists(db, cte_name)) return sql__err("'%s' is already a table -- can't use it as a CTE name", cte_name);
+    if (sql__view_exists(db, cte_name)) return sql__err("'%s' is already a view -- can't use it as a CTE name", cte_name);
+
+    if (!sql__kw_is(&p->cur, "AS")) return sql__err("expected AS after CTE name '%s'", cte_name);
+    sql__advance(p);
+    if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after WITH RECURSIVE %s AS", cte_name);
+    sql__advance(p);
+    if (!sql__kw_is(&p->cur, "SELECT")) return sql__err("expected a SELECT statement (the base case) inside WITH RECURSIVE %s AS (...)", cte_name);
+
+    size_t base_start = p->lx.pos - strlen(p->cur.text);
+    int depth = 0;
+    size_t base_end = 0;
+    int union_all = 0;
+    for (;;) {
+        if (p->cur.type == SQLTOK_EOF) return sql__err("unexpected end of input inside WITH RECURSIVE %s's body", cte_name);
+        if (p->cur.type == SQLTOK_LPAREN) { depth++; sql__advance(p); continue; }
+        if (p->cur.type == SQLTOK_RPAREN) {
+            if (depth == 0)
+                return sql__err("WITH RECURSIVE %s needs UNION [ALL] joining a base case to a recursive term "
+                                 "that references %s", cte_name, cte_name);
+            depth--; sql__advance(p); continue;
+        }
+        if (depth == 0 && sql__kw_is(&p->cur, "UNION")) {
+            base_end = p->lx.pos - strlen(p->cur.text);
+            while (base_end > base_start && isspace((unsigned char)p->lx.src[base_end - 1])) base_end--;
+            sql__advance(p); /* UNION */
+            if (sql__kw_is(&p->cur, "ALL")) { union_all = 1; sql__advance(p); }
+            break;
+        }
+        sql__advance(p);
+    }
+
+    if (!sql__kw_is(&p->cur, "SELECT"))
+        return sql__err("expected a SELECT statement (the recursive term) after UNION [ALL] in WITH RECURSIVE %s", cte_name);
+    size_t rec_start = p->lx.pos - strlen(p->cur.text);
+    depth = 0;
+    for (;;) {
+        if (p->cur.type == SQLTOK_EOF) return sql__err("unexpected end of input inside WITH RECURSIVE %s's body", cte_name);
+        if (p->cur.type == SQLTOK_LPAREN) { depth++; sql__advance(p); continue; }
+        if (p->cur.type == SQLTOK_RPAREN) {
+            if (depth == 0) break; /* the CTE body's own closing paren -- don't consume yet */
+            depth--; sql__advance(p); continue;
+        }
+        sql__advance(p);
+    }
+    size_t rec_end = p->lx.pos - 1; /* p->cur is the ')' itself (empty token text) */
+    while (rec_end > rec_start && isspace((unsigned char)p->lx.src[rec_end - 1])) rec_end--;
+    sql__advance(p); /* consume ')' */
+
+    if (base_end <= base_start) return sql__err("WITH RECURSIVE %s's base case is empty", cte_name);
+    if (rec_end <= rec_start) return sql__err("WITH RECURSIVE %s's recursive term is empty", cte_name);
+
+    char base_text[KDB_MAX_STRING_LEN], rec_text[KDB_MAX_STRING_LEN];
+    size_t blen = base_end - base_start; if (blen >= sizeof(base_text)) blen = sizeof(base_text) - 1;
+    memcpy(base_text, p->lx.src + base_start, blen); base_text[blen] = '\0';
+    size_t rlen = rec_end - rec_start; if (rlen >= sizeof(rec_text)) rlen = sizeof(rec_text) - 1;
+    memcpy(rec_text, p->lx.src + rec_start, rlen); rec_text[rlen] = '\0';
+
+    KdbStatus st;
+    KdbRows *accumulated = NULL;
+    int table_created = 0;
+
+    {
+        SqlParser bp; sql__init(&bp, base_text);
+        KdbRows *base_rows = NULL;
+        st = sql__exec_select_stmt(&bp, db, &base_rows);
+        if (st != KDB_OK) return st;
+        if (base_rows->count == 0) {
+            kdb_rows_free(base_rows);
+            return sql__err("WITH RECURSIVE %s's base case returned no rows -- "
+                             "can't infer the CTE's columns from zero rows", cte_name);
+        }
+
+        st = sql__materialize_rows(db, cte_name, base_rows);
+        if (st != KDB_OK) { kdb_rows_free(base_rows); return st; }
+        table_created = 1;
+
+        accumulated = (KdbRows *)calloc(1, sizeof(KdbRows));
+        if (!accumulated) { kdb_rows_free(base_rows); kdb_drop_table(db, cte_name); kdb_err_oom("recursive CTE accumulator"); return KDB_ERR_OOM; }
+        if (!sql__append_rows(accumulated, base_rows)) {
+            kdb_rows_free(base_rows); kdb_rows_free(accumulated); kdb_drop_table(db, cte_name);
+            kdb_err_oom("recursive CTE accumulator"); return KDB_ERR_OOM;
+        }
+        free(base_rows);
+    }
+
+    int converged = 0;
+    for (int iter = 0; iter < KDB_SQL_MAX_RECURSIVE_ITERS; iter++) {
+        SqlParser rp; sql__init(&rp, rec_text);
+        KdbRows *new_rows = NULL;
+        st = sql__exec_select_stmt(&rp, db, &new_rows);
+        if (st != KDB_OK) goto cleanup;
+
+        if (new_rows->count > 0 && !sql__row_shape_matches(&new_rows->rows[0], &accumulated->rows[0])) {
+            kdb_rows_free(new_rows);
+            st = sql__err("WITH RECURSIVE %s's recursive term must return the same columns "
+                           "(same names, same order) as the base case", cte_name);
+            goto cleanup;
+        }
+
+        if (!union_all) sql__except_rows(new_rows, accumulated, 0); /* drop rows already seen, and dupes within this round */
+
+        if (new_rows->count == 0) { kdb_rows_free(new_rows); converged = 1; break; }
+
+        kdb_drop_table(db, cte_name);
+        st = sql__materialize_rows(db, cte_name, new_rows);
+        if (st != KDB_OK) { kdb_rows_free(new_rows); goto cleanup; }
+
+        if (!sql__append_rows(accumulated, new_rows)) {
+            free(new_rows); kdb_err_oom("recursive CTE accumulator"); st = KDB_ERR_OOM; goto cleanup;
+        }
+        free(new_rows);
+    }
+    if (!converged) {
+        st = sql__err("WITH RECURSIVE %s didn't converge within %d iterations -- check the recursive term "
+                       "actually stops producing new rows eventually", cte_name, KDB_SQL_MAX_RECURSIVE_ITERS);
+        goto cleanup;
+    }
+
+    kdb_drop_table(db, cte_name);
+    table_created = 0;
+    st = sql__materialize_rows(db, cte_name, accumulated);
+    if (st != KDB_OK) goto cleanup;
+    table_created = 1;
+
+    if (!sql__kw_is(&p->cur, "SELECT")) {
+        st = sql__err("expected SELECT after WITH RECURSIVE %s AS (...)", cte_name);
+        goto cleanup;
+    }
+    st = sql__exec_select_stmt(p, db, rows_out);
+
+cleanup:
+    if (table_created) kdb_drop_table(db, cte_name);
+    kdb_rows_free(accumulated);
+    return st;
+}
 
 /* WITH name AS (SELECT ...) [, name2 AS (SELECT ...)]* SELECT ... --
  * implemented as temporary views: each CTE gets inserted into the exact
@@ -2061,6 +2281,19 @@ typedef struct {
     double        else_float;
     int           else_bool;
     char          else_string[KDB_SQL_CASE_VAL_BUF];
+
+    /* A bare literal SELECT item (a number, string, TRUE/FALSE, or NULL --
+     * same shape sql__case_value_from_token already produces for CASE's
+     * THEN/ELSE): "SELECT 1 AS n FROM t", same value on every row, no
+     * column lookup. FROM is still mandatory (this engine's one global
+     * SELECT rule, not something recursive CTEs or this get to skip) --
+     * this only removes the requirement that every item be a column. */
+    int          is_literal;
+    KdbFieldType lit_type;
+    int64_t      lit_int;
+    double       lit_float;
+    int          lit_bool;
+    char         lit_string[KDB_SQL_CASE_VAL_BUF];
 
     /* fn(...) OVER ([PARTITION BY ...] [ORDER BY ...]) -- is_window==0 for
      * everything else (plain column, CASE, or a GROUP BY-collapsing
@@ -3787,6 +4020,36 @@ static KdbStatus sql__project_rows(KdbRows *rows, SqlSelectItem *items, uint32_t
 
         uint32_t kept = 0;
         for (uint32_t i = 0; i < nitems; i++) {
+            if (items[i].is_literal) {
+                KdbField *dst = &new_fields[kept];
+                dst->name = strdup(items[i].alias);
+                if (!dst->name) {
+                    for (uint32_t k = 0; k < kept; k++) sql__free_field(&new_fields[k]);
+                    free(new_fields);
+                    return KDB_ERR_OOM;
+                }
+                dst->type = items[i].lit_type;
+                int ok = 1;
+                switch (items[i].lit_type) {
+                    case KDB_TYPE_INT:    dst->v.as_int   = items[i].lit_int;   break;
+                    case KDB_TYPE_FLOAT:  dst->v.as_float = items[i].lit_float; break;
+                    case KDB_TYPE_BOOL:   dst->v.as_bool  = items[i].lit_bool;  break;
+                    case KDB_TYPE_STRING:
+                        dst->v.as_string = strdup(items[i].lit_string);
+                        ok = dst->v.as_string != NULL;
+                        break;
+                    default: break; /* KDB_TYPE_NULL: nothing to set */
+                }
+                if (!ok) {
+                    free((void *)dst->name);
+                    for (uint32_t k = 0; k < kept; k++) sql__free_field(&new_fields[k]);
+                    free(new_fields);
+                    return KDB_ERR_OOM;
+                }
+                kept++;
+                continue;
+            }
+
             if (items[i].is_case) {
                 KdbField tmp;
                 memset(&tmp, 0, sizeof(tmp));
@@ -4854,6 +5117,7 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     int has_case = 0;
     int has_window = 0;
     int has_func = 0;
+    int has_literal = 0;
 
     if (p->cur.type == SQLTOK_STAR) {
         project_all = 1;
@@ -4866,6 +5130,17 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
             if (sql__kw_is(&p->cur, "CASE")) {
                 if (!sql__parse_case_item(p, db, &item)) return kdb_last_status();
                 has_case = 1;
+            } else if (sql__case_value_from_token(&p->cur, &item.lit_type, &item.lit_int, &item.lit_float,
+                                                  &item.lit_bool, item.lit_string, sizeof(item.lit_string))) {
+                /* a bare literal (number/string/TRUE/FALSE/NULL) -- same
+                 * detection sql__case_value_from_token already does for
+                 * CASE's THEN/ELSE, so a column genuinely named "true"/
+                 * "false"/"null" has the same can't-reference-it-bare
+                 * limitation THEN/ELSE already has, consistently. */
+                item.is_literal = 1;
+                has_literal = 1;
+                sql__advance(p);
+                snprintf(item.alias, sizeof(item.alias), "?column?");
             } else {
                 const char *cname;
                 if (!sql__ident_text(&p->cur, &cname))
@@ -5249,6 +5524,11 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     if (has_func && (has_aggregate || has_group_by)) {
         sql__free_cond_node(where_tree);
         return sql__err("a scalar function doesn't support GROUP BY or aggregate functions yet");
+    }
+
+    if (has_literal && (has_aggregate || has_group_by)) {
+        sql__free_cond_node(where_tree);
+        return sql__err("a bare literal SELECT item doesn't support GROUP BY or aggregate functions yet");
     }
 
     if (project_all && has_group_by) {
@@ -5839,7 +6119,11 @@ KdbStatus kdb_exec_sql(KumDB *db, const char *sql, KdbRows **rows_out, size_t *a
     else if (sql__kw_is(&p.cur, "SELECT")) st = sql__exec_select_stmt(&p, db, rows_out);
     else if (sql__kw_is(&p.cur, "UPDATE")) st = sql__exec_update(&p, db, affected_out, rows_out);
     else if (sql__kw_is(&p.cur, "DELETE")) st = sql__exec_delete(&p, db, affected_out, rows_out);
-    else if (sql__kw_is(&p.cur, "WITH"))   { sql__advance(&p); st = sql__exec_with_stmt(&p, db, rows_out); }
+    else if (sql__kw_is(&p.cur, "WITH")) {
+        sql__advance(&p);
+        if (sql__kw_is(&p.cur, "RECURSIVE")) { sql__advance(&p); st = sql__exec_with_recursive_stmt(&p, db, rows_out); }
+        else                                 st = sql__exec_with_stmt(&p, db, rows_out);
+    }
     else if (sql__kw_is(&p.cur, "BEGIN"))  st = sql__exec_begin(&p, db);
     else if (sql__kw_is(&p.cur, "START"))  st = sql__exec_start_transaction(&p, db);
     else if (sql__kw_is(&p.cur, "COMMIT")) st = sql__exec_commit(&p, db);

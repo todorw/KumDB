@@ -373,6 +373,7 @@ INSERT INTO t (col, ...) SELECT ... [RETURNING * | col, ...]
 INSERT INTO t (col, ...) VALUES (val, ...) ON CONFLICT (col, ...) DO NOTHING | DO UPDATE SET col = val, ... [RETURNING * | col, ...]
 
 [WITH name AS (SELECT ...) [, name2 AS (SELECT ...)]*]
+[WITH RECURSIVE name AS (SELECT ... UNION [ALL] SELECT ...)]
 SELECT [DISTINCT] * | item, ... FROM t | (SELECT ...) [[AS] alias]
     [[INNER|LEFT [OUTER]|RIGHT [OUTER]|FULL [OUTER]|CROSS] JOIN t2 [[AS] alias2] [ON a.col OP (b.col|literal) [AND ...]]]*
     [WHERE cond [AND|OR cond ...]]
@@ -849,6 +850,23 @@ SELECT name, CASE WHEN age >= 18 AND age < 65 THEN 'adult' ELSE 'other' END AS c
     FROM people
 ```
 
+**A bare literal** (number, string, `TRUE`/`FALSE`, `NULL`) also works as
+a `SELECT` item — same value on every row, `FROM` is still mandatory
+(this engine's one global `SELECT` rule; there's no `SELECT 1` with
+nothing to select it *from*, same limitation Oracle's famous `SELECT 1
+FROM DUAL` works around):
+
+```sql
+SELECT name, 'active' AS status FROM users
+```
+
+Unaliased, it defaults to `?column?`, same as real SQL. Not combined
+with `GROUP BY`/aggregate functions, same limit `CASE` has above. No
+arithmetic or other expressions on a literal or a column (`price + 1`,
+`price * 2`) — only the literal or column itself, a function call
+(`ROUND(price, 2)`), or a `CASE`; there's no general expression grammar
+here to parse `+`/`*`/etc against.
+
 **`HAVING`** filters the aggregated/grouped output (same condition syntax
 as `WHERE`, evaluated against the SELECT list's aliases -- `HAVING total >
 90` refers to `SUM(amount) AS total`, not the raw `amount` column). Only
@@ -940,7 +958,8 @@ SELECT customer, amount FROM big_orders ORDER BY amount DESC
 
 Chain more than one with a comma; a later one can reference an earlier
 one (each is validated and made visible in declaration order), but not
-the other way around, and not itself -- no `RECURSIVE`:
+the other way around, and not itself -- this plain (non-`RECURSIVE`)
+form:
 
 ```sql
 WITH regional AS (SELECT region, amount FROM sales WHERE region = 'east'),
@@ -949,6 +968,42 @@ SELECT region FROM totals WHERE total > 10000
 ```
 
 `WITH` only ever precedes a `SELECT` -- not `UPDATE`/`DELETE`/`INSERT`.
+
+**`WITH RECURSIVE name AS (base_select UNION [ALL] recursive_select) SELECT
+... FROM name`** does self-reference: `recursive_select` reads `name` too,
+seeing just the *previous round's new rows* each time (standard
+"semi-naive" recursive-CTE evaluation, not the whole running total —
+matters for a recursive term whose own logic assumes that, e.g. graph
+traversal via a JOIN), repeating until a round produces zero new rows
+(fixpoint) or `10000` rounds pass (a recursive term that never converges
+errors instead of hanging). `UNION` (not `UNION ALL`) drops any row
+already produced by an earlier round before checking whether the round
+produced anything new — this is what makes a cycle in the underlying
+data (a graph edge back to an already-visited node, say) terminate on
+its own instead of looping forever:
+
+```sql
+WITH RECURSIVE org AS (
+    SELECT name, manager FROM employees WHERE name = 'vp_eng'
+    UNION
+    SELECT e.name, e.manager FROM employees AS e JOIN org ON e.manager = org.name
+)
+SELECT name FROM org
+```
+
+Scoped to exactly one CTE (no mixing with other CTEs in the same `WITH`,
+recursive or not — issue those as a separate statement) with exactly the
+standard base-`UNION`-recursive shape (two arms, not more). The base
+case must return at least one row (there's no separate resultset schema
+to materialize zero rows against — see literal `SELECT` items below for
+the same underlying reason), and the recursive term's columns must match
+the base case's exactly (same names, same order — a missing `AS alias`
+on a computed column is a common way to trip this). Under the hood, a
+real (but fully temporary) table named `name` gets created to run all
+of this — dropped again before returning, success or error, so it's
+invisible outside the statement and safe to use inside a `BEGIN`/`COMMIT`
+transaction despite schema changes normally being rejected mid-transaction
+(see Transactions above) — this one's fully self-contained.
 
 **`FROM (SELECT ...) AS alias`** (a derived table) works the same way --
 a subquery standing in for a real table, needing its own alias (there's

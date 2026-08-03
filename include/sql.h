@@ -219,6 +219,14 @@ extern "C" {
  * time -- not column references. Works fine after a JOIN (conditions can
  * reference qualified columns), not combined with GROUP BY/aggregates.
  *
+ * A bare literal (number/string/TRUE/FALSE/NULL) also works as a SELECT
+ * item -- same value on every row, FROM still mandatory (this engine's
+ * one global SELECT rule; no bare "SELECT 1" with nothing to select it
+ * from). Unaliased, defaults to "?column?". Not combined with GROUP BY/
+ * aggregates, same limit CASE has. No arithmetic or other expressions on
+ * a literal or a column ("price + 1") -- only the literal/column itself,
+ * a function call, or CASE; there's no general expression grammar here.
+ *
  * DISTINCT dedupes the result by the exact selected columns, after
  * projection. UNION/UNION ALL/INTERSECT/INTERSECT ALL/EXCEPT/EXCEPT ALL
  * chain multiple SELECTs (same column count required): UNION/INTERSECT/
@@ -274,8 +282,29 @@ extern "C" {
  * re-run-fresh, and JOIN-target behavior as CREATE VIEW, gone the moment
  * the statement finishes either way. Chain more with a comma; a later one
  * can reference an earlier one (each validated and made visible in
- * declaration order), never the reverse and never itself -- no RECURSIVE.
- * Only ever precedes a SELECT, not UPDATE/DELETE/INSERT.
+ * declaration order), never the reverse and never itself -- this plain
+ * (non-RECURSIVE) form. Only ever precedes a SELECT, not UPDATE/DELETE/
+ * INSERT.
+ *
+ * WITH RECURSIVE name AS (base_select UNION [ALL] recursive_select)
+ * SELECT ... FROM name does self-reference: recursive_select's own "FROM
+ * name" sees just the *previous round's new rows* each time (standard
+ * semi-naive recursive-CTE evaluation, not the whole running total),
+ * repeating until a round produces zero new rows or 10000 rounds pass (a
+ * non-converging recursive term errors instead of hanging). UNION (not
+ * UNION ALL) drops rows already produced by an earlier round before
+ * checking for new rows -- what makes a cycle in the underlying data
+ * terminate on its own. Scoped to exactly one CTE (no mixing with other
+ * CTEs in the same WITH) with exactly the standard base-UNION-recursive
+ * shape (two arms). Base case must return >= 1 row (no separate
+ * resultset schema to materialize zero rows against); recursive term's
+ * columns must match the base case's exactly (same names, same order --
+ * a missing "AS alias" on a computed column is a common way to trip
+ * this). Implemented via a real but fully temporary table named name,
+ * dropped before returning either way -- invisible outside the
+ * statement, safe inside a transaction despite DDL normally being
+ * rejected mid-transaction (this one's fully self-contained within the
+ * one kdb_exec_sql call).
  *
  * FROM (SELECT ...) AS alias (a derived table) works the same way -- a
  * subquery standing in for a real table, needing its own alias (nothing

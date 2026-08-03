@@ -2538,6 +2538,106 @@ static void test_ctes(void) {
     teardown(db);
 }
 
+static void test_recursive_ctes(void) {
+    KumDB *db;
+    setup(&db);
+
+    /* a one-row helper table to select a literal seed FROM -- FROM is
+     * mandatory for every SELECT here, recursive CTEs included */
+    ASSERT_OK(sql(db, "CREATE TABLE dual (x INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO dual (x) VALUES (1)"));
+
+    KdbRows *rows = NULL;
+
+    /* growing a string one character at a time -- this engine has no
+     * arithmetic expressions (col + 1) or function calls in WHERE, so a
+     * numeric counter isn't expressible, but CONCAT()/a plain column
+     * comparison is */
+    ASSERT_OK(kdb_exec_sql(db,
+        "WITH RECURSIVE growing AS ("
+        "  SELECT 'a' AS s FROM dual"
+        "  UNION ALL"
+        "  SELECT CONCAT(s, 'a') AS s FROM growing WHERE s != 'aaaaa'"
+        ") SELECT s FROM growing ORDER BY s ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 5u);
+    if (rows && rows->count == 5) {
+        const char *s0 = NULL, *s4 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "s", &s0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[4], "s", &s4));
+        ASSERT_STR(s0, "a");
+        ASSERT_STR(s4, "aaaaa");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* hierarchy traversal via a self-JOIN on the recursive term -- the
+     * canonical recursive CTE use case */
+    ASSERT_OK(sql(db, "CREATE TABLE employees (name TEXT, manager TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO employees (name, manager) VALUES ('ceo', 'none')"));
+    ASSERT_OK(sql(db, "INSERT INTO employees (name, manager) VALUES ('vp_eng', 'ceo')"));
+    ASSERT_OK(sql(db, "INSERT INTO employees (name, manager) VALUES ('vp_sales', 'ceo')"));
+    ASSERT_OK(sql(db, "INSERT INTO employees (name, manager) VALUES ('eng1', 'vp_eng')"));
+    ASSERT_OK(sql(db, "INSERT INTO employees (name, manager) VALUES ('eng2', 'vp_eng')"));
+    ASSERT_OK(sql(db, "INSERT INTO employees (name, manager) VALUES ('sales1', 'vp_sales')"));
+
+    ASSERT_OK(kdb_exec_sql(db,
+        "WITH RECURSIVE org AS ("
+        "  SELECT name, manager FROM employees WHERE name = 'vp_eng'"
+        "  UNION"
+        "  SELECT e.name AS name, e.manager AS manager FROM employees AS e JOIN org ON e.manager = org.name"
+        ") SELECT name FROM org ORDER BY name ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 3u); /* vp_eng, eng1, eng2 */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* a cycle in the underlying data doesn't hang -- UNION (not ALL)
+     * dedupes against the full accumulated history every round, so a
+     * graph edge back to an already-visited node stops on its own */
+    ASSERT_OK(sql(db, "CREATE TABLE edges (src TEXT, dst TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO edges (src, dst) VALUES ('a', 'b')"));
+    ASSERT_OK(sql(db, "INSERT INTO edges (src, dst) VALUES ('b', 'c')"));
+    ASSERT_OK(sql(db, "INSERT INTO edges (src, dst) VALUES ('c', 'a')")); /* cycles back */
+    ASSERT_OK(kdb_exec_sql(db,
+        "WITH RECURSIVE reach AS ("
+        "  SELECT 'a' AS node FROM dual"
+        "  UNION"
+        "  SELECT edges.dst AS node FROM edges JOIN reach ON edges.src = reach.node"
+        ") SELECT node FROM reach ORDER BY node ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 3u); /* a, b, c */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* the CTE's real backing table doesn't survive past the statement */
+    ASSERT_ERR(kdb_exec_sql(db, "SELECT * FROM growing", NULL, NULL));
+
+    /* works inside a SQL transaction too -- the CTE's temp table is
+     * created and dropped entirely within this one statement, so it
+     * never interacts with the surrounding BEGIN/COMMIT bookkeeping */
+    ASSERT_OK(sql(db, "BEGIN"));
+    ASSERT_OK(kdb_exec_sql(db,
+        "WITH RECURSIVE growing2 AS ("
+        "  SELECT 'a' AS s FROM dual"
+        "  UNION ALL"
+        "  SELECT CONCAT(s, 'a') AS s FROM growing2 WHERE s != 'aaa'"
+        ") SELECT s FROM growing2 ORDER BY s ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+    ASSERT_OK(sql(db, "COMMIT"));
+
+    /* error paths */
+    ASSERT_ERR(sql(db, /* base case with no rows -- can't infer a schema */
+        "WITH RECURSIVE z AS (SELECT name FROM employees WHERE 1=0 UNION ALL SELECT name FROM z) SELECT * FROM z"));
+    ASSERT_ERR(sql(db, /* no UNION at all */
+        "WITH RECURSIVE z AS (SELECT 1 AS n FROM dual) SELECT * FROM z"));
+    ASSERT_ERR(sql(db, /* CTE name collides with a real table */
+        "WITH RECURSIVE employees AS (SELECT 'a' AS s FROM dual UNION ALL SELECT CONCAT(s,'a') AS s FROM employees WHERE s != 'aa') "
+        "SELECT * FROM employees"));
+    ASSERT_ERR(sql(db, /* recursive term's column doesn't match the base case's (missing AS s) */
+        "WITH RECURSIVE mism AS (SELECT 'a' AS s FROM dual UNION ALL SELECT CONCAT(s,'a') FROM mism WHERE s != 'aa') "
+        "SELECT * FROM mism"));
+    ASSERT_ERR(sql(db, /* never converges -- hits the iteration cap rather than hanging */
+        "WITH RECURSIVE inf AS (SELECT 'a' AS s FROM dual UNION ALL SELECT CONCAT(s,'a') AS s FROM inf) SELECT * FROM inf"));
+
+    teardown(db);
+}
+
 static void test_derived_tables(void) {
     KumDB *db;
     setup(&db);
@@ -2600,6 +2700,61 @@ static void test_derived_tables(void) {
 
     /* a derived table needs an alias -- there's no name to fall back on */
     ASSERT_ERR(sql(db, "SELECT * FROM (SELECT * FROM sales)"));
+
+    teardown(db);
+}
+
+static void test_literal_select_items(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (name TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('alice')"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('bob')"));
+
+    KdbRows *rows = NULL;
+
+    /* a bare literal alongside a real column -- same value on every row */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT name, 'x' AS tag, 42 AS n, TRUE AS b, NULL AS z FROM t ORDER BY name ASC",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const char *tag0 = NULL;
+        int64_t n0 = 0;
+        int b0 = 0;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "tag", &tag0));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "n", &n0));
+        ASSERT_OK(kdb_row_get_bool(&rows->rows[0], "b", &b0));
+        ASSERT_STR(tag0, "x");
+        ASSERT_EQ(n0, 42);
+        ASSERT_EQ(b0, 1);
+        const KdbField *z0 = kdb_row_get(&rows->rows[0], "z");
+        ASSERT(z0 && z0->type == KDB_TYPE_NULL);
+        /* same literals on the second row too */
+        const char *tag1 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[1], "tag", &tag1));
+        ASSERT_STR(tag1, "x");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* an unaliased literal defaults to "?column?", same as real SQL */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT 1 FROM t WHERE name = 'alice'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        int64_t v = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "?column?", &v));
+        ASSERT_EQ(v, 1);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* still needs a FROM -- this engine's one global SELECT rule, not
+     * something a bare literal gets to skip */
+    ASSERT_ERR(sql(db, "SELECT 1"));
+
+    /* not supported combined with GROUP BY/aggregates, same limit CASE
+     * and scalar functions already have */
+    ASSERT_ERR(sql(db, "SELECT 1, COUNT(*) FROM t"));
+    ASSERT_ERR(sql(db, "SELECT 1, name FROM t GROUP BY name"));
 
     teardown(db);
 }
@@ -3058,8 +3213,10 @@ int main(void) {
     test_views();
     test_view_cte_join_targets();
     test_ctes();
+    test_recursive_ctes();
     test_derived_tables();
     test_correlated_subqueries();
+    test_literal_select_items();
     test_scalar_functions();
     test_window_functions();
     test_comments();
