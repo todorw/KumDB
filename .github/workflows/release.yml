@@ -13,6 +13,16 @@ name: Release
 # deployed tree, so it's a genuine "unzip and run" download, not just a
 # bare exe that's missing its DLLs.
 #
+# Windows builds with MSYS2's MINGW64 toolchain, not MSVC -- the C engine
+# has only ever targeted mingw-w64 on Windows (see include/platform.h's own
+# comment), leaning on mingw's POSIX compat shims (a real unistd.h, etc.)
+# rather than being written against MSVC's CRT. Using MSVC here surfaced
+# exactly that on the first real run: three files include <unistd.h>
+# directly (fine under mingw, a hard error under MSVC). MSYS2's pacman also
+# ships Qt6 built against the same mingw-w64 toolchain it installs, so
+# there's no separate toolchain/Qt ABI matching to get wrong the way there
+# would be pairing aqt's Qt with an independently installed mingw.
+#
 # Deliberately NOT using CPack's own NSIS/DragNDrop generators here: those
 # drive CMake's install() rules directly against the build tree, which
 # has no idea windeployqt/macdeployqt dropped extra runtime files next to
@@ -69,28 +79,39 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Qt
-        uses: jurplel/install-qt-action@v4
+      - uses: msys2/setup-msys2@v2
         with:
-          version: '6.7.*'
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-qt6-base
+            zip
 
       - name: Configure
-        run: cmake -S app -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S app -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --config Release --parallel
+        run: cmake --build build --parallel
 
       - name: Stage install tree
-        run: cmake --install build --config Release --prefix stage
+        run: cmake --install build --prefix stage
 
       - name: Deploy Qt runtime
-        run: windeployqt --release stage\bin\kumdb_studio.exe
+        run: |
+          DEPLOYQT=$(command -v windeployqt-qt6 || command -v windeployqt6 || command -v windeployqt)
+          "$DEPLOYQT" --release stage/bin/kumdb_studio.exe
 
       - name: Zip the deployed tree
-        run: Compress-Archive -Path stage\* -DestinationPath kumdb-studio-windows-x64.zip
+        run: cd stage && zip -r ../kumdb-studio-windows-x64.zip .
 
       - name: Upload
         uses: actions/upload-artifact@v4

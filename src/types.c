@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* strcasecmp -- POSIX, not string.h; glibc leaks it through string.h too but that's non-standard, don't rely on it */
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
