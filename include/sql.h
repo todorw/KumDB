@@ -223,9 +223,21 @@ extern "C" {
  * item -- same value on every row, FROM still mandatory (this engine's
  * one global SELECT rule; no bare "SELECT 1" with nothing to select it
  * from). Unaliased, defaults to "?column?". Not combined with GROUP BY/
- * aggregates, same limit CASE has. No arithmetic or other expressions on
- * a literal or a column ("price + 1") -- only the literal/column itself,
- * a function call, or CASE; there's no general expression grammar here.
+ * aggregates, same limit CASE has.
+ *
+ * Arithmetic expressions (+, -, *, /, %) also work as a SELECT item:
+ * "price * qty AS total", chaining column and/or number-literal terms at
+ * real operator precedence (* / % bind tighter than + -, left to right
+ * within a level). Always computed in double precision and returned as
+ * FLOAT regardless of operand types (same simplification SUM/AVG already
+ * make). A missing/NULL/non-numeric column, or division/modulo by zero,
+ * makes the expression NULL for that row rather than erroring the query.
+ * Up to 6 terms (a term is one column or number, optional leading unary
+ * '-'); no parens for grouping within one expression -- "(a+b)*c" isn't
+ * parseable, only a flat chain at the precedence above. Unaliased,
+ * defaults to "?column?". Not combined with GROUP BY/aggregates. Only a
+ * SELECT item so far -- not usable in WHERE/HAVING/ON or as a function
+ * argument (those still take a plain column or literal only).
  *
  * DISTINCT dedupes the result by the exact selected columns, after
  * projection. UNION/UNION ALL/INTERSECT/INTERSECT ALL/EXCEPT/EXCEPT ALL

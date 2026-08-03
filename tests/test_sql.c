@@ -2759,6 +2759,138 @@ static void test_literal_select_items(void) {
     teardown(db);
 }
 
+static void test_arithmetic_expressions(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (price FLOAT, qty INT, name TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (price, qty, name) VALUES (10.0, 3, 'a')"));
+    ASSERT_OK(sql(db, "INSERT INTO t (price, qty, name) VALUES (5.0, 0, 'b')"));
+
+    /* negative-number-literal lexing everywhere else is unaffected by the
+     * new operator tokens */
+    ASSERT_OK(sql(db, "SELECT * FROM t WHERE qty >= -1"));
+    ASSERT_OK(sql(db, "INSERT INTO t (price, qty, name) VALUES (-2.5, -1, 'neg')"));
+
+    KdbRows *rows = NULL;
+
+    /* basic multiply, column * column */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT price * qty AS total FROM t WHERE name = 'a'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        double v = 0;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "total", &v));
+        ASSERT(v > 29.9 && v < 30.1);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* * binds tighter than + -- "10 + 3*2" is 16, not "13*2"=26 */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT price + qty * 2 AS r FROM t WHERE name = 'a'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        double v = 0;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "r", &v));
+        ASSERT(v > 15.9 && v < 16.1);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* a longer mixed chain: 10*3 - 3 + 1 = 28 */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT price * qty - qty + 1 AS r FROM t WHERE name = 'a'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        double v = 0;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "r", &v));
+        ASSERT(v > 27.9 && v < 28.1);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* modulo */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT qty % 2 AS r FROM t WHERE name = 'a'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        double v = 0;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "r", &v));
+        ASSERT(v > 0.9 && v < 1.1);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* division/modulo by zero is NULL for that row, not a query error */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT price / qty AS r FROM t WHERE name = 'b'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const KdbField *f = kdb_row_get(&rows->rows[0], "r");
+        ASSERT(f && f->type == KDB_TYPE_NULL);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* unary minus on a term after an operator: 10 + -3 = 7 */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT price + -qty AS r FROM t WHERE name = 'a'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        double v = 0;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "r", &v));
+        ASSERT(v > 6.9 && v < 7.1);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* a literal-only expression: 2*3+1 = 7 */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT 2 * 3 + 1 AS r FROM t WHERE name = 'a'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        double v = 0;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "r", &v));
+        ASSERT(v > 6.9 && v < 7.1);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* unaliased expression defaults to "?column?", same as a bare literal */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT price * qty FROM t WHERE name = 'a'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        double v = 0;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "?column?", &v));
+        ASSERT(v > 29.9 && v < 30.1);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* a non-numeric (or missing) column makes the expression NULL for
+     * that row, not an error */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name * 2 AS r FROM t WHERE name = 'a'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const KdbField *f = kdb_row_get(&rows->rows[0], "r");
+        ASSERT(f && f->type == KDB_TYPE_NULL);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* an expression alongside a plain column, and after AS */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name, price * qty AS total FROM t WHERE name = 'a'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        const char *n = NULL;
+        double v = 0;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &n));
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "total", &v));
+        ASSERT_STR(n, "a");
+        ASSERT(v > 29.9 && v < 30.1);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* not combined with GROUP BY/aggregates, same limit CASE/scalar
+     * functions/bare literals already have */
+    ASSERT_ERR(sql(db, "SELECT price * qty, COUNT(*) FROM t"));
+    ASSERT_ERR(sql(db, "SELECT price * qty, name FROM t GROUP BY name"));
+
+    /* not supported in WHERE -- documented scope boundary, only SELECT
+     * items so far */
+    ASSERT_ERR(sql(db, "SELECT * FROM t WHERE price * qty > 10"));
+
+    /* too many terms in one expression is rejected, not silently
+     * truncated */
+    ASSERT_ERR(sql(db, "SELECT 1+1+1+1+1+1+1 AS r FROM t"));
+
+    teardown(db);
+}
+
 static void test_scalar_functions(void) {
     KumDB *db;
     setup(&db);
@@ -3217,6 +3349,7 @@ int main(void) {
     test_derived_tables();
     test_correlated_subqueries();
     test_literal_select_items();
+    test_arithmetic_expressions();
     test_scalar_functions();
     test_window_functions();
     test_comments();

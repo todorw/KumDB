@@ -19,6 +19,13 @@ typedef enum {
     SQLTOK_EOF, SQLTOK_IDENT, SQLTOK_NUMBER, SQLTOK_STRING,
     SQLTOK_LPAREN, SQLTOK_RPAREN, SQLTOK_COMMA, SQLTOK_STAR, SQLTOK_SEMI,
     SQLTOK_EQ, SQLTOK_NEQ, SQLTOK_LT, SQLTOK_LTE, SQLTOK_GT, SQLTOK_GTE,
+    /* arithmetic-only operators -- STAR above doubles as multiply in an
+     * expression context (disambiguated by the parser, not the lexer,
+     * same as it already disambiguates STAR meaning '*' wildcard vs
+     * COUNT(*) today). '-' immediately followed by a digit still lexes
+     * as one signed-number token, same as always (see sql__lex_next) --
+     * SQLTOK_MINUS only comes up for a '-' that isn't part of a literal. */
+    SQLTOK_PLUS, SQLTOK_MINUS, SQLTOK_SLASH, SQLTOK_PERCENT,
     SQLTOK_ERROR
 } SqlTokType;
 
@@ -148,6 +155,13 @@ static SqlToken sql__lex_next(SqlLexer *lx) {
     if (c == '=') { t.type = SQLTOK_EQ;  lx->pos = i + 1; return t; }
     if (c == '<') { t.type = SQLTOK_LT;  lx->pos = i + 1; return t; }
     if (c == '>') { t.type = SQLTOK_GT;  lx->pos = i + 1; return t; }
+    if (c == '+') { t.type = SQLTOK_PLUS;    lx->pos = i + 1; return t; }
+    /* '-' immediately followed by a digit is a signed-number literal (the
+     * NUMBER branch below), not this -- checked here too so that case
+     * always wins regardless of branch order. */
+    if (c == '-' && !isdigit((unsigned char)s[i + 1])) { t.type = SQLTOK_MINUS; lx->pos = i + 1; return t; }
+    if (c == '/') { t.type = SQLTOK_SLASH;   lx->pos = i + 1; return t; }
+    if (c == '%') { t.type = SQLTOK_PERCENT; lx->pos = i + 1; return t; }
 
     if (c == '\'' || c == '"') {
         char quote = c;
@@ -2245,6 +2259,37 @@ typedef struct {
  * audit. No parens within one WHEN -- that would need the tree, which
  * would need the heap; AND/OR-of-plain-conditions covers the documented
  * gap without paying that cost. */
+typedef enum { SQL_ARITH_ADD, SQL_ARITH_SUB, SQL_ARITH_MUL, SQL_ARITH_DIV, SQL_ARITH_MOD } SqlArithOp;
+
+#define KDB_SQL_MAX_EXPR_TERMS 6
+
+/* One term in a flat arithmetic expression chain: a column reference or
+ * a numeric literal (always stored as double -- see SqlExpr), optionally
+ * negated by a leading unary '-'. */
+typedef struct {
+    int    is_col;
+    char   col[KDB_SQL_IDENT_BUF];
+    double lit;
+    int    negate;
+} SqlExprTerm;
+
+/* A flat chain of terms joined by +/-/ * //% at real operator precedence
+ * (*, /, % bind tighter than +, -) -- no parens/nesting within one
+ * expression, same "flat array, no heap" scope discipline SqlCaseBranch's
+ * WHEN conditions use above (a SqlSelectItem carrying one stays POD, so
+ * every early return in sql__exec_select_core stays safe with no new
+ * cleanup path to audit). Always evaluates in double precision and
+ * produces FLOAT, regardless of the operand types -- same simplification
+ * this engine already made for SUM/AVG ("always FLOAT regardless of the
+ * source column's type"), avoiding int-division-truncation surprises. A
+ * missing/NULL/non-numeric column, or division/modulo by zero, makes the
+ * whole expression NULL for that row rather than erroring the query. */
+typedef struct {
+    SqlExprTerm terms[KDB_SQL_MAX_EXPR_TERMS];
+    SqlArithOp  ops[KDB_SQL_MAX_EXPR_TERMS - 1]; /* ops[i] is between terms[i] and terms[i+1] */
+    int         n_terms;
+} SqlExpr;
+
 typedef struct {
     char         cond_filters[KDB_SQL_MAX_CASE_SUBCONDS][KDB_SQL_IDENT_BUF]; /* WHEN condition(s), filter-string form */
     int          n_cond_filters;
@@ -2294,6 +2339,13 @@ typedef struct {
     double       lit_float;
     int          lit_bool;
     char         lit_string[KDB_SQL_CASE_VAL_BUF];
+
+    /* col +/-/ * //% col-or-number, chained -- "SELECT price * qty AS
+     * total FROM t". Detected after a plain column or numeric literal is
+     * already parsed above, by checking whether an arithmetic operator
+     * follows; see the SELECT-item parsing loop. */
+    int    is_expr;
+    SqlExpr expr;
 
     /* fn(...) OVER ([PARTITION BY ...] [ORDER BY ...]) -- is_window==0 for
      * everything else (plain column, CASE, or a GROUP BY-collapsing
@@ -2522,6 +2574,67 @@ static int sql__case_value_from_token(const SqlToken *t, KdbFieldType *type_out,
     }
 }
 
+static int sql__arith_op_from_token(SqlTokType t, SqlArithOp *out) {
+    switch (t) {
+        case SQLTOK_PLUS:    *out = SQL_ARITH_ADD; return 1;
+        case SQLTOK_MINUS:   *out = SQL_ARITH_SUB; return 1;
+        case SQLTOK_STAR:    *out = SQL_ARITH_MUL; return 1;
+        case SQLTOK_SLASH:   *out = SQL_ARITH_DIV; return 1;
+        case SQLTOK_PERCENT: *out = SQL_ARITH_MOD; return 1;
+        default: return 0;
+    }
+}
+
+/* Parses one arithmetic expression term: an optional leading '-' then a
+ * column reference or a numeric literal. p is positioned at the term's
+ * first token (or the '-' before it). Returns 0 if the current token
+ * isn't a term at all (error not set -- this is a plain "no" the caller
+ * decides what to do with, not a hard parse failure). */
+static int sql__parse_expr_term(SqlParser *p, SqlExprTerm *out) {
+    memset(out, 0, sizeof(*out));
+    if (p->cur.type == SQLTOK_MINUS) { out->negate = 1; sql__advance(p); }
+    if (p->cur.type == SQLTOK_NUMBER) {
+        out->is_col = 0;
+        out->lit = atof(p->cur.text);
+        sql__advance(p);
+        return 1;
+    }
+    if (p->cur.type == SQLTOK_IDENT) {
+        snprintf(out->col, sizeof(out->col), "%.255s", p->cur.text);
+        out->is_col = 1;
+        sql__advance(p);
+        return 1;
+    }
+    return 0;
+}
+
+/* Continues parsing an arithmetic expression after its first term is
+ * already in expr->terms[0] (n_terms==1) -- consumes (operator term)*
+ * pairs for as long as the next token is +/-/ * //%. Leaves expr
+ * untouched (n_terms==1) if no operator follows at all -- not an error,
+ * just means the caller's tentative first term wasn't actually the start
+ * of a real expression. Returns 0 on a genuine parse error (error set)
+ * after an operator has already been consumed (an operator demands a
+ * term after it). */
+static int sql__parse_expr_tail(SqlParser *p, SqlExpr *expr) {
+    SqlArithOp op;
+    while (sql__arith_op_from_token(p->cur.type, &op)) {
+        if (expr->n_terms >= KDB_SQL_MAX_EXPR_TERMS) {
+            sql__err("too many terms in one arithmetic expression (max %d)", KDB_SQL_MAX_EXPR_TERMS);
+            return 0;
+        }
+        sql__advance(p); /* the operator */
+        SqlExprTerm term;
+        if (!sql__parse_expr_term(p, &term)) {
+            sql__err("expected a column or number after an arithmetic operator");
+            return 0;
+        }
+        expr->ops[expr->n_terms - 1] = op;
+        expr->terms[expr->n_terms++] = term;
+    }
+    return 1;
+}
+
 /* One function argument: a bare column name, or a literal (number,
  * string, true/false/null -- same shapes sql__case_value_from_token
  * accepts for CASE's THEN/ELSE). p is positioned at the argument's first
@@ -2688,6 +2801,62 @@ static int sql__field_to_double(const KdbField *f, double *out) {
         case KDB_TYPE_BOOL:  *out = (double)f->v.as_bool;  return 1;
         default: return 0;
     }
+}
+
+/* Resolves one term's numeric value against row -- a missing/NULL/non-
+ * numeric column makes the term (and so the whole expression) undefined,
+ * signaled by returning 0. */
+static int sql__expr_term_value(const SqlExprTerm *term, const KdbRow *row, double *out) {
+    double v;
+    if (term->is_col) {
+        const KdbField *f = kdb_row_get(row, term->col);
+        if (!sql__field_to_double(f, &v)) return 0;
+    } else {
+        v = term->lit;
+    }
+    *out = term->negate ? -v : v;
+    return 1;
+}
+
+/* Evaluates a flat term chain at real operator precedence (*, /, % bind
+ * tighter than +, -): first collapses every * / % pair left to right
+ * (each collapse removes one term+op, shifting the rest down -- cheap at
+ * the small term counts KDB_SQL_MAX_EXPR_TERMS allows), then folds the
+ * remaining +/- left to right. Returns 0 (expression undefined for this
+ * row -- caller emits NULL) on a missing/non-numeric term or a division/
+ * modulo by zero. */
+static int sql__eval_expr(const SqlExpr *expr, const KdbRow *row, double *out) {
+    double vals[KDB_SQL_MAX_EXPR_TERMS] = {0}; /* n_terms is always >= 1, so vals[0] is always set below -- GCC's escape analysis at -O2 can't prove that on its own */
+    SqlArithOp ops[KDB_SQL_MAX_EXPR_TERMS - 1];
+    int n = expr->n_terms;
+    for (int i = 0; i < n; i++) {
+        if (!sql__expr_term_value(&expr->terms[i], row, &vals[i])) return 0;
+        if (i > 0) ops[i - 1] = expr->ops[i - 1];
+    }
+
+    int i = 0;
+    while (i < n - 1) {
+        if (ops[i] == SQL_ARITH_MUL || ops[i] == SQL_ARITH_DIV || ops[i] == SQL_ARITH_MOD) {
+            double a = vals[i], b = vals[i + 1], r;
+            switch (ops[i]) {
+                case SQL_ARITH_MUL: r = a * b; break;
+                case SQL_ARITH_DIV: if (b == 0.0) return 0; r = a / b; break;
+                case SQL_ARITH_MOD: if (b == 0.0) return 0; r = fmod(a, b); break;
+                default: r = 0.0; break;
+            }
+            vals[i] = r;
+            for (int k = i + 1; k < n - 1; k++) vals[k] = vals[k + 1];
+            for (int k = i; k < n - 2; k++) ops[k] = ops[k + 1];
+            n--;
+        } else {
+            i++;
+        }
+    }
+
+    double result = vals[0];
+    for (int k = 0; k < n - 1; k++) result = (ops[k] == SQL_ARITH_ADD) ? result + vals[k + 1] : result - vals[k + 1];
+    *out = result;
+    return 1;
 }
 
 static int sql__field_equal(const KdbField *a, const KdbField *b) {
@@ -3104,6 +3273,10 @@ static char *sql__substitute_outer_refs(const char *inner_sql, const char *outer
                 case SQLTOK_LTE:    snprintf(piece, sizeof(piece), "<="); break;
                 case SQLTOK_GT:     snprintf(piece, sizeof(piece), ">"); break;
                 case SQLTOK_GTE:    snprintf(piece, sizeof(piece), ">="); break;
+                case SQLTOK_PLUS:    snprintf(piece, sizeof(piece), "+"); break;
+                case SQLTOK_MINUS:   snprintf(piece, sizeof(piece), "-"); break;
+                case SQLTOK_SLASH:   snprintf(piece, sizeof(piece), "/"); break;
+                case SQLTOK_PERCENT: snprintf(piece, sizeof(piece), "%%"); break;
                 default: piece[0] = '\0'; break;
             }
         }
@@ -4046,6 +4219,21 @@ static KdbStatus sql__project_rows(KdbRows *rows, SqlSelectItem *items, uint32_t
                     free(new_fields);
                     return KDB_ERR_OOM;
                 }
+                kept++;
+                continue;
+            }
+
+            if (items[i].is_expr) {
+                KdbField *dst = &new_fields[kept];
+                dst->name = strdup(items[i].alias);
+                if (!dst->name) {
+                    for (uint32_t k = 0; k < kept; k++) sql__free_field(&new_fields[k]);
+                    free(new_fields);
+                    return KDB_ERR_OOM;
+                }
+                double v;
+                if (sql__eval_expr(&items[i].expr, row, &v)) { dst->type = KDB_TYPE_FLOAT; dst->v.as_float = v; }
+                else                                          { dst->type = KDB_TYPE_NULL; }
                 kept++;
                 continue;
             }
@@ -5118,6 +5306,7 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     int has_window = 0;
     int has_func = 0;
     int has_literal = 0;
+    int has_expr = 0;
 
     if (p->cur.type == SQLTOK_STAR) {
         project_all = 1;
@@ -5309,6 +5498,32 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
                         snprintf(item.arg_col, sizeof(item.arg_col), "%s", first_ident);
                         snprintf(item.alias, sizeof(item.alias), "%s", first_ident);
                     }
+                }
+            }
+
+            /* A plain column or a numeric literal, immediately followed by
+             * +/-/ * //%, is actually the first term of an arithmetic
+             * expression ("SELECT price * qty AS total FROM t") -- checked
+             * here, after the item's shape is otherwise fully settled
+             * above, so a bare column/literal with nothing following it
+             * (the overwhelmingly common case) is completely unaffected. */
+            {
+                int expr_startable = (item.is_literal && (item.lit_type == KDB_TYPE_INT || item.lit_type == KDB_TYPE_FLOAT)) ||
+                                      (!item.is_case && !item.is_func && !item.is_literal && !item.is_window &&
+                                       item.fn == SQL_AGG_NONE && item.arg_col[0] != '\0');
+                SqlArithOp peek_op;
+                if (expr_startable && sql__arith_op_from_token(p->cur.type, &peek_op)) {
+                    SqlExpr expr;
+                    memset(&expr, 0, sizeof(expr));
+                    if (item.is_literal) { expr.terms[0].is_col = 0; expr.terms[0].lit = item.lit_type == KDB_TYPE_INT ? (double)item.lit_int : item.lit_float; }
+                    else                 { expr.terms[0].is_col = 1; snprintf(expr.terms[0].col, sizeof(expr.terms[0].col), "%s", item.arg_col); }
+                    expr.n_terms = 1;
+                    if (!sql__parse_expr_tail(p, &expr)) return kdb_last_status();
+                    item.is_expr = 1;
+                    has_expr = 1;
+                    item.is_literal = 0;
+                    item.expr = expr;
+                    if (item.alias[0] == '\0' || strcmp(item.alias, item.arg_col) == 0) snprintf(item.alias, sizeof(item.alias), "?column?");
                 }
             }
 
@@ -5529,6 +5744,11 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     if (has_literal && (has_aggregate || has_group_by)) {
         sql__free_cond_node(where_tree);
         return sql__err("a bare literal SELECT item doesn't support GROUP BY or aggregate functions yet");
+    }
+
+    if (has_expr && (has_aggregate || has_group_by)) {
+        sql__free_cond_node(where_tree);
+        return sql__err("an arithmetic expression doesn't support GROUP BY or aggregate functions yet");
     }
 
     if (project_all && has_group_by) {

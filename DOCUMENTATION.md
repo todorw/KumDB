@@ -861,11 +861,32 @@ SELECT name, 'active' AS status FROM users
 ```
 
 Unaliased, it defaults to `?column?`, same as real SQL. Not combined
-with `GROUP BY`/aggregate functions, same limit `CASE` has above. No
-arithmetic or other expressions on a literal or a column (`price + 1`,
-`price * 2`) — only the literal or column itself, a function call
-(`ROUND(price, 2)`), or a `CASE`; there's no general expression grammar
-here to parse `+`/`*`/etc against.
+with `GROUP BY`/aggregate functions, same limit `CASE` has above.
+
+**Arithmetic expressions** (`+`, `-`, `*`, `/`, `%`) work as a `SELECT`
+item too, chaining a column and/or number literal terms at real operator
+precedence (`*`/`/`/`%` bind tighter than `+`/`-`, left to right within
+the same precedence level):
+
+```sql
+SELECT name, price * qty AS total FROM orders
+SELECT price + qty * 2 AS r FROM orders
+```
+
+Always computed in double precision and returned as `FLOAT`, regardless
+of the operand types — same simplification `SUM`/`AVG` already make
+("always `FLOAT` regardless of the source column's type"), so `int /
+int` doesn't truncate the way it does in some real engines. A missing/
+`NULL`/non-numeric column, or a division/modulo by zero, makes the whole
+expression `NULL` for that row rather than erroring the query. Up to 6
+terms per expression (a term is one column or number, with an optional
+leading unary `-`); no parentheses for grouping within one expression —
+`(a + b) * c` isn't parseable, only a flat left-to-right chain at the
+precedence above. Unaliased, defaults to `?column?`, same as a bare
+literal. Not combined with `GROUP BY`/aggregate functions, and — for now
+— only usable as a `SELECT` item, not inside `WHERE`/`HAVING`/`ON` or as
+a function argument (`ROUND(price * 1.1, 2)` isn't parseable either);
+those all still take a plain column or literal only.
 
 **`HAVING`** filters the aggregated/grouped output (same condition syntax
 as `WHERE`, evaluated against the SELECT list's aliases -- `HAVING total >
