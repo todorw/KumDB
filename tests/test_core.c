@@ -843,6 +843,150 @@ static void test_list_tables_repeated(void) {
     teardown(db);
 }
 
+static void test_aggregate_pipeline(void) {
+    KumDB *db;
+    setup(&db);
+
+    KdbField f1[] = { kdb_field_string("region", "east"), kdb_field_string("rep", "alice"), kdb_field_float("amount", 100.0), kdb_field_end() };
+    KdbField f2[] = { kdb_field_string("region", "east"), kdb_field_string("rep", "bob"),   kdb_field_float("amount", 150.0), kdb_field_end() };
+    KdbField f3[] = { kdb_field_string("region", "west"), kdb_field_string("rep", "carol"), kdb_field_float("amount", 200.0), kdb_field_end() };
+    KdbField f4[] = { kdb_field_string("region", "west"), kdb_field_string("rep", "dave"),  kdb_field_float("amount", 50.0),  kdb_field_end() };
+    ASSERT_OK(kdb_add(db, "sales", f1));
+    ASSERT_OK(kdb_add(db, "sales", f2));
+    ASSERT_OK(kdb_add(db, "sales", f3));
+    ASSERT_OK(kdb_add(db, "sales", f4));
+
+    /* $match alone */
+    {
+        const char *filters[] = { "region=east", NULL };
+        KdbStage stages[] = {{ .type = KDB_STAGE_MATCH, .as = { .match_filters = filters } }};
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_aggregate(db, "sales", stages, 1, &rows));
+        ASSERT(rows && rows->count == 2u);
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* $group by region with every accumulator type */
+    {
+        KdbAccumulator accs[] = {
+            { "total",      KDB_ACC_SUM,   "amount" },
+            { "avg_amount", KDB_ACC_AVG,   "amount" },
+            { "n",          KDB_ACC_COUNT, NULL },
+            { "min_amount", KDB_ACC_MIN,   "amount" },
+            { "max_amount", KDB_ACC_MAX,   "amount" },
+        };
+        const char *group_by[] = { "region", NULL };
+        KdbStage stages[] = {{
+            .type = KDB_STAGE_GROUP,
+            .as = { .group = { .group_by = group_by, .accumulators = accs, .n_accumulators = 5 } }
+        }};
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_aggregate(db, "sales", stages, 1, &rows));
+        ASSERT(rows && rows->count == 2u);
+        if (rows) {
+            for (size_t i = 0; i < rows->count; i++) {
+                const char *region = NULL;
+                double total = 0, mn = 0, mx = 0;
+                int64_t n = 0;
+                ASSERT_OK(kdb_row_get_string(&rows->rows[i], "region", &region));
+                ASSERT_OK(kdb_row_get_float(&rows->rows[i], "total", &total));
+                ASSERT_OK(kdb_row_get_int(&rows->rows[i], "n", &n));
+                ASSERT_OK(kdb_row_get_float(&rows->rows[i], "min_amount", &mn));
+                ASSERT_OK(kdb_row_get_float(&rows->rows[i], "max_amount", &mx));
+                ASSERT_EQ(n, 2);
+                ASSERT(total > 249.9 && total < 250.1); /* both regions sum to 250 */
+                if (strcmp(region, "east") == 0) {
+                    ASSERT(mn > 99.9 && mn < 100.1);
+                    ASSERT(mx > 149.9 && mx < 150.1);
+                } else {
+                    ASSERT_STR(region, "west");
+                    ASSERT(mn > 49.9 && mn < 50.1);
+                    ASSERT(mx > 199.9 && mx < 200.1);
+                }
+            }
+            kdb_rows_free(rows);
+        }
+    }
+
+    /* full pipeline: $match -> $group -> $sort -> $limit */
+    {
+        const char *filters[] = { "amount__gt=40", NULL };
+        KdbAccumulator accs[] = { { "total", KDB_ACC_SUM, "amount" } };
+        const char *group_by[] = { "region", NULL };
+        KdbStage stages[] = {
+            { .type = KDB_STAGE_MATCH, .as = { .match_filters = filters } },
+            { .type = KDB_STAGE_GROUP, .as = { .group = { .group_by = group_by, .accumulators = accs, .n_accumulators = 1 } } },
+            { .type = KDB_STAGE_SORT,  .as = { .sort = { .fields = {"total"}, .ascending = {0}, .n_fields = 1 } } },
+            { .type = KDB_STAGE_LIMIT, .as = { .limit = 1 } },
+        };
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_aggregate(db, "sales", stages, 4, &rows));
+        ASSERT(rows && rows->count == 1u);
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* $project keeps only the named fields, id included */
+    {
+        const char *fields[] = { "id", "rep", NULL };
+        KdbStage stages[] = {{ .type = KDB_STAGE_PROJECT, .as = { .project_fields = fields } }};
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_aggregate(db, "sales", stages, 1, &rows));
+        ASSERT(rows && rows->count == 4u);
+        if (rows && rows->count > 0) {
+            ASSERT_EQ(rows->rows[0].field_count, 2u);
+            ASSERT(kdb_row_get(&rows->rows[0], "id") != NULL);
+            ASSERT(kdb_row_get(&rows->rows[0], "region") == NULL);
+        }
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* $sort (multi-key would tie-break here, single key is enough) + $skip */
+    {
+        KdbStage stages[] = {
+            { .type = KDB_STAGE_SORT, .as = { .sort = { .fields = {"amount"}, .ascending = {1}, .n_fields = 1 } } },
+            { .type = KDB_STAGE_SKIP, .as = { .skip = 3 } },
+        };
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_aggregate(db, "sales", stages, 2, &rows));
+        ASSERT(rows && rows->count == 1u);
+        if (rows && rows->count == 1) {
+            const char *rep = NULL;
+            ASSERT_OK(kdb_row_get_string(&rows->rows[0], "rep", &rep));
+            ASSERT_STR(rep, "carol"); /* highest amount (200) */
+        }
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* $group with no GROUP BY-equivalent (group_by NULL) collapses to one row,
+     * even over zero matching rows -- same as SQL's aggregate-with-no-GROUP-BY */
+    {
+        KdbField ex[] = { kdb_field_int("x", 1), kdb_field_end() };
+        ASSERT_OK(kdb_add(db, "empty2", ex));
+        ASSERT_OK(kdb_delete(db, "empty2", NULL, NULL));
+
+        KdbAccumulator accs[] = { { "n", KDB_ACC_COUNT, NULL } };
+        KdbStage stages[] = {{ .type = KDB_STAGE_GROUP, .as = { .group = { .group_by = NULL, .accumulators = accs, .n_accumulators = 1 } } }};
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_aggregate(db, "empty2", stages, 1, &rows));
+        ASSERT(rows && rows->count == 1u);
+        if (rows && rows->count == 1) {
+            int64_t n = -1;
+            ASSERT_OK(kdb_row_get_int(&rows->rows[0], "n", &n));
+            ASSERT_EQ(n, 0);
+        }
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* error paths */
+    {
+        KdbRows *rows = NULL;
+        ASSERT_ERR(kdb_aggregate(db, "nonexistent", NULL, 0, &rows));
+        ASSERT_ERR(kdb_aggregate(NULL, "sales", NULL, 0, &rows));
+    }
+
+    teardown(db);
+}
+
 int main(void) {
     printf("=== test_core ===\n");
 
@@ -871,6 +1015,7 @@ int main(void) {
     test_nested_dot_path_filter();
     test_nested_survives_reopen();
     test_list_tables_repeated();
+    test_aggregate_pipeline();
 
     printf("passed=%d  failed=%d\n", passed, failed);
     return failed > 0 ? 1 : 0;

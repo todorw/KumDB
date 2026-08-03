@@ -81,6 +81,73 @@ typedef struct {
 KdbRows *kdb_find_ex(KumDB *db, const char *table_name, const char **filters,
                      const KdbFindOpts *opts);
 
+/* Aggregation pipeline: a sequence of stages run over a table's rows in
+ * order, each stage's output feeding the next -- the NoSQL C API's
+ * counterpart to SQL's WHERE/GROUP BY/ORDER BY/LIMIT (see sql.h), built
+ * for direct C use with no SQL text involved. Every stage runs in memory
+ * over the whole table (kdb_query_execute fetches it all up front, same
+ * "fine at the row counts this engine targets" scope the rest of the
+ * engine already accepts -- not optimized for huge tables). */
+typedef enum {
+    KDB_STAGE_MATCH,    /* keep only rows matching filters (same raw filter-string format kdb_find takes) */
+    KDB_STAGE_GROUP,    /* group by field(s), reducing each group to one row via accumulators */
+    KDB_STAGE_SORT,     /* multi-key sort, same semantics as KdbFindOpts.order_by generalized to several fields */
+    KDB_STAGE_LIMIT,    /* cap the row count */
+    KDB_STAGE_SKIP,     /* drop the first n rows */
+    KDB_STAGE_PROJECT   /* keep only the named fields (id/created_at/updated_at work too), in that order */
+} KdbStageType;
+
+typedef enum {
+    KDB_ACC_COUNT,  /* counts rows (source_field ignored) unless source_field is set, then counts its non-NULL values */
+    KDB_ACC_SUM,    /* always comes back FLOAT, same convention SQL's SUM uses */
+    KDB_ACC_AVG,    /* always comes back FLOAT; 0.0 for a group with no non-NULL values */
+    KDB_ACC_MIN,
+    KDB_ACC_MAX
+} KdbAccumulatorType;
+
+#define KDB_AGG_MAX_GROUP_KEYS   4
+#define KDB_AGG_MAX_ACCUMULATORS 8
+#define KDB_AGG_MAX_SORT_KEYS    4
+
+/* One $group output field: output_name = type(source_field) across the
+ * group's rows. source_field is ignored for a bare KDB_ACC_COUNT(*)
+ * (pass NULL); set it to count only that field's non-NULL values instead
+ * (COUNT(col), same distinction SQL's COUNT(*) vs COUNT(col) makes). */
+typedef struct {
+    const char        *output_name;
+    KdbAccumulatorType type;
+    const char        *source_field;
+} KdbAccumulator;
+
+/* One pipeline stage. group_by/source_field/sort fields must be real
+ * stored fields, not the id/created_at/updated_at pseudo-columns (KDB_
+ * STAGE_PROJECT is the exception -- those work fine there, since a
+ * projected value is copied out immediately rather than held onto
+ * across the whole stage the way a group key or sort key needs to be). */
+typedef struct {
+    KdbStageType type;
+    union {
+        const char **match_filters; /* NULL-terminated; NULL/empty = match every row */
+        struct {
+            const char           **group_by;       /* NULL-terminated field name list; NULL/empty = one group over every row */
+            const KdbAccumulator  *accumulators;
+            size_t                 n_accumulators; /* max KDB_AGG_MAX_ACCUMULATORS */
+        } group;
+        struct {
+            const char *fields[KDB_AGG_MAX_SORT_KEYS];
+            int         ascending[KDB_AGG_MAX_SORT_KEYS]; /* 1 = ASC, 0 = DESC */
+            size_t      n_fields;
+        } sort;
+        size_t       limit;
+        size_t       skip;
+        const char **project_fields; /* NULL-terminated */
+    } as;
+} KdbStage;
+
+KdbStatus kdb_aggregate(KumDB *db, const char *table_name,
+                        const KdbStage *stages, size_t n_stages,
+                        KdbRows **rows_out);
+
 KdbStatus kdb_update(KumDB          *db,
                      const char     *table_name,
                      const char    **where_filters,

@@ -98,6 +98,64 @@ KdbFindOpts opts = { .order_by = "age", .ascending = 0, .limit = 10, .offset = 0
 KdbRows *rows = kdb_find_ex(db, "users", filters, &opts);
 ```
 
+### Aggregation pipeline
+
+`kdb_aggregate()` runs a sequence of stages over a table's rows, each
+stage's output feeding the next — the NoSQL C API's counterpart to SQL's
+`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT` (see the SQL section below), built
+for direct C use with no SQL text involved:
+
+```c
+const char *filters[] = { "region=east", NULL };
+KdbAccumulator accs[] = {
+    { "total",      KDB_ACC_SUM,   "amount" },
+    { "avg_amount", KDB_ACC_AVG,   "amount" },
+    { "n",          KDB_ACC_COUNT, NULL     },
+};
+const char *group_by[] = { "region", NULL };
+
+KdbStage stages[] = {
+    { .type = KDB_STAGE_MATCH, .as = { .match_filters = filters } },
+    { .type = KDB_STAGE_GROUP, .as = { .group = { .group_by = group_by,
+                                                   .accumulators = accs,
+                                                   .n_accumulators = 3 } } },
+    { .type = KDB_STAGE_SORT,  .as = { .sort = { .fields = {"total"}, .ascending = {0}, .n_fields = 1 } } },
+    { .type = KDB_STAGE_LIMIT, .as = { .limit = 10 } },
+};
+
+KdbRows *rows = NULL;
+kdb_aggregate(db, "sales", stages, 4, &rows);
+```
+
+Six stage types, run in whatever order the array lists them (a pipeline
+can use the same stage type more than once — two `$match`es, `$sort`
+after `$group`, etc.):
+
+- **`KDB_STAGE_MATCH`** — keeps only rows matching `filters` (same raw
+  filter-string format `kdb_find` takes, including `OR:`-prefixed groups).
+- **`KDB_STAGE_GROUP`** — groups by `group_by` (a `NULL`-terminated field
+  list; `NULL`/empty collapses everything into one group, same as a
+  `GROUP BY`-less SQL aggregate), reducing each group to one output row.
+  `accumulators` computes `KDB_ACC_SUM`/`AVG`/`MIN`/`MAX` (always `FLOAT`
+  for `SUM`/`AVG`) or `KDB_ACC_COUNT` (rows, or a field's non-`NULL`
+  values if `source_field` is set) per group, alongside the group-by
+  fields themselves. Up to `KDB_AGG_MAX_GROUP_KEYS` (4) group-by fields
+  and `KDB_AGG_MAX_ACCUMULATORS` (8) accumulators.
+- **`KDB_STAGE_SORT`** — multi-key sort (up to `KDB_AGG_MAX_SORT_KEYS`,
+  4), `ascending[i]` `1`/`0` per field.
+- **`KDB_STAGE_LIMIT`** / **`KDB_STAGE_SKIP`** — cap the row count / drop
+  the first `n` rows, same as `KdbFindOpts`.
+- **`KDB_STAGE_PROJECT`** — keeps only the named fields (a `NULL`-
+  terminated list), in that order; a missing field is silently skipped.
+
+`$group`'s `group_by`/accumulator `source_field`s and `$sort`'s fields
+must be real stored fields, not the `id`/`created_at`/`updated_at`
+pseudo-columns (`$match`'s filters and `$project`'s fields work fine with
+them, same as `kdb_find`/`kdb_find_ex` always have). Every stage runs in
+memory over the whole table (`kdb_aggregate` fetches it all up front,
+same as `sql__exec_select_core` does under the hood for SQL) — fine at
+the row counts this engine targets, not optimized for huge tables.
+
 ### Reading a row's fields
 
 ```c

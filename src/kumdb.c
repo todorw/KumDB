@@ -1293,6 +1293,330 @@ KdbRows *kdb_find_ex(KumDB *db, const char *table_name, const char **filters,
     return kdb__result_to_rows(&res);
 }
 
+static int kdb__agg_value_to_double(const KdbValue *v, double *out) {
+    switch (v->type) {
+        case KDB_TYPE_INT:   *out = (double)v->v.as_int; return 1;
+        case KDB_TYPE_FLOAT: *out = v->v.as_float;        return 1;
+        case KDB_TYPE_BOOL:  *out = (double)v->v.as_bool; return 1;
+        default: return 0;
+    }
+}
+
+/* $match: keep only rows kdb_query_matches accepts, same raw filter
+ * strings kdb_find takes. Operates over an already-in-memory KdbResult
+ * (not the table itself), so this is a linear scan + kdb_result_append
+ * copy per match, not an indexed lookup -- fine as one stage in a
+ * pipeline that already fetched the whole table up front. */
+static KdbStatus kdb__agg_match(const KdbResult *cur, const char **filters, KdbResult *out) {
+    KdbQuery q;
+    KdbStatus st = kdb__build_query(filters, &q);
+    if (st != KDB_OK) return st;
+
+    st = kdb_result_init(out, cur->count > 0 ? cur->count : 1);
+    if (st != KDB_OK) { kdb_query_free(&q); return st; }
+
+    for (size_t i = 0; i < cur->count && st == KDB_OK; i++) {
+        if (kdb_query_matches(&q, &cur->rows[i])) st = kdb_result_append(out, &cur->rows[i]);
+    }
+    kdb_query_free(&q);
+    if (st != KDB_OK) kdb_result_free(out);
+    return st;
+}
+
+typedef struct { const char *field; int ascending; } KdbAggSortKey;
+static const KdbAggSortKey *kdb__agg_sort_keys  = NULL;
+static size_t               kdb__agg_sort_nkeys = 0;
+
+/* qsort context globals, same single-threaded precedent sql.c's own
+ * sort/window comparators already establish (this engine is single-
+ * writer, single-process). */
+static int kdb__agg_row_cmp(const void *a, const void *b) {
+    const KdbRecord *ra = (const KdbRecord *)a;
+    const KdbRecord *rb = (const KdbRecord *)b;
+    for (size_t i = 0; i < kdb__agg_sort_nkeys; i++) {
+        const char *field = kdb__agg_sort_keys[i].field;
+        KdbValue pa, pb;
+        const KdbValue *fa, *fb;
+        if (kdb__pseudo_column_value(ra, field, &pa)) fa = &pa;
+        else { const KdbRecordField *f = kdb_record_get_field(ra, field); fa = f ? &f->value : NULL; }
+        if (kdb__pseudo_column_value(rb, field, &pb)) fb = &pb;
+        else { const KdbRecordField *f = kdb_record_get_field(rb, field); fb = f ? &f->value : NULL; }
+
+        int cmp;
+        if (!fa && !fb)   cmp = 0;
+        else if (!fa)     cmp = kdb__agg_sort_keys[i].ascending ? -1 : 1;
+        else if (!fb)     cmp = kdb__agg_sort_keys[i].ascending ? 1 : -1;
+        else { cmp = kdb_value_compare(fa, fb); if (!kdb__agg_sort_keys[i].ascending) cmp = -cmp; }
+        if (cmp != 0) return cmp;
+    }
+    return 0;
+}
+
+/* $sort: multi-key, in place (unlike $match/$group/$project, this
+ * doesn't need a fresh KdbResult -- qsort reorders cur->rows directly). */
+static void kdb__agg_sort(KdbResult *cur, const char *const *fields, const int *ascending, size_t n_fields) {
+    if (n_fields == 0 || cur->count == 0) return;
+    if (n_fields > KDB_AGG_MAX_SORT_KEYS) n_fields = KDB_AGG_MAX_SORT_KEYS;
+
+    KdbAggSortKey keys[KDB_AGG_MAX_SORT_KEYS];
+    for (size_t i = 0; i < n_fields; i++) { keys[i].field = fields[i]; keys[i].ascending = ascending[i]; }
+    kdb__agg_sort_keys  = keys;
+    kdb__agg_sort_nkeys = n_fields;
+    qsort(cur->rows, cur->count, sizeof(KdbRecord), kdb__agg_row_cmp);
+    kdb__agg_sort_keys  = NULL;
+    kdb__agg_sort_nkeys = 0;
+}
+
+#define KDB_AGG_MAX_GROUPS 512
+
+/* key_refs/min_ref/max_ref point straight into cur's own row data -- cur
+ * stays alive for this whole stage (same "all must stay alive for the
+ * whole call" precedent sql.c's SqlGroupAcc already follows), so no
+ * separate copy/free bookkeeping is needed until the final output rows
+ * are built. Deliberately real-columns-only (see KdbStage's own doc
+ * comment) -- a pseudo-column value has no stable backing storage to
+ * point into across the whole pass, unlike a real field already sitting
+ * in cur->rows[i].fields[]. */
+typedef struct {
+    const KdbValue *key_refs[KDB_AGG_MAX_GROUP_KEYS];
+    double          sum[KDB_AGG_MAX_ACCUMULATORS];
+    int64_t         count_nonnull[KDB_AGG_MAX_ACCUMULATORS];
+    const KdbValue *min_ref[KDB_AGG_MAX_ACCUMULATORS];
+    const KdbValue *max_ref[KDB_AGG_MAX_ACCUMULATORS];
+} KdbAggGroupAcc;
+
+static KdbStatus kdb__agg_group(const KdbResult *cur, const char **group_by,
+                                const KdbAccumulator *accs, size_t n_accs, KdbResult *out) {
+    size_t n_group_by = 0;
+    if (group_by) while (group_by[n_group_by]) n_group_by++;
+    if (n_group_by > KDB_AGG_MAX_GROUP_KEYS) {
+        kdb_set_error(KDB_ERR_BAD_ARG, "$group supports at most %d group-by fields", KDB_AGG_MAX_GROUP_KEYS);
+        return KDB_ERR_BAD_ARG;
+    }
+    if (n_accs > KDB_AGG_MAX_ACCUMULATORS) {
+        kdb_set_error(KDB_ERR_BAD_ARG, "$group supports at most %d accumulators", KDB_AGG_MAX_ACCUMULATORS);
+        return KDB_ERR_BAD_ARG;
+    }
+
+    KdbAggGroupAcc *groups = (KdbAggGroupAcc *)calloc(KDB_AGG_MAX_GROUPS, sizeof(KdbAggGroupAcc));
+    if (!groups) { kdb_err_oom("aggregation groups"); return KDB_ERR_OOM; }
+    size_t ngroups = 0;
+
+    for (size_t r = 0; r < cur->count; r++) {
+        const KdbRecord *row = &cur->rows[r];
+        const KdbValue *key_refs[KDB_AGG_MAX_GROUP_KEYS];
+        for (size_t k = 0; k < n_group_by; k++) {
+            const KdbRecordField *f = kdb_record_get_field(row, group_by[k]);
+            key_refs[k] = f ? &f->value : NULL;
+        }
+
+        size_t gi;
+        if (n_group_by == 0) {
+            gi = 0;
+            if (ngroups == 0) ngroups = 1;
+        } else {
+            int found = 0;
+            for (gi = 0; gi < ngroups; gi++) {
+                int all_match = 1;
+                for (size_t k = 0; k < n_group_by; k++) {
+                    const KdbValue *a = groups[gi].key_refs[k], *b = key_refs[k];
+                    int eq = (!a && !b) || (a && b && kdb_value_compare(a, b) == 0);
+                    if (!eq) { all_match = 0; break; }
+                }
+                if (all_match) { found = 1; break; }
+            }
+            if (!found) {
+                if (ngroups >= KDB_AGG_MAX_GROUPS) {
+                    free(groups);
+                    kdb_set_error(KDB_ERR_FULL, "$group: too many distinct groups (max %d)", KDB_AGG_MAX_GROUPS);
+                    return KDB_ERR_FULL;
+                }
+                gi = ngroups++;
+                for (size_t k = 0; k < n_group_by; k++) groups[gi].key_refs[k] = key_refs[k];
+            }
+        }
+
+        for (size_t a = 0; a < n_accs; a++) {
+            const KdbAccumulator *acc = &accs[a];
+            if (acc->type == KDB_ACC_COUNT) {
+                if (!acc->source_field) { groups[gi].count_nonnull[a]++; continue; }
+                const KdbRecordField *f = kdb_record_get_field(row, acc->source_field);
+                if (f && f->value.type != KDB_TYPE_NULL) groups[gi].count_nonnull[a]++;
+                continue;
+            }
+            const KdbRecordField *f = kdb_record_get_field(row, acc->source_field);
+            if (!f || f->value.type == KDB_TYPE_NULL) continue;
+            switch (acc->type) {
+                case KDB_ACC_SUM:
+                case KDB_ACC_AVG: {
+                    double v;
+                    if (kdb__agg_value_to_double(&f->value, &v)) { groups[gi].sum[a] += v; groups[gi].count_nonnull[a]++; }
+                    break;
+                }
+                case KDB_ACC_MIN:
+                    if (!groups[gi].min_ref[a] || kdb_value_compare(&f->value, groups[gi].min_ref[a]) < 0) groups[gi].min_ref[a] = &f->value;
+                    break;
+                case KDB_ACC_MAX:
+                    if (!groups[gi].max_ref[a] || kdb_value_compare(&f->value, groups[gi].max_ref[a]) > 0) groups[gi].max_ref[a] = &f->value;
+                    break;
+                default: break;
+            }
+        }
+    }
+    if (n_group_by == 0 && ngroups == 0) ngroups = 1; /* no rows: still emit one summary group, same as SQL's GROUP BY-less aggregate */
+
+    KdbStatus st = kdb_result_init(out, ngroups);
+    if (st != KDB_OK) { free(groups); return st; }
+
+    for (size_t gi = 0; gi < ngroups && st == KDB_OK; gi++) {
+        KdbRecord orow;
+        memset(&orow, 0, sizeof(orow));
+        uint32_t nfields = (uint32_t)(n_group_by + n_accs);
+        orow.fields = (KdbRecordField *)calloc(nfields ? nfields : 1, sizeof(KdbRecordField));
+        if (!orow.fields) { st = KDB_ERR_OOM; kdb_err_oom("group output fields"); break; }
+
+        uint32_t fi = 0;
+        int ok = 1;
+        for (size_t k = 0; k < n_group_by && ok; k++) {
+            KDB_STRLCPY(orow.fields[fi].col_name, group_by[k], KDB_MAX_NAME_LEN);
+            if (groups[gi].key_refs[k]) { if (kdb_value_copy(groups[gi].key_refs[k], &orow.fields[fi].value) != KDB_OK) ok = 0; }
+            else orow.fields[fi].value.type = KDB_TYPE_NULL;
+            fi++;
+        }
+        for (size_t a = 0; a < n_accs && ok; a++) {
+            KDB_STRLCPY(orow.fields[fi].col_name, accs[a].output_name, KDB_MAX_NAME_LEN);
+            KdbValue *ov = &orow.fields[fi].value;
+            switch (accs[a].type) {
+                case KDB_ACC_COUNT: ov->type = KDB_TYPE_INT;   ov->v.as_int   = groups[gi].count_nonnull[a]; break;
+                case KDB_ACC_SUM:   ov->type = KDB_TYPE_FLOAT; ov->v.as_float = groups[gi].sum[a];           break;
+                case KDB_ACC_AVG:
+                    ov->type = KDB_TYPE_FLOAT;
+                    ov->v.as_float = groups[gi].count_nonnull[a] > 0 ? groups[gi].sum[a] / (double)groups[gi].count_nonnull[a] : 0.0;
+                    break;
+                case KDB_ACC_MIN:
+                    if (groups[gi].min_ref[a]) { if (kdb_value_copy(groups[gi].min_ref[a], ov) != KDB_OK) ok = 0; }
+                    else ov->type = KDB_TYPE_NULL;
+                    break;
+                case KDB_ACC_MAX:
+                    if (groups[gi].max_ref[a]) { if (kdb_value_copy(groups[gi].max_ref[a], ov) != KDB_OK) ok = 0; }
+                    else ov->type = KDB_TYPE_NULL;
+                    break;
+            }
+            fi++;
+        }
+        orow.field_count = fi;
+        st = ok ? kdb_result_append(out, &orow) : KDB_ERR_OOM;
+        for (uint32_t k = 0; k < orow.field_count; k++) kdb_value_free(&orow.fields[k].value);
+        free(orow.fields);
+    }
+
+    free(groups);
+    if (st != KDB_OK) kdb_result_free(out);
+    return st;
+}
+
+/* $project: keep only the named fields, in that order -- id/created_at/
+ * updated_at work here (unlike $group's keys/$sort's fields) since the
+ * pseudo-value is copied straight into the output row instead of being
+ * held onto across a whole stage. A missing field is silently skipped,
+ * same "soft" convention SELECT-item projection elsewhere in this engine
+ * already follows. */
+static KdbStatus kdb__agg_project(const KdbResult *cur, const char **fields, KdbResult *out) {
+    size_t n_fields = 0;
+    if (fields) while (fields[n_fields]) n_fields++;
+
+    KdbStatus st = kdb_result_init(out, cur->count > 0 ? cur->count : 1);
+    if (st != KDB_OK) return st;
+
+    for (size_t r = 0; r < cur->count && st == KDB_OK; r++) {
+        KdbRecord orow;
+        memset(&orow, 0, sizeof(orow));
+        orow.id         = cur->rows[r].id;
+        orow.created_at = cur->rows[r].created_at;
+        orow.updated_at = cur->rows[r].updated_at;
+        orow.fields = (KdbRecordField *)calloc(n_fields ? n_fields : 1, sizeof(KdbRecordField));
+        if (!orow.fields) { st = KDB_ERR_OOM; kdb_err_oom("project output fields"); break; }
+
+        uint32_t fi = 0;
+        int ok = 1;
+        for (size_t k = 0; k < n_fields && ok; k++) {
+            KdbValue pseudo;
+            const KdbValue *val = NULL;
+            if (kdb__pseudo_column_value(&cur->rows[r], fields[k], &pseudo)) val = &pseudo;
+            else { const KdbRecordField *f = kdb_record_get_field(&cur->rows[r], fields[k]); if (f) val = &f->value; }
+            if (!val) continue;
+
+            KDB_STRLCPY(orow.fields[fi].col_name, fields[k], KDB_MAX_NAME_LEN);
+            if (kdb_value_copy(val, &orow.fields[fi].value) != KDB_OK) { ok = 0; break; }
+            fi++;
+        }
+        orow.field_count = fi;
+        st = ok ? kdb_result_append(out, &orow) : KDB_ERR_OOM;
+        for (uint32_t k = 0; k < orow.field_count; k++) kdb_value_free(&orow.fields[k].value);
+        free(orow.fields);
+    }
+
+    if (st != KDB_OK) kdb_result_free(out);
+    return st;
+}
+
+KdbStatus kdb_aggregate(KumDB *db, const char *table_name,
+                        const KdbStage *stages, size_t n_stages, KdbRows **rows_out) {
+    if (!db || !table_name || !rows_out || (n_stages > 0 && !stages)) {
+        kdb_err_null_arg("db/table_name/stages/rows_out", "kdb_aggregate");
+        return KDB_ERR_BAD_ARG;
+    }
+    *rows_out = NULL;
+
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+
+    KdbQuery empty_q;
+    kdb_query_init(&empty_q);
+    KdbResult cur;
+    KdbStatus st = kdb_query_execute(tbl, &empty_q, &cur);
+    kdb_query_free(&empty_q);
+    if (st != KDB_OK) return st;
+
+    for (size_t i = 0; i < n_stages && st == KDB_OK; i++) {
+        const KdbStage *stage = &stages[i];
+        switch (stage->type) {
+            case KDB_STAGE_MATCH: {
+                KdbResult next;
+                st = kdb__agg_match(&cur, stage->as.match_filters, &next);
+                if (st == KDB_OK) { kdb_result_free(&cur); cur = next; }
+                break;
+            }
+            case KDB_STAGE_GROUP: {
+                KdbResult next;
+                st = kdb__agg_group(&cur, stage->as.group.group_by,
+                                    stage->as.group.accumulators, stage->as.group.n_accumulators, &next);
+                if (st == KDB_OK) { kdb_result_free(&cur); cur = next; }
+                break;
+            }
+            case KDB_STAGE_SORT:
+                kdb__agg_sort(&cur, stage->as.sort.fields, stage->as.sort.ascending, stage->as.sort.n_fields);
+                break;
+            case KDB_STAGE_LIMIT:
+                kdb_result_limit(&cur, stage->as.limit);
+                break;
+            case KDB_STAGE_SKIP:
+                kdb_result_offset(&cur, stage->as.skip);
+                break;
+            case KDB_STAGE_PROJECT: {
+                KdbResult next;
+                st = kdb__agg_project(&cur, stage->as.project_fields, &next);
+                if (st == KDB_OK) { kdb_result_free(&cur); cur = next; }
+                break;
+            }
+        }
+    }
+    if (st != KDB_OK) { kdb_result_free(&cur); return st; }
+
+    *rows_out = kdb__result_to_rows(&cur);
+    return *rows_out ? KDB_OK : kdb_last_status();
+}
+
 KdbRow *kdb_find_one(KumDB *db, const char *table_name, const char **filters) {
     if (!db || !table_name) {
         kdb_err_null_arg("db/table_name", "kdb_find_one");
