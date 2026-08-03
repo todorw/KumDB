@@ -503,21 +503,28 @@ COLUMN` column definition only ever takes effect at that column's
 creation moment; these two work on a column that's already there,
 rebuilding the index from every existing row (`CREATE INDEX`) or just
 removing it (`DROP INDEX`, leaving the column and its data untouched).
-The index name is accepted and ignored if you give one — KumDB's indexes
-aren't named, only per-column. Naming more than one column creates that
-many independent single-column indexes, **not** one combined-key
-composite index — there's no multi-column index in the storage layer to
-build one from, so this is an honest per-column generalization rather
-than a real composite index wearing the syntax:
+The index name is accepted and ignored if you give one — KumDB finds an
+index again by its column set, not a name. One column creates an
+ordinary single-column index; two or more create one **real composite
+(multi-column) index** — a single column-value tuple hashed together,
+not that many independent single-column indexes — capped at 4 columns
+per composite index and 4 composite indexes per table:
 
 ```sql
 CREATE INDEX ON employees (department)
-CREATE INDEX ON employees (department, role)  -- two independent indexes, not one composite key
-DROP INDEX ON employees (department)
+CREATE INDEX ON employees (department, role)  -- one composite index over both columns together
+DROP INDEX ON employees (department, role)     -- column order doesn't matter for finding it again
 ```
 
-Indexing an already-indexed column, or dropping an index from a column
-that doesn't have one, both error rather than silently no-opping.
+A query naming every column of a composite index with `=`/`AND` (in any
+order) can use it to skip a full table scan, same as a single-column
+index does for one column. Indexing an already-indexed column (or an
+identical composite column set), or dropping an index that isn't there,
+both error rather than silently no-opping. A composite index is purely
+a lookup accelerator, same as a single-column one — it doesn't imply or
+enforce uniqueness across the combined columns (that's what a `UNIQUE`
+column, or several, is for; the two features are independent of each
+other).
 
 **`ALTER TABLE t RENAME COLUMN col TO new_col`** renames a column —
 schema, its index if it has one, and every existing row's field, so it's

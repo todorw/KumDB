@@ -26,9 +26,9 @@ KdbStatus kdb_table_open(KdbTable   *tbl,
     KdbStatus st = kdb_storage_open(tbl, data_dir, table_name);
     if (st != KDB_OK) return st;
 
-    
+
     if (tbl->header.column_count > 0) {
-        KdbIndex *idx_arr[KDB_MAX_COLUMNS];
+        KdbIndex *idx_arr[KDB_MAX_COLUMNS + KDB_MAX_COMPOSITE_INDEXES];
         memset(idx_arr, 0, sizeof(idx_arr));
         uint32_t idx_count = 0;
 
@@ -36,6 +36,16 @@ KdbStatus kdb_table_open(KdbTable   *tbl,
                                        tbl->header.column_count,
                                        idx_arr, &idx_count);
         if (st != KDB_OK) {
+            kdb_storage_close(tbl);
+            return st;
+        }
+
+        st = kdb_index_build_composite_for_table(tbl->header.columns,
+                                                 tbl->header.composite_indexes,
+                                                 tbl->header.n_composite_indexes,
+                                                 idx_arr, &idx_count);
+        if (st != KDB_OK) {
+            for (uint32_t i = 0; i < idx_count; i++) kdb_index_free(idx_arr[i]);
             kdb_storage_close(tbl);
             return st;
         }
@@ -268,6 +278,106 @@ KdbStatus kdb_table_drop_index(KdbTable *tbl, const char *col_name) {
     }
 
     col->indexed = 0;
+    tbl->dirty = 1;
+    return kdb_storage_flush_header(tbl);
+}
+
+/* A real composite (multi-column) index -- one KdbIndex hashing all
+ * n_cols columns' values together, not n_cols independent single-column
+ * indexes. col_names order matters for how the index itself hashes, but
+ * not for finding/dropping it again later (kdb_index_find_composite/this
+ * function's own drop counterpart match by column SET, not order). */
+KdbStatus kdb_table_create_composite_index(KdbTable *tbl, const char **col_names, uint32_t n_cols) {
+    if (!tbl || !col_names || n_cols < 2 || n_cols > KDB_MAX_COMPOSITE_COLS) {
+        kdb_err_bad_arg("col_names/n_cols", "kdb_table_create_composite_index needs 2..KDB_MAX_COMPOSITE_COLS columns");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (tbl->header.n_composite_indexes >= KDB_MAX_COMPOSITE_INDEXES) {
+        kdb_set_error(KDB_ERR_FULL, "table '%s' already has the max %d composite indexes", tbl->name, KDB_MAX_COMPOSITE_INDEXES);
+        return KDB_ERR_FULL;
+    }
+
+    uint8_t positions[KDB_MAX_COMPOSITE_COLS];
+    for (uint32_t i = 0; i < n_cols; i++) {
+        const KdbColumn *c = kdb_table_get_column(tbl, col_names[i]);
+        if (!c) {
+            kdb_err_field_not_found(col_names[i], tbl->name);
+            return KDB_ERR_NOT_FOUND;
+        }
+        positions[i] = (uint8_t)(c - tbl->header.columns);
+    }
+
+    if (kdb_index_find_composite(tbl->indices, tbl->index_count, col_names, n_cols)) {
+        kdb_set_error(KDB_ERR_EXISTS, "a composite index on exactly these columns already exists on table '%s'", tbl->name);
+        return KDB_ERR_EXISTS;
+    }
+
+    KdbIndex *idx = kdb_index_new_composite(col_names, n_cols);
+    if (!idx) return KDB_ERR_OOM;
+    KdbIndex **new_indices = realloc(tbl->indices, (tbl->index_count + 1) * sizeof(KdbIndex *));
+    if (!new_indices) {
+        kdb_index_free(idx);
+        kdb_err_oom("index array grow");
+        return KDB_ERR_OOM;
+    }
+    new_indices[tbl->index_count] = idx;
+    tbl->indices = new_indices;
+    tbl->index_count++;
+    kdb_index_rebuild(idx, tbl);
+
+    KdbCompositeIndexDef *def = &tbl->header.composite_indexes[tbl->header.n_composite_indexes];
+    memset(def, 0, sizeof(*def));
+    for (uint32_t i = 0; i < n_cols; i++) def->col_positions[i] = positions[i];
+    def->n_cols = (uint8_t)n_cols;
+    tbl->header.n_composite_indexes++;
+
+    tbl->dirty = 1;
+    return kdb_storage_flush_header(tbl);
+}
+
+KdbStatus kdb_table_drop_composite_index(KdbTable *tbl, const char **col_names, uint32_t n_cols) {
+    if (!tbl || !col_names || n_cols == 0) {
+        kdb_err_null_arg("tbl/col_names", "kdb_table_drop_composite_index");
+        return KDB_ERR_BAD_ARG;
+    }
+
+    KdbIndex *idx = kdb_index_find_composite(tbl->indices, tbl->index_count, col_names, n_cols);
+    if (!idx) {
+        kdb_set_error(KDB_ERR_NOT_FOUND, "no composite index on exactly these columns exists on table '%s'", tbl->name);
+        return KDB_ERR_NOT_FOUND;
+    }
+
+    uint8_t positions[KDB_MAX_COMPOSITE_COLS];
+    for (uint32_t i = 0; i < n_cols; i++) {
+        const KdbColumn *c = kdb_table_get_column(tbl, col_names[i]);
+        positions[i] = c ? (uint8_t)(c - tbl->header.columns) : 0xFF;
+    }
+    for (uint8_t d = 0; d < tbl->header.n_composite_indexes; d++) {
+        KdbCompositeIndexDef *def = &tbl->header.composite_indexes[d];
+        if (def->n_cols != n_cols) continue;
+        int all_match = 1;
+        for (uint32_t i = 0; i < n_cols && all_match; i++) {
+            int found = 0;
+            for (uint32_t k = 0; k < def->n_cols; k++) if (def->col_positions[k] == positions[i]) { found = 1; break; }
+            if (!found) all_match = 0;
+        }
+        if (all_match) {
+            memmove(def, def + 1, (size_t)(tbl->header.n_composite_indexes - d - 1) * sizeof(*def));
+            memset(&tbl->header.composite_indexes[tbl->header.n_composite_indexes - 1], 0, sizeof(*def));
+            tbl->header.n_composite_indexes--;
+            break;
+        }
+    }
+
+    for (uint32_t i = 0; i < tbl->index_count; i++) {
+        if (tbl->indices[i] == idx) {
+            kdb_index_free(idx);
+            memmove(&tbl->indices[i], &tbl->indices[i + 1], (tbl->index_count - i - 1) * sizeof(KdbIndex *));
+            tbl->index_count--;
+            break;
+        }
+    }
+
     tbl->dirty = 1;
     return kdb_storage_flush_header(tbl);
 }

@@ -42,6 +42,19 @@ KdbStatus kdb_table_create_index(KdbTable *tbl, const char *col_name);
  * indexed). The column and its data are untouched -- only the index. */
 KdbStatus kdb_table_drop_index(KdbTable *tbl, const char *col_name);
 
+/* A real composite (multi-column) index -- one index hashing all n_cols
+ * columns' values together (n_cols must be 2..KDB_MAX_COMPOSITE_COLS),
+ * not n_cols independent single-column indexes. KDB_ERR_EXISTS if a
+ * composite index on exactly this column set (any order) already exists;
+ * KDB_ERR_FULL if the table already has KDB_MAX_COMPOSITE_INDEXES of
+ * them. Rebuilds from every row already in the table before returning. */
+KdbStatus kdb_table_create_composite_index(KdbTable *tbl, const char **col_names, uint32_t n_cols);
+
+/* Drops a composite index matching exactly this column set (any order) --
+ * KDB_ERR_NOT_FOUND if none does. The columns and their data are
+ * untouched -- only the index. */
+KdbStatus kdb_table_drop_composite_index(KdbTable *tbl, const char **col_names, uint32_t n_cols);
+
 /* Renames a column: schema, its index (if any), and every row's field
  * name for it -- the last part is a full table rewrite, same cost as
  * kdb_table_drop_column/kdb_compact. KDB_ERR_EXISTS if new_name is

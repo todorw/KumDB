@@ -381,7 +381,52 @@ KdbStatus kdb_query_execute(KdbTable       *tbl,
     KdbStatus st = kdb_result_init(res_out, 16);
     if (st != KDB_OK) return st;
 
-    
+    /* A single AND-group of N>=2 pure-equality filters whose column set
+     * exactly matches a real composite index -- reorder the filter values
+     * to the index's own fixed column order (the WHERE clause's own order
+     * doesn't have to match it) before hashing, same acceleration idea as
+     * the single-column case just below, extended to N columns. */
+    if (q->group_count == 1 && q->groups[0].count >= 2 &&
+        q->groups[0].count <= KDB_MAX_COMPOSITE_COLS && tbl->index_count > 0) {
+        const KdbFilterGroup *g = &q->groups[0];
+        int all_eq = 1;
+        const char *col_names[KDB_MAX_COMPOSITE_COLS];
+        for (uint32_t i = 0; i < g->count; i++) {
+            if (g->filters[i].op != KDB_OP_EQ) { all_eq = 0; break; }
+            col_names[i] = g->filters[i].col_name;
+        }
+        KdbIndex *cidx = all_eq ? kdb_index_find_composite(tbl->indices, tbl->index_count, col_names, g->count) : NULL;
+        if (cidx) {
+            const char *idx_cols[KDB_MAX_COMPOSITE_COLS];
+            idx_cols[0] = cidx->col_name;
+            for (uint32_t e = 0; e < cidx->n_extra_cols; e++) idx_cols[e + 1] = cidx->extra_cols[e];
+            uint32_t n_idx_cols = cidx->n_extra_cols + 1;
+
+            KdbValue vals[KDB_MAX_COMPOSITE_COLS];
+            int reordered_ok = 1;
+            for (uint32_t k = 0; k < n_idx_cols && reordered_ok; k++) {
+                reordered_ok = 0;
+                for (uint32_t i = 0; i < g->count; i++) {
+                    if (strcmp(g->filters[i].col_name, idx_cols[k]) == 0) { vals[k] = g->filters[i].value; reordered_ok = 1; break; }
+                }
+            }
+            if (reordered_ok) {
+                uint64_t offsets[KDB_INDEX_BUCKETS];
+                size_t   found = 0;
+                KdbStatus ist = kdb_index_lookup_multi(cidx, vals, n_idx_cols, offsets, KDB_INDEX_BUCKETS, &found);
+                if (ist == KDB_OK) {
+                    for (size_t i = 0; i < found; i++) {
+                        KdbRecord *r = kdb_storage_read_at(tbl, offsets[i]);
+                        if (!r) continue;
+                        if (kdb_query_matches(q, r))
+                            kdb_result_append(res_out, r);
+                        kdb_record_free(r);
+                    }
+                    return KDB_OK;
+                }
+            }
+        }
+    }
 
     if (q->group_count == 1 && q->groups[0].count == 1 &&
         q->groups[0].filters[0].op == KDB_OP_EQ && tbl->index_count > 0) {

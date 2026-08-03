@@ -349,16 +349,23 @@ extern "C" {
  * field from every row, same cost as kdb_compact().
  *
  * CREATE INDEX [name] ON t (cols)/DROP INDEX [name] ON t (cols) index or
- * un-index a column *after* the table already exists -- unlike INDEX/
- * UNIQUE/PRIMARY KEY on a column definition, which only ever takes effect
- * at that column's creation moment. CREATE INDEX rebuilds from every
- * existing row; DROP INDEX just removes it, leaving the column and its
- * data untouched. The name, if given, is accepted and ignored -- KumDB's
- * indexes aren't named, only per-column. Naming more than one column
- * creates that many independent single-column indexes, not one
- * combined-key composite index -- there's no multi-column index in the
- * storage layer to build one from. Indexing an already-indexed column, or
- * dropping an index that isn't there, both error.
+ * un-index a column (or columns) *after* the table already exists --
+ * unlike INDEX/UNIQUE/PRIMARY KEY on a column definition, which only ever
+ * takes effect at that column's creation moment. CREATE INDEX rebuilds
+ * from every existing row; DROP INDEX just removes it, leaving the
+ * columns and their data untouched. The name, if given, is accepted and
+ * ignored -- KumDB finds an index again by its column set, not a name.
+ * One column creates an ordinary single-column index; two or more create
+ * one real composite (multi-column) index -- a single column-value tuple
+ * hashed together, not that many independent single-column indexes --
+ * capped at KDB_MAX_COMPOSITE_COLS columns and KDB_MAX_COMPOSITE_INDEXES
+ * per table. A query naming every column of a composite index with =/AND
+ * (any order) can use it instead of a full scan, same as a single-column
+ * index does for one column. Indexing an already-indexed column (or an
+ * identical composite column set), or dropping an index that isn't
+ * there, both error. A composite index doesn't imply or enforce
+ * uniqueness across the combined columns -- that's UNIQUE's job, and the
+ * two features are independent of each other.
  *
  * ALTER TABLE t RENAME COLUMN col TO new_col renames a column -- schema,
  * its index if any, and every existing row's field, a full table

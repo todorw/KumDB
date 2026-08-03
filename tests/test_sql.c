@@ -2241,8 +2241,12 @@ static void test_create_drop_index(void) {
     /* an index name is accepted and ignored -- KumDB's indexes aren't named */
     ASSERT_OK(sql(db, "CREATE INDEX idx_name ON t (name)"));
 
-    /* a multi-column CREATE INDEX creates independent single-column
-     * indexes, not one combined-key composite index */
+    /* a multi-column CREATE INDEX creates one real composite (multi-
+     * column) index -- a single column-value tuple hashed together, not
+     * independent single-column indexes (see test_composite_indexes for
+     * thorough coverage of that). Single-column queries against a and b
+     * still work correctly here (via the unindexed full-scan fallback,
+     * since neither column has its own single-column index anymore). */
     ASSERT_OK(sql(db, "CREATE TABLE t2 (a TEXT, b TEXT)"));
     ASSERT_OK(sql(db, "CREATE INDEX ON t2 (a, b)"));
     ASSERT_OK(sql(db, "INSERT INTO t2 (a, b) VALUES ('x', 'y')"));
@@ -2250,6 +2254,9 @@ static void test_create_drop_index(void) {
     ASSERT(rows && rows->count == 1u);
     if (rows) { kdb_rows_free(rows); rows = NULL; }
     ASSERT_OK(kdb_exec_sql(db, "SELECT b FROM t2 WHERE b = 'y'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+    ASSERT_OK(kdb_exec_sql(db, "SELECT a FROM t2 WHERE a = 'x' AND b = 'y'", &rows, NULL));
     ASSERT(rows && rows->count == 1u);
     if (rows) { kdb_rows_free(rows); rows = NULL; }
 
@@ -2266,6 +2273,81 @@ static void test_create_drop_index(void) {
 
     /* dropping an index that isn't there is rejected */
     ASSERT_ERR(sql(db, "DROP INDEX ON t (dept)"));
+
+    teardown(db);
+}
+
+static void test_composite_indexes(void) {
+    KumDB *db;
+    setup(&db);
+
+    ASSERT_OK(sql(db, "CREATE TABLE orders (region TEXT, product TEXT, qty INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO orders (region, product, qty) VALUES ('east', 'widget', 10)"));
+    ASSERT_OK(sql(db, "INSERT INTO orders (region, product, qty) VALUES ('east', 'gadget', 20)"));
+    ASSERT_OK(sql(db, "INSERT INTO orders (region, product, qty) VALUES ('west', 'widget', 30)"));
+    ASSERT_OK(sql(db, "CREATE INDEX ON orders (region, product)"));
+
+    KdbRows *rows = NULL;
+
+    /* a query naming both columns finds exactly the one matching row --
+     * whether or not this actually went through the composite index (vs.
+     * a full scan) is an internal detail; either way must be correct */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT qty FROM orders WHERE region = 'east' AND product = 'widget'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows && rows->count == 1) {
+        int64_t qty = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "qty", &qty));
+        ASSERT_EQ(qty, 10);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* a real composite index, not two independent single-column ones --
+     * a duplicate CREATE INDEX naming the same columns (in either order)
+     * is rejected as already existing */
+    ASSERT_ERR(sql(db, "CREATE INDEX ON orders (region, product)"));
+    ASSERT_ERR(sql(db, "CREATE INDEX ON orders (product, region)"));
+
+    /* rows inserted after the index exists are picked up too */
+    ASSERT_OK(sql(db, "INSERT INTO orders (region, product, qty) VALUES ('east', 'widget', 99)"));
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT qty FROM orders WHERE region = 'east' AND product = 'widget' ORDER BY qty ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* DROP INDEX works with the columns named in any order */
+    ASSERT_OK(sql(db, "DROP INDEX ON orders (product, region)"));
+    ASSERT_ERR(sql(db, "DROP INDEX ON orders (region, product)")); /* already gone */
+    /* still correct without the index */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT qty FROM orders WHERE region = 'east' AND product = 'widget'", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* the composite definition survives a close/reopen -- recreate it,
+     * reopen on the SAME directory (not teardown()/setup(), which would
+     * wipe it), and confirm CREATE INDEX on the same columns is still
+     * rejected as already existing (only possible if it persisted) */
+    ASSERT_OK(sql(db, "CREATE INDEX ON orders (region, product)"));
+    kdb_close(db);
+    db = kdb_open(TEST_DIR);
+    ASSERT(db != NULL);
+    ASSERT_ERR(sql(db, "CREATE INDEX ON orders (region, product)"));
+
+    /* 3-column composite index */
+    ASSERT_OK(sql(db, "CREATE TABLE t3 (a INT, b INT, c INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t3 (a, b, c) VALUES (1, 2, 3)"));
+    ASSERT_OK(sql(db, "INSERT INTO t3 (a, b, c) VALUES (1, 2, 4)"));
+    ASSERT_OK(sql(db, "CREATE INDEX ON t3 (a, b, c)"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT c FROM t3 WHERE a = 1 AND b = 2 AND c = 3", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* indexing isn't a uniqueness constraint -- a composite index alone
+     * still allows a duplicate full-key row */
+    ASSERT_OK(sql(db, "INSERT INTO t3 (a, b, c) VALUES (1, 2, 3)"));
+
+    /* error paths */
+    ASSERT_ERR(sql(db, "CREATE INDEX ON orders (region, product, qty, region, product)")); /* too many columns */
+    ASSERT_ERR(sql(db, "CREATE INDEX ON orders (region, nonexistent)"));
 
     teardown(db);
 }
@@ -3419,6 +3501,7 @@ int main(void) {
     test_alter_table();
     test_unique_not_null_constraints();
     test_create_drop_index();
+    test_composite_indexes();
     test_alter_table_rename();
     test_nested_values_through_sql();
     test_reserved_columns_skipped();

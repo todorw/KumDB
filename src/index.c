@@ -8,11 +8,12 @@
 #include "../include/types.h"
 
 
-uint32_t kdb_index_hash(const KdbValue *v) {
-    if (!v) return 0;
-
-    uint32_t hash = 2166136261u; 
-#define FNV_MIX(byte) hash ^= (uint8_t)(byte); hash *= 16777619u
+/* Mixes one value's bytes into *hash (FNV-1a-style) -- shared by
+ * kdb_index_hash_multi so a single-value hash and a composite hash use
+ * exactly the same per-value mixing, just continued across more than one
+ * value for a composite index. */
+static void kdb__index_hash_mix(uint32_t *hash, const KdbValue *v) {
+#define FNV_MIX(byte) *hash ^= (uint8_t)(byte); *hash *= 16777619u
 
     switch (v->type) {
         case KDB_TYPE_INT: {
@@ -47,8 +48,17 @@ uint32_t kdb_index_hash(const KdbValue *v) {
             break;
     }
 #undef FNV_MIX
+}
 
+uint32_t kdb_index_hash_multi(const KdbValue *values, size_t n) {
+    if (!values || n == 0) return 0; /* same "nothing to hash" convention kdb_index_hash always had */
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < n; i++) kdb__index_hash_mix(&hash, &values[i]);
     return hash % KDB_INDEX_BUCKETS;
+}
+
+uint32_t kdb_index_hash(const KdbValue *v) {
+    return kdb_index_hash_multi(v, v ? 1 : 0);
 }
 
 
@@ -57,7 +67,21 @@ KdbIndex *kdb_index_new(const char *col_name) {
     if (!idx) { kdb_err_oom("KdbIndex"); return NULL; }
     if (col_name)
         KDB_STRLCPY(idx->col_name, col_name, KDB_MAX_NAME_LEN);
-    
+
+    return idx;
+}
+
+KdbIndex *kdb_index_new_composite(const char **col_names, uint32_t n_cols) {
+    if (!col_names || n_cols == 0 || n_cols > KDB_MAX_COMPOSITE_COLS) {
+        kdb_err_bad_arg("col_names/n_cols", "kdb_index_new_composite needs 1..KDB_MAX_COMPOSITE_COLS columns");
+        return NULL;
+    }
+    KdbIndex *idx = kdb_index_new(col_names[0]);
+    if (!idx) return NULL;
+    for (uint32_t i = 1; i < n_cols; i++) {
+        KDB_STRLCPY(idx->extra_cols[i - 1], col_names[i], KDB_MAX_NAME_LEN);
+    }
+    idx->n_extra_cols = n_cols - 1;
     return idx;
 }
 
@@ -91,11 +115,22 @@ KdbStatus kdb_index_insert(KdbIndex       *idx,
         return KDB_ERR_BAD_ARG;
     }
 
-    
+    /* gather every column this index covers -- col_name plus, for a
+     * composite index, extra_cols in order. A record missing any one of
+     * them isn't indexed at all (same "missing = no entry" convention the
+     * single-column case always had), not partially indexed on whatever
+     * it does have. */
+    KdbValue vals[KDB_MAX_COMPOSITE_COLS];
     const KdbRecordField *f = kdb_record_get_field(r, idx->col_name);
-    if (!f) return KDB_OK; 
+    if (!f) return KDB_OK;
+    vals[0] = f->value;
+    for (uint32_t i = 0; i < idx->n_extra_cols; i++) {
+        const KdbRecordField *ef = kdb_record_get_field(r, idx->extra_cols[i]);
+        if (!ef) return KDB_OK;
+        vals[i + 1] = ef->value;
+    }
 
-    uint32_t bucket = kdb_index_hash(&f->value);
+    uint32_t bucket = kdb_index_hash_multi(vals, (size_t)idx->n_extra_cols + 1);
 
     KdbIndexNode *node = (KdbIndexNode *)calloc(1, sizeof(KdbIndexNode));
     if (!node) { kdb_err_oom("KdbIndexNode"); return KDB_ERR_OOM; }
@@ -181,23 +216,22 @@ KdbStatus kdb_index_rebuild(KdbIndex *idx, KdbTable *tbl) {
 }
 
 
-KdbStatus kdb_index_lookup(const KdbIndex *idx,
-                           const KdbValue *value,
-                           uint64_t       *file_offsets_out,
-                           size_t          max_results,
-                           size_t         *count_out) {
-    if (!idx || !value || !file_offsets_out || !count_out) {
-        kdb_err_null_arg("idx/value/file_offsets_out/count_out", "kdb_index_lookup");
+KdbStatus kdb_index_lookup_multi(const KdbIndex *idx,
+                                 const KdbValue *values,
+                                 size_t          n,
+                                 uint64_t       *file_offsets_out,
+                                 size_t          max_results,
+                                 size_t         *count_out) {
+    if (!idx || !values || n == 0 || !file_offsets_out || !count_out) {
+        kdb_err_null_arg("idx/values/file_offsets_out/count_out", "kdb_index_lookup_multi");
         return KDB_ERR_BAD_ARG;
     }
 
     *count_out = 0;
-    uint32_t bucket = kdb_index_hash(value);
+    uint32_t bucket = kdb_index_hash_multi(values, n);
 
     const KdbIndexNode *node = idx->buckets[bucket];
     while (node && *count_out < max_results) {
-        
-
         file_offsets_out[(*count_out)++] = node->file_offset;
         node = node->next;
     }
@@ -208,6 +242,15 @@ KdbStatus kdb_index_lookup(const KdbIndex *idx,
         return KDB_ERR_NOT_FOUND;
     }
     return KDB_OK;
+}
+
+KdbStatus kdb_index_lookup(const KdbIndex *idx,
+                           const KdbValue *value,
+                           uint64_t       *file_offsets_out,
+                           size_t          max_results,
+                           size_t         *count_out) {
+    if (!value) { kdb_err_null_arg("value", "kdb_index_lookup"); return KDB_ERR_BAD_ARG; }
+    return kdb_index_lookup_multi(idx, value, 1, file_offsets_out, max_results, count_out);
 }
 
 uint64_t kdb_index_lookup_one(const KdbIndex *idx, const KdbValue *value) {
@@ -238,13 +281,57 @@ KdbStatus kdb_index_build_for_table(const KdbColumn *columns,
     return KDB_OK;
 }
 
+KdbStatus kdb_index_build_composite_for_table(const KdbColumn             *columns,
+                                              const KdbCompositeIndexDef *defs,
+                                              uint8_t                     n_defs,
+                                              KdbIndex                  **indices_out,
+                                              uint32_t                   *count_out) {
+    if (!columns || !indices_out || !count_out) {
+        kdb_err_null_arg("columns/indices_out/count_out", "kdb_index_build_composite_for_table");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (!defs) return KDB_OK; /* nothing to build */
+
+    for (uint8_t d = 0; d < n_defs; d++) {
+        if (defs[d].n_cols == 0) continue; /* unused slot */
+        const char *names[KDB_MAX_COMPOSITE_COLS];
+        for (uint8_t c = 0; c < defs[d].n_cols; c++) names[c] = columns[defs[d].col_positions[c]].name;
+        KdbIndex *idx = kdb_index_new_composite(names, defs[d].n_cols);
+        if (!idx) return KDB_ERR_OOM;
+        indices_out[(*count_out)++] = idx;
+    }
+    return KDB_OK;
+}
+
 KdbIndex *kdb_index_find(KdbIndex **indices,
                          uint32_t   count,
                          const char *col_name) {
     if (!indices || !col_name) return NULL;
     for (uint32_t i = 0; i < count; i++) {
-        if (indices[i] && strcmp(indices[i]->col_name, col_name) == 0)
+        if (indices[i] && indices[i]->n_extra_cols == 0 && strcmp(indices[i]->col_name, col_name) == 0)
             return indices[i];
+    }
+    return NULL;
+}
+
+KdbIndex *kdb_index_find_composite(KdbIndex   **indices,
+                                   uint32_t     count,
+                                   const char **col_names,
+                                   uint32_t     n_cols) {
+    if (!indices || !col_names || n_cols == 0) return NULL;
+    for (uint32_t i = 0; i < count; i++) {
+        KdbIndex *idx = indices[i];
+        if (!idx || idx->n_extra_cols + 1 != n_cols) continue;
+
+        int all_found = 1;
+        for (uint32_t a = 0; a < n_cols && all_found; a++) {
+            int found = (strcmp(idx->col_name, col_names[a]) == 0);
+            for (uint32_t e = 0; !found && e < idx->n_extra_cols; e++) {
+                if (strcmp(idx->extra_cols[e], col_names[a]) == 0) found = 1;
+            }
+            if (!found) all_found = 0;
+        }
+        if (all_found) return idx;
     }
     return NULL;
 }

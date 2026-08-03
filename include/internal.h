@@ -9,7 +9,7 @@
 
 #define KDB_MAGIC              0x4B554D44
 #define KDB_VERSION_MAJOR      1
-#define KDB_VERSION_MINOR      2
+#define KDB_VERSION_MINOR      3
 #define KDB_VERSION_PATCH      0
 
 #define KDB__STR(x) #x
@@ -29,6 +29,14 @@
 #define KDB_MAX_BATCH_SIZE     65536
 #define KDB_PAGE_SIZE          4096
 #define KDB_INDEX_BUCKETS      1024
+
+/* A real composite (multi-column) index covers at most this many columns,
+ * and a table can have at most this many composite indexes -- small fixed
+ * bounds so the definitions fit in KdbTableHeader's existing reserved
+ * padding (see KdbCompositeIndexDef below) rather than growing the file
+ * format's on-disk layout. */
+#define KDB_MAX_COMPOSITE_COLS    4
+#define KDB_MAX_COMPOSITE_INDEXES 4
 
 /* ARRAY/OBJECT values: bounds so a corrupt/malicious file can't make
  * deserialization recurse or allocate without limit. */
@@ -98,8 +106,17 @@ typedef struct {
 } KdbColumn;
 
 
+/* A real composite (multi-column) index's definition: which columns (by
+ * position in KdbTableHeader.columns[], in the order the index covers
+ * them), stored compactly enough to fit in KdbTableHeader's existing
+ * reserved padding -- see below. n_cols==0 means an unused slot. */
 typedef struct {
-    uint32_t magic;                          
+    uint8_t col_positions[KDB_MAX_COMPOSITE_COLS];
+    uint8_t n_cols;
+} KdbCompositeIndexDef;
+
+typedef struct {
+    uint32_t magic;
     uint8_t  version_major;
     uint8_t  version_minor;
     uint8_t  version_patch;
@@ -107,12 +124,21 @@ typedef struct {
     char     table_name[KDB_MAX_NAME_LEN];
     uint32_t column_count;
     uint64_t record_count;
-    uint64_t next_id;                        
-    uint64_t created_at;                     
+    uint64_t next_id;
+    uint64_t created_at;
     uint64_t updated_at;
-    uint64_t data_offset;                    
-    uint64_t index_offset;                   
-    uint8_t  _pad1[64];                      
+    uint64_t data_offset;
+    uint64_t index_offset;
+    /* Added in file format 1.3 (KDB_VERSION_MINOR) -- takes 21 of the 64
+     * bytes that used to be _pad1[64] in full, so a pre-1.3 file (whose
+     * padding was always zeroed before being written -- see
+     * kdb_storage_create) reads back n_composite_indexes=0, exactly its
+     * real prior behavior (no composite indexes existed yet). Forward-
+     * compatible without a migration step, same reasoning as KdbColumn's
+     * "unique" byte in file format 1.2. */
+    KdbCompositeIndexDef composite_indexes[KDB_MAX_COMPOSITE_INDEXES];
+    uint8_t  n_composite_indexes;
+    uint8_t  _pad1[43];
     KdbColumn columns[KDB_MAX_COLUMNS];
 } KdbTableHeader;
 
@@ -190,7 +216,16 @@ typedef struct KdbIndexNode {
 } KdbIndexNode;
 
 typedef struct {
-    char          col_name[KDB_MAX_NAME_LEN];
+    char          col_name[KDB_MAX_NAME_LEN]; /* first/primary column -- always set, even for a composite index */
+    /* Additional columns for a real composite (multi-column) index --
+     * n_extra_cols==0 means this is an ordinary single-column index
+     * (existing behavior, completely unchanged: every lookup/insert path
+     * that only ever dealt with col_name still works exactly as before).
+     * When n_extra_cols>0, every hash/insert/lookup combines col_name's
+     * value with all of extra_cols's values together (kdb_index_hash_multi)
+     * instead of hashing col_name alone. */
+    char          extra_cols[KDB_MAX_COMPOSITE_COLS - 1][KDB_MAX_NAME_LEN];
+    uint32_t      n_extra_cols;
     KdbIndexNode *buckets[KDB_INDEX_BUCKETS];
 } KdbIndex;
 

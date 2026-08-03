@@ -1437,15 +1437,12 @@ done:
 /* CREATE INDEX [name] ON t (col [, col2, ...]) -- the index name, when
  * given, is accepted and ignored (best-effort SQL DDL compatibility,
  * same as DEFAULT elsewhere in this file): KumDB's indexes aren't named,
- * only per-column. More than one column creates that many independent
- * single-column indexes, not one combined-key composite index -- there's
- * no multi-column index in the storage layer to build (see
- * kdb_table_create_index), so this is an honest generalization rather
- * than pretending a true composite index exists. Each column is indexed
- * one at a time; if a later one fails (already indexed, say), whichever
- * earlier ones already succeeded stay indexed rather than rolling back
- * -- same no-implicit-transaction convention every other multi-step DDL
- * statement in this file follows. */
+ * they're found again later by their column set. Exactly one column
+ * creates an ordinary single-column index; two or more create one real
+ * composite (multi-column) index -- a single column-value tuple hashed
+ * together, not that many independent single-column indexes (see
+ * kdb_table_create_composite_index). Capped at KDB_MAX_COMPOSITE_COLS
+ * columns per composite index. */
 static KdbStatus sql__exec_create_index(SqlParser *p, KumDB *db) {
     if (p->cur.type == SQLTOK_IDENT && !sql__kw_is(&p->cur, "ON")) sql__advance(p); /* optional index name, ignored */
 
@@ -1461,15 +1458,18 @@ static KdbStatus sql__exec_create_index(SqlParser *p, KumDB *db) {
     if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after CREATE INDEX ON %s", table_name);
     sql__advance(p);
 
+    char col_names[KDB_MAX_COMPOSITE_COLS][KDB_SQL_IDENT_BUF];
+    const char *col_ptrs[KDB_MAX_COMPOSITE_COLS];
+    uint32_t n_cols = 0;
     for (;;) {
         const char *cname;
         if (!sql__ident_text(&p->cur, &cname)) return sql__err("expected a column name in CREATE INDEX's column list");
-        char col_name[KDB_SQL_IDENT_BUF];
-        snprintf(col_name, sizeof(col_name), "%.255s", cname);
+        if (n_cols >= KDB_MAX_COMPOSITE_COLS)
+            return sql__err("too many columns in one CREATE INDEX (max %d)", KDB_MAX_COMPOSITE_COLS);
+        snprintf(col_names[n_cols], sizeof(col_names[0]), "%.255s", cname);
+        col_ptrs[n_cols] = col_names[n_cols];
+        n_cols++;
         sql__advance(p);
-
-        KdbStatus st = kdb_create_index(db, table_name, col_name);
-        if (st != KDB_OK) return st;
 
         if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
         break;
@@ -1477,7 +1477,8 @@ static KdbStatus sql__exec_create_index(SqlParser *p, KumDB *db) {
     if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing CREATE INDEX's column list");
     sql__advance(p);
 
-    return KDB_OK;
+    if (n_cols == 1) return kdb_create_index(db, table_name, col_ptrs[0]);
+    return kdb_create_composite_index(db, table_name, col_ptrs, n_cols);
 }
 
 static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
@@ -1556,7 +1557,8 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
 
 /* DROP INDEX [name] ON t (col [, col2, ...]) -- mirrors CREATE INDEX's
  * shape exactly, including the accepted-and-ignored optional name and
- * the "each column is its own independent index" semantics. */
+ * the "one column names an ordinary index, two or more name a real
+ * composite index" semantics. */
 static KdbStatus sql__exec_drop_index(SqlParser *p, KumDB *db) {
     if (p->cur.type == SQLTOK_IDENT && !sql__kw_is(&p->cur, "ON")) sql__advance(p); /* optional index name, ignored */
 
@@ -1572,15 +1574,18 @@ static KdbStatus sql__exec_drop_index(SqlParser *p, KumDB *db) {
     if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after DROP INDEX ON %s", table_name);
     sql__advance(p);
 
+    char col_names[KDB_MAX_COMPOSITE_COLS][KDB_SQL_IDENT_BUF];
+    const char *col_ptrs[KDB_MAX_COMPOSITE_COLS];
+    uint32_t n_cols = 0;
     for (;;) {
         const char *cname;
         if (!sql__ident_text(&p->cur, &cname)) return sql__err("expected a column name in DROP INDEX's column list");
-        char col_name[KDB_SQL_IDENT_BUF];
-        snprintf(col_name, sizeof(col_name), "%.255s", cname);
+        if (n_cols >= KDB_MAX_COMPOSITE_COLS)
+            return sql__err("too many columns in one DROP INDEX (max %d)", KDB_MAX_COMPOSITE_COLS);
+        snprintf(col_names[n_cols], sizeof(col_names[0]), "%.255s", cname);
+        col_ptrs[n_cols] = col_names[n_cols];
+        n_cols++;
         sql__advance(p);
-
-        KdbStatus st = kdb_drop_index(db, table_name, col_name);
-        if (st != KDB_OK) return st;
 
         if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
         break;
@@ -1588,7 +1593,8 @@ static KdbStatus sql__exec_drop_index(SqlParser *p, KumDB *db) {
     if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing DROP INDEX's column list");
     sql__advance(p);
 
-    return KDB_OK;
+    if (n_cols == 1) return kdb_drop_index(db, table_name, col_ptrs[0]);
+    return kdb_drop_composite_index(db, table_name, col_ptrs, n_cols);
 }
 
 static KdbStatus sql__exec_drop_table(SqlParser *p, KumDB *db) {

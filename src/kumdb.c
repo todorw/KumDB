@@ -1116,6 +1116,34 @@ KdbStatus kdb_drop_index(KumDB *db, const char *table_name, const char *col_name
     return kdb_table_drop_index(tbl, col_name);
 }
 
+KdbStatus kdb_create_composite_index(KumDB *db, const char *table_name, const char **col_names, uint32_t n_cols) {
+    if (!db || !table_name || !col_names) {
+        kdb_err_null_arg("db/table_name/col_names", "kdb_create_composite_index");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+    return kdb_table_create_composite_index(tbl, col_names, n_cols);
+}
+
+KdbStatus kdb_drop_composite_index(KumDB *db, const char *table_name, const char **col_names, uint32_t n_cols) {
+    if (!db || !table_name || !col_names) {
+        kdb_err_null_arg("db/table_name/col_names", "kdb_drop_composite_index");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+    return kdb_table_drop_composite_index(tbl, col_names, n_cols);
+}
+
 KdbStatus kdb_rename_column(KumDB *db, const char *table_name, const char *old_col, const char *new_col) {
     if (!db || !table_name || !old_col || !new_col) {
         kdb_err_null_arg("db/table_name/old_col/new_col", "kdb_rename_column");
