@@ -100,7 +100,8 @@ typedef enum {
     KDB_STAGE_LIMIT,    /* cap the row count */
     KDB_STAGE_SKIP,     /* drop the first n rows */
     KDB_STAGE_PROJECT,  /* keep only the named fields (id/created_at/updated_at work too), in that order */
-    KDB_STAGE_LOOKUP    /* cross-collection join -- embeds matching rows from another table as an array field */
+    KDB_STAGE_LOOKUP,   /* cross-collection join -- embeds matching rows from another table as an array field */
+    KDB_STAGE_UNWIND    /* flattens an ARRAY field -- one output row per element, that field replaced by the element */
 } KdbStageType;
 
 typedef enum {
@@ -153,6 +154,7 @@ typedef struct {
             const char *foreign_field; /* from_table's field to match against (id/created_at/updated_at work here too) */
             const char *as_field;      /* output field name -- always set to an ARRAY, even when nothing matches */
         } lookup;
+        const char *unwind_field; /* must be a real stored ARRAY field -- not id/created_at/updated_at */
     } as;
 } KdbStage;
 

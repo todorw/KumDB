@@ -1090,6 +1090,66 @@ static void test_aggregate_lookup(void) {
     teardown(db);
 }
 
+static void test_aggregate_unwind(void) {
+    KumDB *db;
+    setup(&db);
+
+    KdbField tags1[] = { kdb_field_string(NULL, "vip"), kdb_field_string(NULL, "premium"), kdb_field_string(NULL, "new") };
+    KdbField f1[] = { kdb_field_string("name", "alice"), kdb_field_array("tags", tags1, 3), kdb_field_end() };
+    KdbField f2[] = { kdb_field_string("name", "bob"), kdb_field_end() }; /* no tags field at all */
+    KdbField f3[] = { kdb_field_string("name", "carol"), kdb_field_array("tags", NULL, 0), kdb_field_end() }; /* empty array */
+    ASSERT_OK(kdb_add(db, "people", f1));
+    ASSERT_OK(kdb_add(db, "people", f2));
+    ASSERT_OK(kdb_add(db, "people", f3));
+
+    /* one output row per tag for alice; bob and carol dropped entirely
+     * (missing field / empty array, same as MongoDB's $unwind default) */
+    {
+        KdbStage stages[] = {{ .type = KDB_STAGE_UNWIND, .as = { .unwind_field = "tags" } }};
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_aggregate(db, "people", stages, 1, &rows));
+        ASSERT(rows && rows->count == 3u);
+        if (rows) {
+            int saw_vip = 0, saw_premium = 0, saw_new = 0;
+            for (size_t i = 0; i < rows->count; i++) {
+                const char *name = NULL, *tag = NULL;
+                ASSERT_OK(kdb_row_get_string(&rows->rows[i], "name", &name));
+                ASSERT_STR(name, "alice"); /* bob/carol never appear */
+                ASSERT_OK(kdb_row_get_string(&rows->rows[i], "tags", &tag)); /* now a plain STRING, not an array */
+                if (strcmp(tag, "vip") == 0) saw_vip = 1;
+                if (strcmp(tag, "premium") == 0) saw_premium = 1;
+                if (strcmp(tag, "new") == 0) saw_new = 1;
+            }
+            ASSERT(saw_vip && saw_premium && saw_new);
+            kdb_rows_free(rows);
+        }
+    }
+
+    /* combined with $match afterward -- ordinary pipeline composition */
+    {
+        const char *filters[] = { "tags=premium", NULL };
+        KdbStage stages[] = {
+            { .type = KDB_STAGE_UNWIND, .as = { .unwind_field = "tags" } },
+            { .type = KDB_STAGE_MATCH,  .as = { .match_filters = filters } },
+        };
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_aggregate(db, "people", stages, 2, &rows));
+        ASSERT(rows && rows->count == 1u);
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* unwinding a non-ARRAY field is a soft skip (row dropped), not an error */
+    {
+        KdbStage stages[] = {{ .type = KDB_STAGE_UNWIND, .as = { .unwind_field = "name" } }};
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_aggregate(db, "people", stages, 1, &rows));
+        ASSERT(rows && rows->count == 0u);
+        if (rows) kdb_rows_free(rows);
+    }
+
+    teardown(db);
+}
+
 static void test_text_search(void) {
     KumDB *db;
     setup(&db);
@@ -1330,6 +1390,7 @@ int main(void) {
     test_list_tables_repeated();
     test_aggregate_pipeline();
     test_aggregate_lookup();
+    test_aggregate_unwind();
     test_text_search();
     test_geo_queries();
 

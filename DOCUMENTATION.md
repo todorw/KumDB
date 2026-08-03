@@ -127,7 +127,7 @@ KdbRows *rows = NULL;
 kdb_aggregate(db, "sales", stages, 4, &rows);
 ```
 
-Seven stage types, run in whatever order the array lists them (a pipeline
+Eight stage types, run in whatever order the array lists them (a pipeline
 can use the same stage type more than once — two `$match`es, `$sort`
 after `$group`, etc.):
 
@@ -184,6 +184,22 @@ real error (`KDB_ERR_NOT_FOUND`); a row simply missing `local_field` (or
 holding `NULL` there) just gets an empty array, no error, same "soft
 skip" convention `$group`/`kdb_geo_near` already follow for a missing
 field.
+
+- **`KDB_STAGE_UNWIND`** — flattens an `ARRAY` field: replaces
+  `unwind_field`'s value with each of its elements in turn, producing one
+  output row per element (every other field, including `id`/`created_at`/
+  `updated_at`, is repeated unchanged across all of them — same as
+  MongoDB's `$unwind` keeps the same `_id` across every unwound copy of a
+  document). A row where `unwind_field` is missing, `NULL`, not an
+  `ARRAY`, or an empty array is dropped entirely (MongoDB's own default
+  behavior, `preserveNullAndEmptyArrays: false`) rather than erroring the
+  whole pipeline over one row's shape.
+
+```c
+KdbStage stages[] = {{ .type = KDB_STAGE_UNWIND, .as = { .unwind_field = "tags" } }};
+kdb_aggregate(db, "people", stages, 1, &rows);
+/* a person with tags=["vip","new"] becomes two rows, each with tags="vip" or tags="new" */
+```
 
 ### Full-text search
 

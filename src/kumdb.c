@@ -2110,6 +2110,35 @@ static KdbStatus kdb__agg_lookup(KumDB *db, const KdbResult *cur, const char *fr
     return st;
 }
 
+/* $unwind: for every row, replaces field's ARRAY value with each of its
+ * elements in turn, producing one output row per element (the rest of
+ * the row -- every other field, id/created_at/updated_at -- is repeated
+ * unchanged across all of them, same as MongoDB's $unwind keeps the same
+ * _id across every unwound copy of a document). A row where field is
+ * missing, NULL, not an ARRAY, or an empty array is dropped entirely --
+ * MongoDB's own default behavior (preserveNullAndEmptyArrays: false),
+ * and consistent with this pipeline's existing soft-skip convention for
+ * a row that just can't participate in a stage (missing $group key,
+ * missing geo coordinate) rather than erroring the whole pipeline over
+ * one row's shape. */
+static KdbStatus kdb__agg_unwind(const KdbResult *cur, const char *field, KdbResult *out) {
+    KdbStatus st = kdb_result_init(out, cur->count > 0 ? cur->count : 1);
+    if (st != KDB_OK) return st;
+
+    for (size_t r = 0; r < cur->count && st == KDB_OK; r++) {
+        const KdbRecordField *f = kdb_record_get_field(&cur->rows[r], field);
+        if (!f || f->value.type != KDB_TYPE_ARRAY || f->value.v.as_array.count == 0) continue;
+
+        for (size_t e = 0; e < f->value.v.as_array.count && st == KDB_OK; e++) {
+            st = kdb_result_append(out, &cur->rows[r]);
+            if (st == KDB_OK) st = kdb_record_set_field(&out->rows[out->count - 1], field, &f->value.v.as_array.items[e]);
+        }
+    }
+
+    if (st != KDB_OK) kdb_result_free(out);
+    return st;
+}
+
 KdbStatus kdb_aggregate(KumDB *db, const char *table_name,
                         const KdbStage *stages, size_t n_stages, KdbRows **rows_out) {
     if (!db || !table_name || !rows_out || (n_stages > 0 && !stages)) {
@@ -2163,6 +2192,12 @@ KdbStatus kdb_aggregate(KumDB *db, const char *table_name,
                 KdbResult next;
                 st = kdb__agg_lookup(db, &cur, stage->as.lookup.from_table, stage->as.lookup.local_field,
                                      stage->as.lookup.foreign_field, stage->as.lookup.as_field, &next);
+                if (st == KDB_OK) { kdb_result_free(&cur); cur = next; }
+                break;
+            }
+            case KDB_STAGE_UNWIND: {
+                KdbResult next;
+                st = kdb__agg_unwind(&cur, stage->as.unwind_field, &next);
                 if (st == KDB_OK) { kdb_result_free(&cur); cur = next; }
                 break;
             }
