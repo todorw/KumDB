@@ -1221,10 +1221,29 @@ terms per expression (a term is one column or number, with an optional
 leading unary `-`); no parentheses for grouping within one expression —
 `(a + b) * c` isn't parseable, only a flat left-to-right chain at the
 precedence above. Unaliased, defaults to `?column?`, same as a bare
-literal. Not combined with `GROUP BY`/aggregate functions, and — for now
-— only usable as a `SELECT` item, not inside `WHERE`/`HAVING`/`ON` or as
-a function argument (`ROUND(price * 1.1, 2)` isn't parseable either);
-those all still take a plain column or literal only.
+literal. Not combined with `GROUP BY`/aggregate functions.
+
+An arithmetic expression also works as a `WHERE`/`HAVING` condition's
+left-hand side, evaluated per row:
+
+```sql
+SELECT * FROM orders WHERE price * qty > 100
+SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM sales GROUP BY region HAVING n * 10 > 15
+```
+
+There, only against a plain numeric literal via the six comparisons
+(`=`, `!=`, `>`, `>=`, `<`, `<=`) — no `BETWEEN`/`IN`/`LIKE`/etc, which
+don't have a sensible meaning against a computed value. Same `NULL`
+handling as the `SELECT`-item form: a missing/`NULL`/non-numeric operand
+makes the condition not match, for *any* comparison including `!=` (not
+matching is not the same as matching "not equal"). An expression
+condition always evaluates in memory — every row fetched first, then
+filtered — never through the indexed storage-level filter path, the same
+way `EXISTS`/a correlated subquery already forces; works in `UPDATE`/
+`DELETE`'s `WHERE` too. Not supported inside `JOIN ON`, `CASE WHEN`,
+`FILTER (WHERE ...)`, or as a function argument (`ROUND(price * 1.1, 2)`
+isn't parseable either) — those all still take a plain column or literal
+only.
 
 **`HAVING`** filters the aggregated/grouped output (same condition syntax
 as `WHERE`, evaluated against the SELECT list's aliases -- `HAVING total >

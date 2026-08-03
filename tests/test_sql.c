@@ -402,6 +402,18 @@ static int64_t count_all(KumDB *db, const char *table) {
     return n;
 }
 
+/* Same as count_all, but against table "t" with a WHERE clause -- used by
+ * test_expr_in_where_having, which needs many small variations of one. */
+static int64_t count_all_where(KumDB *db, const char *where_cond) {
+    char q[256];
+    snprintf(q, sizeof(q), "SELECT * FROM t WHERE %s", where_cond);
+    KdbRows *rows = NULL;
+    ASSERT_OK(kdb_exec_sql(db, q, &rows, NULL));
+    int64_t n = rows ? (int64_t)rows->count : -1;
+    if (rows) kdb_rows_free(rows);
+    return n;
+}
+
 static void test_transactions(void) {
     KumDB *db;
     setup(&db);
@@ -3347,13 +3359,94 @@ static void test_arithmetic_expressions(void) {
     ASSERT_ERR(sql(db, "SELECT price * qty, COUNT(*) FROM t"));
     ASSERT_ERR(sql(db, "SELECT price * qty, name FROM t GROUP BY name"));
 
-    /* not supported in WHERE -- documented scope boundary, only SELECT
-     * items so far */
-    ASSERT_ERR(sql(db, "SELECT * FROM t WHERE price * qty > 10"));
+    /* arithmetic expressions work in WHERE too, evaluated per row (see
+     * test_expr_in_where_having for the full coverage) */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM t WHERE price * qty > 10", &rows, NULL));
+    ASSERT(rows && rows->count == 1u); /* only 'a' (10*3=30); 'b' is 0, 'neg' is 2.5 */
+    if (rows && rows->count == 1) {
+        const char *n = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &n));
+        ASSERT_STR(n, "a");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
 
     /* too many terms in one expression is rejected, not silently
      * truncated */
     ASSERT_ERR(sql(db, "SELECT 1+1+1+1+1+1+1 AS r FROM t"));
+
+    teardown(db);
+}
+
+static void test_expr_in_where_having(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (price FLOAT, qty INT, name TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (price, qty, name) VALUES (10.0, 3, 'a')"));   /* 30 */
+    ASSERT_OK(sql(db, "INSERT INTO t (price, qty, name) VALUES (5.0, 0, 'b')"));    /* 0 */
+    ASSERT_OK(sql(db, "INSERT INTO t (price, qty, name) VALUES (2.0, 20, 'c')"));   /* 40 */
+    ASSERT_OK(sql(db, "INSERT INTO t (price, qty, name) VALUES (-2.5, -1, 'neg')")); /* 2.5 */
+    ASSERT_OK(sql(db, "INSERT INTO t (qty, name) VALUES (5, 'nullprice')"));        /* price missing -> NULL */
+
+    KdbRows *rows = NULL;
+
+    /* basic WHERE expr > literal */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE price * qty > 10", &rows, NULL));
+    ASSERT(rows && rows->count == 2u); /* a(30), c(40) */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* all six comparison operators */
+    ASSERT_EQ(count_all_where(db, "price * qty = 30"), 1);
+    ASSERT_EQ(count_all_where(db, "price * qty != 30"), 3);  /* b, c, neg -- NULL never matches, even != */
+    ASSERT_EQ(count_all_where(db, "price * qty >= 30"), 2);  /* a, c */
+    ASSERT_EQ(count_all_where(db, "price * qty < 10"), 2);   /* b, neg */
+    ASSERT_EQ(count_all_where(db, "price * qty <= 0"), 1);   /* b */
+
+    /* a NULL/missing operand never matches any comparison, even != */
+    ASSERT_EQ(count_all_where(db, "name = 'nullprice' AND price * qty > -999999"), 0);
+    ASSERT_EQ(count_all_where(db, "name = 'nullprice' AND price * qty != 30"), 0);
+
+    /* combined with AND/OR */
+    ASSERT_EQ(count_all_where(db, "price * qty > 10 AND name = 'c'"), 1);
+    ASSERT_EQ(count_all_where(db, "price * qty > 100 OR name = 'b'"), 1);
+
+    /* negative RHS literal, and +/- operators */
+    ASSERT_EQ(count_all_where(db, "price * qty < -1"), 0);
+    ASSERT_EQ(count_all_where(db, "price + qty > -2"), 3); /* a, b, c -- neg is -3.5, nullprice is NULL */
+
+    /* %% -- fmod keeps the dividend's sign, same as the SELECT-item version */
+    ASSERT_EQ(count_all_where(db, "qty % 3 = 0"), 2); /* a(3%3=0), b(0%3=0) */
+
+    /* an expression can start with a numeric literal, not just a column */
+    ASSERT_EQ(count_all_where(db, "100 - qty > 90"), 4); /* a(97),b(100),neg(101),nullprice(95) -- c is 80 */
+
+    /* HAVING an expression over a GROUP BY alias */
+    ASSERT_OK(sql(db, "CREATE TABLE sales (region TEXT, amount FLOAT)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount) VALUES ('east', 100.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount) VALUES ('east', 50.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, amount) VALUES ('west', 10.0)"));
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM sales GROUP BY region HAVING n * 10 > 15",
+        &rows, NULL));
+    ASSERT(rows && rows->count == 1u); /* east: n=2, 20>15 keeps; west: n=1, 10>15 drops */
+    if (rows && rows->count == 1) {
+        const char *region = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "region", &region));
+        ASSERT_STR(region, "east");
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* UPDATE/DELETE WHERE with an expression */
+    ASSERT_OK(sql(db, "UPDATE t SET name = 'big' WHERE price * qty > 35"));
+    ASSERT_EQ(count_all_where(db, "name = 'big'"), 1); /* only c (40) */
+    ASSERT_OK(sql(db, "DELETE FROM t WHERE price * qty < -1"));
+    ASSERT_EQ(count_all_where(db, "1=1"), 5); /* nothing matched < -1 -- still all 5 rows, just one renamed */
+
+    /* error paths */
+    ASSERT_ERR(sql(db, "SELECT * FROM t WHERE price * qty IS NULL"));
+    ASSERT_ERR(sql(db, "SELECT * FROM t WHERE price * qty BETWEEN 1 AND 2"));
+    ASSERT_ERR(sql(db, "SELECT * FROM t WHERE price * qty > 'x'"));
+    ASSERT_ERR(sql(db, "SELECT CASE WHEN price * qty > 1 THEN 1 ELSE 0 END FROM t"));
+    ASSERT_ERR(sql(db, "SELECT COUNT(*) FILTER (WHERE price * qty > 1) FROM t"));
 
     teardown(db);
 }
@@ -3946,6 +4039,7 @@ int main(void) {
     test_correlated_subqueries();
     test_literal_select_items();
     test_arithmetic_expressions();
+    test_expr_in_where_having();
     test_scalar_functions();
     test_window_functions();
     test_window_frame_clauses();

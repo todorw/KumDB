@@ -443,6 +443,40 @@ static char *sql__parse_in_subquery(SqlParser *p, KumDB *db, const char *col_ctx
     return strdup(list);
 }
 
+typedef enum { SQL_ARITH_ADD, SQL_ARITH_SUB, SQL_ARITH_MUL, SQL_ARITH_DIV, SQL_ARITH_MOD } SqlArithOp;
+
+#define KDB_SQL_MAX_EXPR_TERMS 6
+
+/* One term in a flat arithmetic expression chain: a column reference or
+ * a numeric literal (always stored as double -- see SqlExpr), optionally
+ * negated by a leading unary '-'. */
+typedef struct {
+    int    is_col;
+    char   col[KDB_SQL_IDENT_BUF];
+    double lit;
+    int    negate;
+} SqlExprTerm;
+
+/* A flat chain of terms joined by +/-/ * //% at real operator precedence
+ * (*, /, % bind tighter than +, -) -- no parens/nesting within one
+ * expression, same "flat array, no heap" scope discipline SqlCaseBranch's
+ * WHEN conditions use (see below). Always evaluates in double precision
+ * and produces FLOAT, regardless of the operand types -- same
+ * simplification this engine already made for SUM/AVG ("always FLOAT
+ * regardless of the source column's type"), avoiding int-division-
+ * truncation surprises. A missing/NULL/non-numeric column, or division/
+ * modulo by zero, makes the whole expression NULL for that row rather
+ * than erroring the query. Used both as a SELECT item (SqlSelectItem.expr)
+ * and, since #39, directly inside a WHERE/HAVING condition
+ * (SqlCondNode's own expr field, SQL_COND_EXPR below) -- moved this early
+ * in the file so SqlCondNode, defined right after, can embed one by value
+ * (a complete type is needed, not just a forward declaration). */
+typedef struct {
+    SqlExprTerm terms[KDB_SQL_MAX_EXPR_TERMS];
+    SqlArithOp  ops[KDB_SQL_MAX_EXPR_TERMS - 1]; /* ops[i] is between terms[i] and terms[i+1] */
+    int         n_terms;
+} SqlExpr;
+
 /* A parsed WHERE/HAVING condition can be a leaf (a flat filter string,
  * "col__op=val"), an AND/OR of two subtrees, an EXISTS/NOT EXISTS whose
  * leaf_filter holds the inner SELECT's raw source text (same convention
@@ -458,37 +492,124 @@ static char *sql__parse_in_subquery(SqlParser *p, KumDB *db, const char *col_ctx
  * "lt", or "lte" -- a pointer to a static string literal, never freed). A
  * *non*-correlated "(SELECT ...)" never reaches the tree at all: it keeps
  * running once at parse time and folding into an ordinary flat leaf, same
- * as before this existed -- see sql__parse_condition(). */
+ * as before this existed -- see sql__parse_condition(). SQL_COND_EXPR
+ * (since #39) is the odd one out: "expr OP literal" ("price * qty >
+ * 100"), where expr is an arithmetic chain, not a bare column -- there's
+ * no flat filter-string form for a computed value at all (the storage
+ * layer only ever filters by a stored column's value), so this always
+ * forces tree evaluation via sql__eval_expr, same as EXISTS/a correlated
+ * subquery already forces it for its own different reason. Only the six
+ * plain comparisons are valid against one (no IS/BETWEEN/IN/LIKE/etc --
+ * see sql__parse_expr_condition). */
 typedef enum { SQL_COND_LEAF, SQL_COND_AND, SQL_COND_OR, SQL_COND_EXISTS, SQL_COND_NOT_EXISTS,
-               SQL_COND_SCALAR_SUBQUERY, SQL_COND_IN_SUBQUERY } SqlCondKind;
+               SQL_COND_SCALAR_SUBQUERY, SQL_COND_IN_SUBQUERY, SQL_COND_EXPR } SqlCondKind;
 
 /* Side channel sql__parse_condition() uses to report that "col OP
  * (SELECT ...)" or "col IN (SELECT ...)" turned out to reference
  * corr_alias and so was deferred into a tree leaf instead of being
- * executed once and folded into a flat filter string. kind stays
- * SQL_COND_LEAF (col/op/inner_sql left untouched) for every other
+ * executed once and folded into a flat filter string, or that the
+ * condition was actually "expr OP literal" (SQL_COND_EXPR). kind stays
+ * SQL_COND_LEAF (every other field left untouched) for every other
  * condition shape, including a non-correlated subquery -- that one is
  * indistinguishable from any other leaf by the time it returns, since it
  * already ran and became a plain value. */
 typedef struct {
     SqlCondKind kind;
-    char        *col;        /* SCALAR_SUBQUERY/IN_SUBQUERY only, heap-owned */
-    const char  *op;         /* SCALAR_SUBQUERY only: static literal, see SqlCondNode.corr_op */
-    char        *inner_sql;  /* SCALAR_SUBQUERY/IN_SUBQUERY only, heap-owned */
+    char        *col;         /* SCALAR_SUBQUERY/IN_SUBQUERY only, heap-owned */
+    const char  *op;          /* SCALAR_SUBQUERY only: static literal, see SqlCondNode.corr_op */
+    char        *inner_sql;   /* SCALAR_SUBQUERY/IN_SUBQUERY only, heap-owned */
+    SqlExpr      expr;        /* SQL_COND_EXPR only -- POD, no heap ownership */
+    SqlTokType   expr_cmp_op; /* SQL_COND_EXPR only: SQLTOK_EQ/NEQ/GT/GTE/LT/LTE */
+    double       expr_rhs;    /* SQL_COND_EXPR only: the literal being compared against */
 } SqlCorrResult;
+
+/* Forward declarations -- full definitions live down with SELECT-item
+ * arithmetic expression parsing, but sql__parse_condition (just below)
+ * needs them too, and is parsed well before that point in the file. */
+static int sql__arith_op_from_token(SqlTokType t, SqlArithOp *out);
+static int sql__parse_expr_term(SqlParser *p, SqlExprTerm *out);
+static int sql__parse_expr_tail(SqlParser *p, SqlExpr *expr);
+
+/* "expr CMP literal" ("price * qty > 100") -- expr's first term is
+ * already parsed (first_term); this consumes the rest of the chain, the
+ * comparison operator, and a numeric literal RHS. Only the six plain
+ * comparisons are valid here (no IS/BETWEEN/IN/LIKE/etc -- none of those
+ * have a sensible meaning against a computed value that isn't really "in
+ * the table"). Reports SQL_COND_EXPR via corr_out and returns NULL, the
+ * same convention SCALAR_SUBQUERY/IN_SUBQUERY already use for "this leaf
+ * isn't a flat filter string." Returns NULL with corr_out->kind still
+ * SQL_COND_LEAF (i.e. untouched) on a genuine parse error (error set). */
+static char *sql__parse_expr_condition(SqlParser *p, SqlExprTerm first_term, SqlCorrResult *corr_out) {
+    SqlExpr expr;
+    memset(&expr, 0, sizeof(expr));
+    expr.terms[0] = first_term;
+    expr.n_terms = 1;
+    if (!sql__parse_expr_tail(p, &expr)) return NULL;
+
+    SqlTokType cmp_op = p->cur.type;
+    if (cmp_op != SQLTOK_EQ && cmp_op != SQLTOK_NEQ && cmp_op != SQLTOK_GT &&
+        cmp_op != SQLTOK_GTE && cmp_op != SQLTOK_LT && cmp_op != SQLTOK_LTE) {
+        sql__err("expected a comparison operator (=, !=, >, >=, <, <=) after an arithmetic expression in WHERE/HAVING");
+        return NULL;
+    }
+    sql__advance(p);
+
+    int negate_rhs = 0;
+    if (p->cur.type == SQLTOK_MINUS) { negate_rhs = 1; sql__advance(p); }
+    if (p->cur.type != SQLTOK_NUMBER) {
+        sql__err("expected a numeric literal after the comparison operator on an arithmetic expression");
+        return NULL;
+    }
+    double rhs = atof(p->cur.text);
+    if (negate_rhs) rhs = -rhs;
+    sql__advance(p);
+
+    corr_out->kind = SQL_COND_EXPR;
+    corr_out->expr = expr;
+    corr_out->expr_cmp_op = cmp_op;
+    corr_out->expr_rhs = rhs;
+    return NULL;
+}
 
 /* corr_alias: an outer alias a "(SELECT ...)" scalar/IN subquery may
  * correlate against, or NULL if there's no sensible outer row to
  * correlate against here (CASE WHEN's conditions, HAVING). When a
  * subquery's raw text does reference corr_alias, *corr_out is filled in
  * and this returns NULL without that being an error -- callers must check
- * corr_out->kind before treating a NULL return as failure. */
+ * corr_out->kind before treating a NULL return as failure. Same for
+ * SQL_COND_EXPR ("expr OP literal" -- see sql__parse_expr_condition). */
 static char *sql__parse_condition(SqlParser *p, KumDB *db, const char *corr_alias, SqlCorrResult *corr_out) {
+    /* A condition starting with a numeric literal (or a unary '-') can
+     * only be the start of an arithmetic expression ("5 + x > 10") -- a
+     * plain condition always starts with a column name otherwise, so
+     * there's no ambiguity to resolve here. */
+    if (p->cur.type == SQLTOK_NUMBER || p->cur.type == SQLTOK_MINUS) {
+        SqlExprTerm first_term;
+        if (!sql__parse_expr_term(p, &first_term)) { sql__err("expected a column name in WHERE clause"); return NULL; }
+        return sql__parse_expr_condition(p, first_term, corr_out);
+    }
+
     const char *col;
     if (!sql__ident_text(&p->cur, &col)) { sql__err("expected a column name in WHERE clause"); return NULL; }
     char col_buf[KDB_SQL_IDENT_BUF];
     snprintf(col_buf, sizeof(col_buf), "%.255s", col);
     sql__advance(p);
+
+    /* A column immediately followed by +/-/ * //% is the first term of an
+     * arithmetic expression ("price * qty > 100"), not a plain column
+     * condition -- checked here, before IS/BETWEEN/IN/LIKE/etc below, so
+     * a bare column condition (the overwhelmingly common case) is
+     * completely unaffected. */
+    {
+        SqlArithOp peek_op;
+        if (sql__arith_op_from_token(p->cur.type, &peek_op)) {
+            SqlExprTerm first_term;
+            memset(&first_term, 0, sizeof(first_term));
+            first_term.is_col = 1;
+            snprintf(first_term.col, sizeof(first_term.col), "%s", col_buf);
+            return sql__parse_expr_condition(p, first_term, corr_out);
+        }
+    }
 
     if (sql__kw_is(&p->cur, "IS")) {
         sql__advance(p);
@@ -707,6 +828,9 @@ typedef struct SqlCondNode {
     struct SqlCondNode   *right;         /* AND/OR only */
     char                 *corr_col;      /* SCALAR_SUBQUERY/IN_SUBQUERY only: outer column being compared */
     const char            *corr_op;      /* SCALAR_SUBQUERY only: "", "neq", "gt", "gte", "lt", or "lte" */
+    SqlExpr               expr;          /* SQL_COND_EXPR only -- POD, no heap ownership, see SqlCorrResult */
+    SqlTokType             expr_cmp_op;  /* SQL_COND_EXPR only */
+    double                 expr_rhs;     /* SQL_COND_EXPR only */
 } SqlCondNode;
 
 static void sql__free_cond_node(SqlCondNode *n) {
@@ -817,7 +941,7 @@ static SqlCondNode *sql__parse_cond_primary(SqlParser *p, KumDB *db, const char 
         sql__err("too many conditions (max %d)", KDB_SQL_MAX_COND);
         return NULL;
     }
-    SqlCorrResult corr = { SQL_COND_LEAF, NULL, NULL, NULL };
+    SqlCorrResult corr = { .kind = SQL_COND_LEAF };
     char *f = sql__parse_condition(p, db, corr_alias, &corr);
     if (corr.kind != SQL_COND_LEAF) {
         SqlCondNode *n = KDB_ALLOC(SqlCondNode);
@@ -826,7 +950,10 @@ static SqlCondNode *sql__parse_cond_primary(SqlParser *p, KumDB *db, const char 
         n->leaf_filter = corr.inner_sql;
         n->corr_col = corr.col;
         n->corr_op = corr.op;
-        *used_parens = 1; /* correlated subqueries have no flat filter-string form -- forces tree evaluation */
+        n->expr = corr.expr;
+        n->expr_cmp_op = corr.expr_cmp_op;
+        n->expr_rhs = corr.expr_rhs;
+        *used_parens = 1; /* neither correlated subqueries nor an expression leaf has a flat filter-string form -- forces tree evaluation */
         (*leaf_count)++;
         return n;
     }
@@ -2604,36 +2731,10 @@ typedef struct {
  * audit. No parens within one WHEN -- that would need the tree, which
  * would need the heap; AND/OR-of-plain-conditions covers the documented
  * gap without paying that cost. */
-typedef enum { SQL_ARITH_ADD, SQL_ARITH_SUB, SQL_ARITH_MUL, SQL_ARITH_DIV, SQL_ARITH_MOD } SqlArithOp;
-
-#define KDB_SQL_MAX_EXPR_TERMS 6
-
-/* One term in a flat arithmetic expression chain: a column reference or
- * a numeric literal (always stored as double -- see SqlExpr), optionally
- * negated by a leading unary '-'. */
-typedef struct {
-    int    is_col;
-    char   col[KDB_SQL_IDENT_BUF];
-    double lit;
-    int    negate;
-} SqlExprTerm;
-
-/* A flat chain of terms joined by +/-/ * //% at real operator precedence
- * (*, /, % bind tighter than +, -) -- no parens/nesting within one
- * expression, same "flat array, no heap" scope discipline SqlCaseBranch's
- * WHEN conditions use above (a SqlSelectItem carrying one stays POD, so
- * every early return in sql__exec_select_core stays safe with no new
- * cleanup path to audit). Always evaluates in double precision and
- * produces FLOAT, regardless of the operand types -- same simplification
- * this engine already made for SUM/AVG ("always FLOAT regardless of the
- * source column's type"), avoiding int-division-truncation surprises. A
- * missing/NULL/non-numeric column, or division/modulo by zero, makes the
- * whole expression NULL for that row rather than erroring the query. */
-typedef struct {
-    SqlExprTerm terms[KDB_SQL_MAX_EXPR_TERMS];
-    SqlArithOp  ops[KDB_SQL_MAX_EXPR_TERMS - 1]; /* ops[i] is between terms[i] and terms[i+1] */
-    int         n_terms;
-} SqlExpr;
+/* SqlArithOp/SqlExprTerm/SqlExpr (arithmetic expressions) are defined
+ * earlier now, alongside SqlCondNode -- a WHERE/HAVING condition can
+ * embed one directly (SQL_COND_EXPR) since #39, and needed the complete
+ * type available that early. See their own doc comments up there. */
 
 typedef struct {
     char         cond_filters[KDB_SQL_MAX_CASE_SUBCONDS][KDB_SQL_IDENT_BUF]; /* WHEN condition(s), filter-string form */
@@ -3184,8 +3285,9 @@ static int sql__parse_case_item(SqlParser *p, KumDB *db, SqlSelectItem *item) {
                 sql__err("too many conditions in one CASE WHEN (max %d)", KDB_SQL_MAX_CASE_SUBCONDS);
                 return 0;
             }
-            SqlCorrResult unused_corr = { SQL_COND_LEAF, NULL, NULL, NULL };
+            SqlCorrResult unused_corr = { .kind = SQL_COND_LEAF };
             char *cond = sql__parse_condition(p, db, NULL, &unused_corr); /* NULL: no outer row to correlate a subquery against inside CASE WHEN */
+            if (unused_corr.kind == SQL_COND_EXPR) { sql__err("an arithmetic expression isn't supported in a CASE WHEN condition"); return 0; }
             if (!cond) return 0;
             if (start_new_group) snprintf(br->cond_filters[br->n_cond_filters], sizeof(br->cond_filters[0]), "OR:%s", cond);
             else                 snprintf(br->cond_filters[br->n_cond_filters], sizeof(br->cond_filters[0]), "%s", cond);
@@ -3852,6 +3954,19 @@ static int sql__cond_tree_matches(KumDB *db, const char *outer_alias, const KdbR
         case SQL_COND_NOT_EXISTS: return sql__eval_exists(db, outer_alias, row, node->leaf_filter, 1);
         case SQL_COND_SCALAR_SUBQUERY: return sql__eval_correlated_scalar(db, outer_alias, row, node);
         case SQL_COND_IN_SUBQUERY:     return sql__eval_correlated_in(db, outer_alias, row, node);
+        case SQL_COND_EXPR: {
+            double val;
+            if (!sql__eval_expr(&node->expr, row, &val)) return 0; /* NULL/non-numeric operand -- doesn't match, same as an arithmetic SELECT item going NULL */
+            switch (node->expr_cmp_op) {
+                case SQLTOK_EQ:  return val == node->expr_rhs;
+                case SQLTOK_NEQ: return val != node->expr_rhs;
+                case SQLTOK_GT:  return val > node->expr_rhs;
+                case SQLTOK_GTE: return val >= node->expr_rhs;
+                case SQLTOK_LT:  return val < node->expr_rhs;
+                case SQLTOK_LTE: return val <= node->expr_rhs;
+                default: return 0;
+            }
+        }
         default: return 0;
     }
 }
@@ -5968,8 +6083,9 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
                         for (;;) {
                             if (item.n_filter_conds >= KDB_SQL_MAX_CASE_SUBCONDS)
                                 return sql__err("too many conditions in one FILTER (WHERE ...) (max %d)", KDB_SQL_MAX_CASE_SUBCONDS);
-                            SqlCorrResult unused_corr = { SQL_COND_LEAF, NULL, NULL, NULL };
+                            SqlCorrResult unused_corr = { .kind = SQL_COND_LEAF };
                             char *cond = sql__parse_condition(p, db, NULL, &unused_corr); /* NULL: no outer row to correlate a subquery against inside FILTER */
+                            if (unused_corr.kind == SQL_COND_EXPR) return sql__err("an arithmetic expression isn't supported in a FILTER (WHERE ...) condition");
                             if (!cond) return kdb_last_status();
                             if (start_new_group) snprintf(item.filter_conds[item.n_filter_conds], sizeof(item.filter_conds[0]), "OR:%s", cond);
                             else                 snprintf(item.filter_conds[item.n_filter_conds], sizeof(item.filter_conds[0]), "%s", cond);

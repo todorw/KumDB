@@ -281,9 +281,16 @@ extern "C" {
  * Up to 6 terms (a term is one column or number, optional leading unary
  * '-'); no parens for grouping within one expression -- "(a+b)*c" isn't
  * parseable, only a flat chain at the precedence above. Unaliased,
- * defaults to "?column?". Not combined with GROUP BY/aggregates. Only a
- * SELECT item so far -- not usable in WHERE/HAVING/ON or as a function
- * argument (those still take a plain column or literal only).
+ * defaults to "?column?". Not combined with GROUP BY/aggregates. Also
+ * works as a WHERE/HAVING condition's left-hand side ("WHERE price * qty
+ * > 100"), evaluated per row -- but there, only against a plain numeric
+ * literal via the six comparisons (=, !=, >, >=, <, <=), no BETWEEN/IN/
+ * LIKE/etc, which don't have a sensible meaning against a computed value.
+ * A WHERE/HAVING expression condition always evaluates in memory (every
+ * row fetched first, then filtered), never through the indexed storage-
+ * level filter path, same as EXISTS/a correlated subquery already forces.
+ * Still not usable in JOIN ON or as a function argument (those still take
+ * a plain column or literal only).
  *
  * DISTINCT dedupes the result by the exact selected columns, after
  * projection. UNION/UNION ALL/INTERSECT/INTERSECT ALL/EXCEPT/EXCEPT ALL
