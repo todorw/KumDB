@@ -15,8 +15,11 @@ cover custom forms or printed reports.
 
 - **Datasheet view**: pick a table on the left, see/edit its rows in a grid.
   Editing a cell writes through immediately (same as Access's datasheet view
-  — there's no separate save step). Add/delete rows from the toolbar, or
-  export the whole grid to CSV.
+  — there's no separate save step). Add a row either via the toolbar dialog
+  (several fields at once) or Access-style: just start typing into the `*`
+  row at the bottom of the grid. A record navigator (First/Prev/Next/Last +
+  row count) and an instant search box sit below/above the grid; export the
+  whole thing to CSV.
 - **Schema view**: a read-only breakdown of a table's columns — type,
   nullable, indexed, unique — for whatever the datasheet grid doesn't have
   room to show inline.

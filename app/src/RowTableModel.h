@@ -11,6 +11,16 @@
 // first row happens to have for a SQL SELECT with no schema handy).
 // Editing a cell round-trips through KumDbHandle::updateCell() immediately
 // -- there's no separate "save" step, same as Access's datasheet view.
+//
+// When editable, an extra blank row is appended at the end (Access's own
+// "*" new-record row): typing a value into any of its cells inserts a new
+// row via KumDbHandle::addRow() with just that one field set, then asks
+// the owner to reload (newRowInserted()) so the freshly-inserted row takes
+// its real place and a fresh blank row appears below it. Not a literal
+// clone of Access's behavior (which stages a whole record before
+// committing on row-exit) -- this reuses the same "every edit commits
+// immediately" rule the rest of the grid already follows, just extended
+// to the blank row too.
 class RowTableModel : public QAbstractTableModel {
     Q_OBJECT
 public:
@@ -26,6 +36,8 @@ public:
 
     quint64 idAt(int row) const;
     QString columnNameAt(int col) const;
+    int realRowCount() const { return m_rows.size(); } // excludes the trailing blank new-record row
+    bool isNewRecordRow(int row) const { return m_editable && row == m_rows.size(); }
 
     int rowCount(const QModelIndex &parent = QModelIndex()) const override;
     int columnCount(const QModelIndex &parent = QModelIndex()) const override;
@@ -37,6 +49,7 @@ public:
 signals:
     void editFailed(const QString &error);
     void rowChanged();
+    void newRowInserted(); // a field was committed on the blank new-record row -- caller should reload
 
 private:
     KumDbHandle  *m_db;

@@ -12,6 +12,7 @@ class QLabel;
 class QueryPanel;
 class QListWidgetItem;
 class QStackedWidget;
+class QLineEdit;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -37,6 +38,8 @@ private slots:
     void deleteSelectedRow();
     void exportDatasheetCsv();
     void filterTableList(const QString &text);
+    void filterDatasheetRows(const QString &text);
+    void updateRecordNav();
     void showAbout();
 
 private:
@@ -52,6 +55,8 @@ private:
     QLabel          *m_tableCountLabel;
     QTableView      *m_datasheet;
     RowTableModel   *m_datasheetModel;
+    QLineEdit       *m_datasheetSearch;
+    QLabel          *m_recordNavLabel;
     QTableWidget    *m_schemaView;
     QueryPanel      *m_queryPanel;
     QLabel          *m_statusLabel;

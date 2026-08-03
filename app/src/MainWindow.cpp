@@ -10,6 +10,7 @@
 #include <QListWidget>
 #include <QTableView>
 #include <QTableWidget>
+#include <QItemSelectionModel>
 #include <QHeaderView>
 #include <QTabWidget>
 #include <QStackedWidget>
@@ -197,7 +198,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     auto *datasheetPage = new QWidget(tabs);
     auto *datasheetLayout = new QVBoxLayout(datasheetPage);
     auto *datasheetButtons = new QHBoxLayout;
-    auto *addRowBtn = new QPushButton("+ Add row", datasheetPage);
+    auto *addRowBtn = new QPushButton("+ Add row...", datasheetPage);
+    addRowBtn->setToolTip("Fill several fields at once via a dialog -- or just start typing into the * row at the bottom of the grid.");
     auto *deleteRowBtn = new QPushButton("- Delete row", datasheetPage);
     deleteRowBtn->setObjectName("dangerButton");
     auto *refreshBtn = new QPushButton("Refresh", datasheetPage);
@@ -207,6 +209,11 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     datasheetButtons->addWidget(deleteRowBtn);
     datasheetButtons->addWidget(refreshBtn);
     datasheetButtons->addStretch();
+    m_datasheetSearch = new QLineEdit(datasheetPage);
+    m_datasheetSearch->setPlaceholderText("Search this table...");
+    m_datasheetSearch->setClearButtonEnabled(true);
+    m_datasheetSearch->setMaximumWidth(220);
+    datasheetButtons->addWidget(m_datasheetSearch);
     datasheetButtons->addWidget(exportBtn);
     datasheetButtons->addWidget(compactBtn);
     datasheetLayout->addLayout(datasheetButtons);
@@ -219,6 +226,36 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     m_datasheet->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_datasheet->setSortingEnabled(false); // RowTableModel isn't a proxy-sortable model -- avoid a misleading sort arrow
     datasheetLayout->addWidget(m_datasheet);
+
+    // Record navigator -- Access's own First/Prev/Next/Last + "Row N of M"
+    // strip at the bottom of every datasheet.
+    auto *navRow = new QHBoxLayout;
+    QStyle *navSt = style();
+    auto *navFirst = new QToolButton(datasheetPage);
+    navFirst->setIcon(navSt->standardIcon(QStyle::SP_MediaSkipBackward));
+    navFirst->setToolTip("First record");
+    auto *navPrev = new QToolButton(datasheetPage);
+    navPrev->setIcon(navSt->standardIcon(QStyle::SP_MediaSeekBackward));
+    navPrev->setToolTip("Previous record");
+    auto *navNext = new QToolButton(datasheetPage);
+    navNext->setIcon(navSt->standardIcon(QStyle::SP_MediaSeekForward));
+    navNext->setToolTip("Next record");
+    auto *navLast = new QToolButton(datasheetPage);
+    navLast->setIcon(navSt->standardIcon(QStyle::SP_MediaSkipForward));
+    navLast->setToolTip("Last record");
+    auto *navNew = new QToolButton(datasheetPage);
+    navNew->setIcon(navSt->standardIcon(QStyle::SP_FileIcon));
+    navNew->setToolTip("New record");
+    m_recordNavLabel = new QLabel("No records", datasheetPage);
+    navRow->addWidget(navFirst);
+    navRow->addWidget(navPrev);
+    navRow->addWidget(navNext);
+    navRow->addWidget(navLast);
+    navRow->addWidget(navNew);
+    navRow->addWidget(m_recordNavLabel);
+    navRow->addStretch();
+    datasheetLayout->addLayout(navRow);
+
     tabs->addTab(datasheetPage, "Datasheet");
 
     connect(addRowBtn, &QPushButton::clicked, this, &MainWindow::addRowViaDatasheet);
@@ -226,9 +263,26 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     connect(refreshBtn, &QPushButton::clicked, this, &MainWindow::reloadDatasheet);
     connect(exportBtn, &QPushButton::clicked, this, &MainWindow::exportDatasheetCsv);
     connect(compactBtn, &QPushButton::clicked, this, &MainWindow::compactTable);
+    connect(m_datasheetSearch, &QLineEdit::textChanged, this, &MainWindow::filterDatasheetRows);
     connect(m_datasheetModel, &RowTableModel::editFailed, this, [this](const QString &err) {
         QMessageBox::warning(this, "Edit failed", err);
     });
+    // Deferred (queued): a field just committed on the model's own blank
+    // new-record row triggers this, and the model must finish its own
+    // setData()/edit-commit cycle before we're allowed to reset it.
+    connect(m_datasheetModel, &RowTableModel::newRowInserted, this, &MainWindow::reloadDatasheet, Qt::QueuedConnection);
+    connect(m_datasheet->selectionModel(), &QItemSelectionModel::currentRowChanged, this, &MainWindow::updateRecordNav);
+
+    auto moveRow = [this](int row) {
+        if (row < 0 || row >= m_datasheetModel->rowCount()) return;
+        m_datasheet->setCurrentIndex(m_datasheetModel->index(row, 1));
+        m_datasheet->scrollTo(m_datasheetModel->index(row, 0));
+    };
+    connect(navFirst, &QToolButton::clicked, this, [this, moveRow]() { moveRow(0); });
+    connect(navPrev, &QToolButton::clicked, this, [this, moveRow]() { moveRow(m_datasheet->currentIndex().row() - 1); });
+    connect(navNext, &QToolButton::clicked, this, [this, moveRow]() { moveRow(m_datasheet->currentIndex().row() + 1); });
+    connect(navLast, &QToolButton::clicked, this, [this, moveRow]() { moveRow(m_datasheetModel->rowCount() - 1); });
+    connect(navNew, &QToolButton::clicked, this, [this, moveRow]() { moveRow(m_datasheetModel->rowCount() - 1); });
 
     // Schema tab -- read-only view of a table's full column metadata,
     // including constraints the datasheet grid has no room to show.
@@ -318,8 +372,10 @@ void MainWindow::newDatabase() {
 void MainWindow::closeDatabase() {
     m_db.close();
     m_tableList->clear();
+    m_datasheetSearch->clear();
     m_datasheetModel->clear();
     m_schemaView->setRowCount(0);
+    updateRecordNav();
     setDbLoadedState(false);
     setConnectionIndicator(false);
     m_statusLabel->setText("No database open.");
@@ -352,6 +408,7 @@ QString MainWindow::currentTableName() const {
 }
 
 void MainWindow::onTableSelected(QListWidgetItem *) {
+    m_datasheetSearch->clear(); // a stale filter from the previous table would just hide everything here
     reloadDatasheet();
     reloadSchemaView();
 }
@@ -375,7 +432,11 @@ void MainWindow::reloadSchemaView() {
 
 void MainWindow::reloadDatasheet() {
     QString table = currentTableName();
-    if (table.isEmpty() || !m_db.isOpen()) { m_datasheetModel->clear(); return; }
+    if (table.isEmpty() || !m_db.isOpen()) {
+        m_datasheetModel->clear();
+        updateRecordNav();
+        return;
+    }
 
     QVector<KColumnMeta> schema = m_db.schema(table);
     QStringList columns, readOnlyColumns;
@@ -401,6 +462,41 @@ void MainWindow::reloadDatasheet() {
     m_datasheetModel->setData(table, columns, rows, true, readOnlyColumns);
     m_datasheet->resizeColumnsToContents();
     m_statusLabel->setText(QString("%1: %2 row(s)").arg(table).arg(rows.size()));
+    filterDatasheetRows(m_datasheetSearch->text()); // model reset above drops any prior row-hidden state
+    updateRecordNav();
+}
+
+// Access-style instant filter: hides any row where no cell contains text
+// (case-insensitive), leaving the trailing blank new-record row visible no
+// matter what's typed -- you should always be able to add a row while
+// filtering. No proxy model needed since row indices stay stable (hidden
+// rows are still real rows at the same index, just not painted).
+void MainWindow::filterDatasheetRows(const QString &text) {
+    int realRows = m_datasheetModel->realRowCount();
+    for (int r = 0; r < realRows; r++) {
+        bool hide = false;
+        if (!text.isEmpty()) {
+            hide = true;
+            for (int c = 0; c < m_datasheetModel->columnCount() && hide; c++) {
+                if (m_datasheetModel->index(r, c).data(Qt::DisplayRole).toString().contains(text, Qt::CaseInsensitive))
+                    hide = false;
+            }
+        }
+        m_datasheet->setRowHidden(r, hide);
+    }
+    updateRecordNav();
+}
+
+void MainWindow::updateRecordNav() {
+    int total = m_datasheetModel->realRowCount();
+    int row = m_datasheet->currentIndex().isValid() ? m_datasheet->currentIndex().row() : -1;
+    if (total == 0) {
+        m_recordNavLabel->setText(m_datasheetModel->isNewRecordRow(0) ? "No records yet -- type into the * row" : "No records");
+    } else if (row < 0 || m_datasheetModel->isNewRecordRow(row)) {
+        m_recordNavLabel->setText(QString("%1 record(s)").arg(total));
+    } else {
+        m_recordNavLabel->setText(QString("Row %1 of %2").arg(row + 1).arg(total));
+    }
 }
 
 void MainWindow::addRowViaDatasheet() {

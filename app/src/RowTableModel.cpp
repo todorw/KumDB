@@ -36,7 +36,7 @@ QString RowTableModel::columnNameAt(int col) const {
 
 int RowTableModel::rowCount(const QModelIndex &parent) const {
     if (parent.isValid()) return 0;
-    return m_rows.size();
+    return m_rows.size() + (m_editable ? 1 : 0); // +1 for the trailing blank new-record row
 }
 
 int RowTableModel::columnCount(const QModelIndex &parent) const {
@@ -51,7 +51,13 @@ static const QPair<QString, QVariant> *findField(const KRow &row, const QString 
 }
 
 QVariant RowTableModel::data(const QModelIndex &index, int role) const {
-    if (!index.isValid() || index.row() >= m_rows.size()) return {};
+    if (!index.isValid() || index.row() >= rowCount()) return {};
+
+    if (isNewRecordRow(index.row())) {
+        // blank placeholder row -- nothing to show yet, it isn't a real record
+        return {};
+    }
+
     const KRow &row = m_rows[index.row()];
 
     if (index.column() == 0) {
@@ -73,6 +79,18 @@ bool RowTableModel::setData(const QModelIndex &index, const QVariant &value, int
 
     const QString colName = m_columns[index.column() - 1];
     if (m_readOnlyColumns.contains(colName)) return false;
+
+    if (isNewRecordRow(index.row())) {
+        if (!value.isValid() || value.isNull()) return false; // nothing typed -- don't insert an all-NULL row
+        QString err;
+        if (!m_db->addRow(m_table, {{colName, value}}, &err)) {
+            emit editFailed(err);
+            return false;
+        }
+        emit newRowInserted();
+        return true;
+    }
+
     quint64 id = idAt(index.row());
 
     QString err;
@@ -95,13 +113,14 @@ bool RowTableModel::setData(const QModelIndex &index, const QVariant &value, int
 }
 
 QVariant RowTableModel::headerData(int section, Qt::Orientation orientation, int role) const {
-    if (role != Qt::DisplayRole) return {};
     if (orientation == Qt::Horizontal) {
+        if (role != Qt::DisplayRole) return {};
         if (section == 0) return QStringLiteral("id");
         if (section - 1 < m_columns.size()) return m_columns[section - 1];
         return {};
     }
-    return section + 1;
+    if (role == Qt::DisplayRole) return isNewRecordRow(section) ? QStringLiteral("*") : QString::number(section + 1);
+    return {};
 }
 
 Qt::ItemFlags RowTableModel::flags(const QModelIndex &index) const {
