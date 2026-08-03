@@ -1286,6 +1286,74 @@ static void test_multi_column_group_by(void) {
     teardown(db);
 }
 
+static void test_grouping_sets(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE sales (region TEXT, rep TEXT, amount FLOAT)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, rep, amount) VALUES ('east', 'alice', 100.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, rep, amount) VALUES ('east', 'bob', 150.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, rep, amount) VALUES ('west', 'alice', 50.0)"));
+    ASSERT_OK(sql(db, "INSERT INTO sales (region, rep, amount) VALUES ('west', 'carol', 200.0)"));
+
+    KdbRows *rows = NULL;
+
+    /* ROLLUP(region, rep): 4 base (region,rep) groups + 2 region subtotals
+     * (rep rolled up to NULL) + 1 grand total (both rolled up) = 7 rows */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT region, rep, SUM(amount) AS total FROM sales GROUP BY ROLLUP(region, rep)", &rows, NULL));
+    ASSERT_EQ(rows ? rows->count : 0, 7u);
+    if (rows) {
+        int found_grand_total = 0;
+        for (size_t i = 0; i < rows->count; i++) {
+            const KdbField *region_f = kdb_row_get(&rows->rows[i], "region");
+            const KdbField *rep_f = kdb_row_get(&rows->rows[i], "rep");
+            if (region_f && region_f->type == KDB_TYPE_NULL && rep_f && rep_f->type == KDB_TYPE_NULL) {
+                found_grand_total = 1;
+                double total = 0;
+                ASSERT_OK(kdb_row_get_float(&rows->rows[i], "total", &total));
+                ASSERT(total > 499.9 && total < 500.1); /* 100+150+50+200 */
+            }
+        }
+        ASSERT(found_grand_total);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* CUBE(region, rep): 4 base groups + 2 region subtotals + 3 rep
+     * subtotals (3 distinct reps) + 1 grand total = 10 rows */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT region, rep, SUM(amount) AS total FROM sales GROUP BY CUBE(region, rep)", &rows, NULL));
+    ASSERT_EQ(rows ? rows->count : 0, 10u);
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* GROUPING SETS lists exactly the sets asked for, nothing implied --
+     * (region) and () only, no full (region,rep) breakdown */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT region, SUM(amount) AS total FROM sales GROUP BY GROUPING SETS ((region), ())", &rows, NULL));
+    ASSERT_EQ(rows ? rows->count : 0, 3u); /* 2 regions + 1 grand total */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* HAVING filters the unioned result the same as any other GROUP BY */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT region, rep, SUM(amount) AS total FROM sales GROUP BY ROLLUP(region, rep) HAVING total > 140",
+        &rows, NULL));
+    ASSERT_EQ(rows ? rows->count : 0, 5u); /* bob(150), carol(200), east(250), west(250), grand total(500) */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* ROLLUP() a single column: base groups + one grand total */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT region, SUM(amount) AS total FROM sales GROUP BY ROLLUP(region)", &rows, NULL));
+    ASSERT_EQ(rows ? rows->count : 0, 3u); /* east, west, grand total */
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* error paths */
+    ASSERT_ERR(sql(db, "SELECT region, rep, SUM(amount) FROM sales GROUP BY CUBE(region, rep, region, rep, region)")); /* too many CUBE columns */
+    ASSERT_ERR(sql(db, "SELECT SUM(amount) FROM sales GROUP BY ROLLUP region, rep)"));                                  /* missing '(' */
+    ASSERT_ERR(sql(db, "SELECT rep, SUM(amount) FROM sales GROUP BY ROLLUP(region)"));                                  /* rep isn't in any grouping set */
+    ASSERT_ERR(sql(db, "SELECT * FROM sales GROUP BY ROLLUP(region)"));                                                 /* '*' with GROUP BY, ROLLUP included */
+
+    teardown(db);
+}
+
 static void test_having(void) {
     KumDB *db;
     setup(&db);
@@ -3685,6 +3753,7 @@ int main(void) {
     test_group_by_extensions();
     test_aggregate_filter();
     test_multi_column_group_by();
+    test_grouping_sets();
     test_having();
     test_union();
     test_intersect_except();

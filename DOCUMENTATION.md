@@ -424,7 +424,7 @@ INSERT INTO t (col, ...) VALUES (val, ...) ON CONFLICT (col, ...) DO NOTHING | D
 SELECT [DISTINCT] * | item, ... FROM t | (SELECT ...) [[AS] alias]
     [[INNER|LEFT [OUTER]|RIGHT [OUTER]|FULL [OUTER]|CROSS] JOIN t2 [[AS] alias2] [ON a.col OP (b.col|literal) [AND ...]]]*
     [WHERE cond [AND|OR cond ...]]
-    [GROUP BY col, ...]
+    [GROUP BY col, ... | ROLLUP(col, ...) | CUBE(col, ...) | GROUPING SETS ((col, ...), ...)]
     [HAVING cond [AND|OR cond ...]]
     [(UNION|INTERSECT|EXCEPT) [ALL] SELECT ...]*
     [ORDER BY col [ASC|DESC], ...]
@@ -787,6 +787,35 @@ SELECT region, COUNT(DISTINCT rep) AS n_reps, STRING_AGG(rep, ', ') AS reps
 `STRING_AGG`/`GROUP_CONCAT` only works as a `GROUP BY`-collapsing
 aggregate, not as a window function (`OVER (...)` on it is rejected) —
 the other aggregates can be either, `OVER`'s presence is what decides.
+
+**`GROUP BY ROLLUP(...)`/`CUBE(...)`/`GROUPING SETS (...)`** compute
+several grouping sets in one query and union the results together — the
+same rows you'd get running one plain `GROUP BY` per set and `UNION
+ALL`-ing them by hand. A column not in a given output row's own set comes
+back `NULL` for that row (this engine has no `GROUPING()` function, so
+that `NULL` isn't distinguished from a real stored `NULL`):
+
+```sql
+SELECT region, rep, SUM(amount) AS total FROM sales GROUP BY ROLLUP(region, rep)
+```
+
+`ROLLUP(a, b, c)` produces one grouping set per prefix — `(a,b,c)`,
+`(a,b)`, `(a)`, `()` — a hierarchical subtotal-then-grand-total pattern
+(the query above gets a subtotal per region, a subtotal per rep within
+each region, and a grand total). `CUBE(a, b)` produces every subset —
+`(a,b)`, `(a)`, `(b)`, `()` — capped at 4 columns to keep its 2^n
+grouping sets bounded; use `ROLLUP` instead for more columns if a
+hierarchical breakdown (not every combination) is enough. `GROUPING
+SETS ((a,b), (a), ())` lists the exact sets wanted and nothing more —
+`GROUPING SETS ((region), ())` gets region subtotals plus a grand total
+but skips the full `(region, rep)` breakdown `ROLLUP(region, rep)` would
+include. Each of `ROLLUP`/`CUBE`/`GROUPING SETS` must be the entire
+`GROUP BY` clause (not mixed with plain columns — `GROUP BY region,
+ROLLUP(rep)` isn't supported), and every `SELECT` item still needs to be
+an aggregate or one of the columns mentioned somewhere in the clause,
+same rule plain `GROUP BY` uses — just checked against the union of
+every listed set rather than one fixed column list. `HAVING` filters the
+unioned result the same as any other `GROUP BY`.
 
 Any `GROUP BY`-collapsing aggregate — `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/
 `STRING_AGG`/`GROUP_CONCAT`, `DISTINCT` or not — accepts a trailing

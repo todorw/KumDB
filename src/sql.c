@@ -3882,6 +3882,13 @@ static int sql__eval_func_item(const SqlSelectItem *item, const KdbRow *row, Kdb
 #define KDB_SQL_MAX_GROUP_COLS 8
 #define KDB_SQL_MAX_COUNT_DISTINCT_VALS 128
 
+/* ROLLUP(a,b,c)/CUBE(a,b)/GROUPING SETS ((a,b),(a),()) all expand to a
+ * fixed list of grouping sets -- see the GROUP BY parsing block in
+ * sql__exec_select_core. CUBE is capped at KDB_SQL_MAX_CUBE_COLS columns
+ * to keep its 2^n grouping sets within KDB_SQL_MAX_GROUPING_SETS. */
+#define KDB_SQL_MAX_GROUPING_SETS 16
+#define KDB_SQL_MAX_CUBE_COLS      4
+
 typedef struct {
     /* one group-by column's value per slot, pointing into the source
      * rows; NULL = that column was missing/null on this group's rows.
@@ -5916,23 +5923,132 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
     int where_used_parens = 0;
     if (!sql__parse_where_expr(p, db, has_join ? NULL : alias1, alias1, &where_tree, &where_used_parens)) return kdb_last_status();
 
+    /* group_cols/ngroup_cols is always the UNION of every column mentioned
+     * anywhere in the GROUP BY clause -- for a plain "GROUP BY a, b" that's
+     * just {a,b}; for ROLLUP/CUBE it's the full column list passed to them
+     * (every column appears in at least the largest generated set); for
+     * GROUPING SETS it's the deduplicated union across every listed set.
+     * Used for the "column must appear in GROUP BY" validation below,
+     * which doesn't care which particular set a column ends up in, only
+     * that it's grouped by *some* set (anything not in a given row's own
+     * set becomes NULL there -- see grouping_sets_cols/n_grouping_sets).
+     *
+     * grouping_sets_cols/grouping_sets_ncols/n_grouping_sets is the actual
+     * list of grouping sets to aggregate over, one sql__compute_aggregates
+     * call each, unioned together into one result below. A plain
+     * "GROUP BY a, b" (n_grouping_sets left at 0) is handled as a single
+     * implicit set equal to group_cols itself, so the common case pays no
+     * extra cost and behaves exactly as before ROLLUP/CUBE/GROUPING SETS
+     * existed. */
     char group_cols[KDB_SQL_MAX_GROUP_COLS][KDB_SQL_IDENT_BUF];
     int  ngroup_cols = 0;
+    char grouping_sets_cols[KDB_SQL_MAX_GROUPING_SETS][KDB_SQL_MAX_GROUP_COLS][KDB_SQL_IDENT_BUF];
+    int  grouping_sets_ncols[KDB_SQL_MAX_GROUPING_SETS];
+    int  n_grouping_sets = 0;
+
     if (sql__kw_is(&p->cur, "GROUP")) {
         sql__advance(p);
         if (!sql__kw_is(&p->cur, "BY")) { sql__free_cond_node(where_tree); return sql__err("expected BY after GROUP"); }
         sql__advance(p);
-        for (;;) {
-            const char *gcol;
-            if (!sql__ident_text(&p->cur, &gcol)) { sql__free_cond_node(where_tree); return sql__err("expected a column name after GROUP BY"); }
-            if (ngroup_cols >= KDB_SQL_MAX_GROUP_COLS) { sql__free_cond_node(where_tree); return sql__err("too many GROUP BY columns (max %d)", KDB_SQL_MAX_GROUP_COLS); }
-            snprintf(group_cols[ngroup_cols++], sizeof(group_cols[0]), "%.255s", gcol);
+
+        if (sql__kw_is(&p->cur, "ROLLUP") || sql__kw_is(&p->cur, "CUBE")) {
+            int is_cube = sql__kw_is(&p->cur, "CUBE");
             sql__advance(p);
-            if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
-            break;
+            if (p->cur.type != SQLTOK_LPAREN) { sql__free_cond_node(where_tree); return sql__err("expected '(' after %s", is_cube ? "CUBE" : "ROLLUP"); }
+            sql__advance(p);
+            for (;;) {
+                const char *gcol;
+                if (!sql__ident_text(&p->cur, &gcol)) { sql__free_cond_node(where_tree); return sql__err("expected a column name inside %s(...)", is_cube ? "CUBE" : "ROLLUP"); }
+                if (ngroup_cols >= KDB_SQL_MAX_GROUP_COLS) { sql__free_cond_node(where_tree); return sql__err("too many columns in %s(...) (max %d)", is_cube ? "CUBE" : "ROLLUP", KDB_SQL_MAX_GROUP_COLS); }
+                snprintf(group_cols[ngroup_cols++], sizeof(group_cols[0]), "%.255s", gcol);
+                sql__advance(p);
+                if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+                break;
+            }
+            if (p->cur.type != SQLTOK_RPAREN) { sql__free_cond_node(where_tree); return sql__err("expected ')' closing %s(...)", is_cube ? "CUBE" : "ROLLUP"); }
+            sql__advance(p);
+
+            if (is_cube && ngroup_cols > KDB_SQL_MAX_CUBE_COLS) {
+                sql__free_cond_node(where_tree);
+                return sql__err("CUBE(...) supports at most %d columns here -- keeps its 2^n grouping sets bounded",
+                                 KDB_SQL_MAX_CUBE_COLS);
+            }
+
+            if (is_cube) {
+                int nsubsets = 1 << ngroup_cols;
+                for (int mask = nsubsets - 1; mask >= 0; mask--) {
+                    int si = n_grouping_sets++;
+                    int nc = 0;
+                    for (int b = 0; b < ngroup_cols; b++) {
+                        if (mask & (1 << b)) snprintf(grouping_sets_cols[si][nc++], sizeof(grouping_sets_cols[0][0]), "%.255s", group_cols[b]);
+                    }
+                    grouping_sets_ncols[si] = nc;
+                }
+            } else {
+                for (int i = ngroup_cols; i >= 0; i--) {
+                    int si = n_grouping_sets++;
+                    for (int k = 0; k < i; k++) snprintf(grouping_sets_cols[si][k], sizeof(grouping_sets_cols[0][0]), "%.255s", group_cols[k]);
+                    grouping_sets_ncols[si] = i;
+                }
+            }
+
+        } else if (sql__kw_is(&p->cur, "GROUPING")) {
+            sql__advance(p);
+            if (!sql__kw_is(&p->cur, "SETS")) { sql__free_cond_node(where_tree); return sql__err("expected SETS after GROUPING"); }
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_LPAREN) { sql__free_cond_node(where_tree); return sql__err("expected '(' after GROUPING SETS"); }
+            sql__advance(p);
+            for (;;) {
+                if (n_grouping_sets >= KDB_SQL_MAX_GROUPING_SETS) { sql__free_cond_node(where_tree); return sql__err("too many grouping sets (max %d)", KDB_SQL_MAX_GROUPING_SETS); }
+                if (p->cur.type != SQLTOK_LPAREN) { sql__free_cond_node(where_tree); return sql__err("expected '(' to start an entry inside GROUPING SETS(...)"); }
+                sql__advance(p);
+                int si = n_grouping_sets++;
+                int nc = 0;
+                if (p->cur.type != SQLTOK_RPAREN) {
+                    for (;;) {
+                        const char *gcol;
+                        if (!sql__ident_text(&p->cur, &gcol)) { sql__free_cond_node(where_tree); return sql__err("expected a column name inside a GROUPING SETS(...) entry"); }
+                        if (nc >= KDB_SQL_MAX_GROUP_COLS) { sql__free_cond_node(where_tree); return sql__err("too many columns in one GROUPING SETS(...) entry (max %d)", KDB_SQL_MAX_GROUP_COLS); }
+                        snprintf(grouping_sets_cols[si][nc++], sizeof(grouping_sets_cols[0][0]), "%.255s", gcol);
+                        sql__advance(p);
+                        if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+                        break;
+                    }
+                }
+                grouping_sets_ncols[si] = nc;
+                if (p->cur.type != SQLTOK_RPAREN) { sql__free_cond_node(where_tree); return sql__err("expected ')' closing a GROUPING SETS(...) entry"); }
+                sql__advance(p);
+
+                for (int k = 0; k < nc; k++) {
+                    int dup = 0;
+                    for (int u = 0; u < ngroup_cols; u++) if (strcmp(group_cols[u], grouping_sets_cols[si][k]) == 0) { dup = 1; break; }
+                    if (!dup) {
+                        if (ngroup_cols >= KDB_SQL_MAX_GROUP_COLS) { sql__free_cond_node(where_tree); return sql__err("too many distinct columns across GROUPING SETS(...) (max %d)", KDB_SQL_MAX_GROUP_COLS); }
+                        snprintf(group_cols[ngroup_cols++], sizeof(group_cols[0]), "%.255s", grouping_sets_cols[si][k]);
+                    }
+                }
+                if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+                break;
+            }
+            if (p->cur.type != SQLTOK_RPAREN) { sql__free_cond_node(where_tree); return sql__err("expected ')' closing GROUPING SETS(...)"); }
+            sql__advance(p);
+
+        } else {
+            for (;;) {
+                const char *gcol;
+                if (!sql__ident_text(&p->cur, &gcol)) { sql__free_cond_node(where_tree); return sql__err("expected a column name after GROUP BY"); }
+                if (ngroup_cols >= KDB_SQL_MAX_GROUP_COLS) { sql__free_cond_node(where_tree); return sql__err("too many GROUP BY columns (max %d)", KDB_SQL_MAX_GROUP_COLS); }
+                snprintf(group_cols[ngroup_cols++], sizeof(group_cols[0]), "%.255s", gcol);
+                sql__advance(p);
+                if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+                break;
+            }
+            n_grouping_sets = 1;
+            grouping_sets_ncols[0] = ngroup_cols;
+            for (int k = 0; k < ngroup_cols; k++) snprintf(grouping_sets_cols[0][k], sizeof(grouping_sets_cols[0][0]), "%.255s", group_cols[k]);
         }
     }
-    int has_group_by = ngroup_cols > 0;
+    int has_group_by = n_grouping_sets > 0;
 
     if (has_case && (has_aggregate || has_group_by)) {
         sql__free_cond_node(where_tree);
@@ -6021,10 +6137,37 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
         if (needs_filtering) sql__filter_rows_tree(db, alias1, all, where_tree);
         sql__free_cond_node(where_tree);
 
-        KdbRows *agg = NULL;
-        KdbStatus ast = sql__compute_aggregates(all, items, nitems, group_cols, ngroup_cols, &agg);
+        /* One sql__compute_aggregates pass per grouping set (just one for
+         * a plain GROUP BY, or none at all -- a bare aggregate with no
+         * GROUP BY -- in which case group_cols/ngroup_cols, empty, is
+         * used directly for that single implicit summary-row pass), the
+         * results unioned together. A SELECT item not in a given set's own
+         * columns comes back NULL for that set's rows automatically --
+         * sql__compute_aggregates only fills a SQL_AGG_NONE item from
+         * group_cols entries it was actually given, see its key_ref
+         * lookup -- so ROLLUP/CUBE/GROUPING SETS need no separate
+         * NULL-padding step here. */
+        int nsets = n_grouping_sets > 0 ? n_grouping_sets : 1;
+        KdbRows *agg = (KdbRows *)calloc(1, sizeof(KdbRows));
+        KdbStatus ast = agg ? KDB_OK : KDB_ERR_OOM;
+        if (!agg) kdb_err_oom("grouping sets result");
+        for (int si = 0; si < nsets && ast == KDB_OK; si++) {
+            KdbRows *partial = NULL;
+            ast = sql__compute_aggregates(all, items, nitems,
+                                           n_grouping_sets > 0 ? grouping_sets_cols[si] : group_cols,
+                                           n_grouping_sets > 0 ? grouping_sets_ncols[si] : ngroup_cols,
+                                           &partial);
+            if (ast != KDB_OK) break;
+            if (!sql__append_rows(agg, partial)) {
+                kdb_rows_free(partial);
+                ast = KDB_ERR_OOM;
+                kdb_err_oom("grouping sets result");
+                break;
+            }
+            free(partial);
+        }
         kdb_rows_free(all);
-        if (ast != KDB_OK) { sql__free_cond_node(having_tree); return ast; }
+        if (ast != KDB_OK) { kdb_rows_free(agg); sql__free_cond_node(having_tree); return ast; }
 
         sql__filter_rows_tree(db, alias1, agg, having_tree);
         sql__free_cond_node(having_tree);

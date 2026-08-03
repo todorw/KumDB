@@ -34,7 +34,7 @@ extern "C" {
  *   SELECT [DISTINCT] * | item, ... FROM t [[AS] alias]
  *                               [[INNER|LEFT [OUTER]|RIGHT [OUTER]|FULL [OUTER]|CROSS] JOIN t2 [[AS] alias2] [ON a.col OP (b.col|literal) [AND ...]]]*
  *                               [WHERE cond [AND|OR cond ...]]
- *                               [GROUP BY col, ...]
+ *                               [GROUP BY col, ... | ROLLUP(col, ...) | CUBE(col, ...) | GROUPING SETS ((col, ...), ...)]
  *                               [HAVING cond [AND|OR cond ...]]
  *                               [(UNION|INTERSECT|EXCEPT) [ALL] SELECT ...]*
  *                               [ORDER BY col [ASC|DESC], ...]
@@ -135,6 +135,26 @@ extern "C" {
  * GROUP_CONCAT only works as a GROUP BY-collapsing aggregate, not as a
  * window function (OVER on it is rejected, unlike the others). HAVING
  * filters the aggregated output (needs GROUP BY or an aggregate item).
+ *
+ * GROUP BY ROLLUP(col, ...)/CUBE(col, ...)/GROUPING SETS ((col, ...),
+ * ...) compute several grouping sets in one query and union the results,
+ * same as running one plain GROUP BY per set and UNION ALL-ing them --
+ * any column not in a given output row's own set comes back NULL for
+ * that row (not distinguished from a real NULL -- no GROUPING() function
+ * here). ROLLUP(a, b, c) produces one grouping set per prefix -- (a,b,c),
+ * (a,b), (a), () -- a hierarchical subtotal/grand-total pattern. CUBE(a,
+ * b) produces every subset -- (a,b), (a), (b), () -- capped at 4 columns
+ * (2^n grouping sets stay bounded); use ROLLUP for more columns if a
+ * hierarchical breakdown (not every combination) is enough. GROUPING
+ * SETS lists the exact sets wanted, nothing implied -- GROUPING SETS
+ * ((a,b), (a), ()) gets you a subset of what ROLLUP(a,b) would (skips
+ * (a) if you don't list it, or add sets ROLLUP/CUBE wouldn't generate).
+ * Each of these must be the entire GROUP BY clause (not mixed with plain
+ * columns), and every SELECT item still has to be either an aggregate
+ * or one of the columns mentioned somewhere in the clause -- same rule
+ * plain GROUP BY uses, just checked against the union of every listed
+ * set rather than one fixed list. HAVING filters the unioned result the
+ * same as any other GROUP BY.
  *
  * Any GROUP BY-collapsing aggregate call (DISTINCT or not) accepts a
  * trailing FILTER (WHERE cond [AND|OR cond ...]): only rows matching that
