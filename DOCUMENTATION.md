@@ -165,6 +165,16 @@ Turning either flag on later (`kdb_alter_column_nullable`/
 rows that already violate the new rule aren't retroactively checked or
 rewritten.
 
+`kdb_add_foreign_key(db, table, col, ref_table, ref_col)` and
+`kdb_add_check_constraint(db, table, col, op, literal)` add real,
+enforced constraints the same way from the C API directly (`kdb_drop_
+foreign_key` removes one) — see `ALTER TABLE`'s `REFERENCES`/`FOREIGN
+KEY`/`CHECK` forms below for the full semantics (RESTRICT-only foreign
+keys, the six-comparison-operator CHECK, both enforced by `kdb_add`/
+`kdb_update`/`kdb_delete` regardless of whether they were declared from
+SQL or here). `kdb_batch_import` bypasses both, same as it bypasses NOT
+NULL/UNIQUE.
+
 ### Errors, printing, misc
 
 ```c
@@ -401,9 +411,13 @@ kdb_exec_sql_params(db, "SELECT * FROM employees WHERE age >= ? AND dept = ?",
 ```
 
 ```sql
-CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX], ...)
-ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX]
+CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2)], ...
+                [, FOREIGN KEY (col) REFERENCES t2(col2)]* [, CHECK (col op literal)]*)
+ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2)]
+ALTER TABLE t ADD FOREIGN KEY (col) REFERENCES t2(col2)
+ALTER TABLE t ADD CHECK (col op literal)
 ALTER TABLE t DROP [COLUMN] col
+ALTER TABLE t DROP FOREIGN KEY (col)
 ALTER TABLE t RENAME COLUMN col TO new_col
 ALTER TABLE t ALTER [COLUMN] col TYPE newtype | SET NOT NULL | DROP NOT NULL | SET UNIQUE | DROP UNIQUE
 ALTER TABLE t RENAME [TO] new_name
@@ -596,6 +610,61 @@ ALTER TABLE staff ALTER COLUMN zip_code TYPE INT
 
 Renaming a column or table that another one already has that name
 errors rather than silently colliding.
+
+**Foreign keys** — `REFERENCES t2(col2)` as a column modifier, or
+`FOREIGN KEY (col) REFERENCES t2(col2)` as its own table-level item —
+declare that `col` must always be `NULL` or equal to some existing
+`t2.col2` value. `t2`/`col2` must already exist (checked immediately, not
+deferred):
+
+```sql
+CREATE TABLE customers (name TEXT UNIQUE)
+CREATE TABLE orders (customer_id INT REFERENCES customers(id), amount FLOAT)
+```
+
+From then on, `INSERT`/`UPDATE` giving `customer_id` a non-`NULL` value
+with no matching `customers.id` is rejected, and deleting or updating
+away a `customers` row that some `orders` row still points to is
+rejected too — `RESTRICT` semantics, no `ON DELETE`/`ON UPDATE`
+`CASCADE`/`SET NULL`, the write is simply refused. `col2` can be a real
+column or one of the `id`/`created_at`/`updated_at` pseudo-columns —
+referencing a table's own auto `id` (as above) is the most common case,
+even though `id` isn't a "real" schema column (`kdb_table_has_column` is
+false for it — a plain `SELECT id` doesn't project it back out either,
+a separate, pre-existing gap; use `RETURNING id` to get it after an
+`INSERT`). One foreign key per column, no composite (multi-column)
+foreign keys. `ALTER TABLE t ADD FOREIGN KEY (col) REFERENCES
+t2(col2)` adds one after the fact, same validation and enforcement;
+`ALTER TABLE t DROP FOREIGN KEY (col)` removes it. Dropping `col` itself
+takes its foreign key with it.
+
+**`CHECK (col op literal)`** — as its own table-level item in
+`CREATE TABLE`, or via `ALTER TABLE t ADD CHECK (col op literal)` —
+restricts `col`'s values:
+
+```sql
+CREATE TABLE orders (customer_id INT REFERENCES customers(id), amount FLOAT,
+                      CHECK (amount > 0))
+```
+
+`op` is one of `=`, `!=`, `>`, `>=`, `<`, `<=` (no `BETWEEN`/`IN`/`LIKE`/
+etc — those would need more than one literal or a list); the literal is
+an `INT`/`FLOAT`/`BOOL`/`STRING` value, never `NULL` (a `NULL` value
+never violates a `CHECK`, same as real SQL, so comparing against `NULL`
+isn't a meaningful constraint and is rejected at parse time). Enforced
+the same way `NOT NULL`/`UNIQUE` are — `INSERT`/`UPDATE` reject a
+violation from here on, existing rows aren't retroactively checked.
+Dropping `col` drops any `CHECK` on it too, rather than leaving a
+dangling reference to a nonexistent column.
+
+Both features needed real fields on `KdbColumn`/`KdbTableHeader` (a
+foreign key alone needs a whole table-name-sized string) rather than
+being squeezed into the small reserved padding every earlier extension
+this year carved from instead — the on-disk file format bumped to 2.0
+over it, which is a real, intentional break from 1.x (KumDB refuses to
+open a 1.x file with a clear "versions are incompatible" error, same as
+it already did for any major-version mismatch, rather than misreading
+old data).
 
 **`WHERE`** supports `=`, `!=`/`<>`, `>`, `>=`, `<`, `<=`,
 `BETWEEN a AND b`, `IN (a, b, c)`, `IS [NOT] NULL`, `LIKE 'pat'`

@@ -2353,6 +2353,87 @@ static void test_alter_column_type(void) {
     teardown(db);
 }
 
+static void test_foreign_keys_and_checks(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE customers (name TEXT UNIQUE)"));
+    ASSERT_OK(sql(db, "CREATE TABLE orders (customer_id INT REFERENCES customers(id), amount FLOAT, CHECK (amount > 0))"));
+
+    KdbRows *rows = NULL;
+
+    /* REFERENCES customers(id) -- id is a pseudo-column (not a real
+     * schema entry), still a valid FK target; get it back via RETURNING
+     * (plain SELECT doesn't project id -- a separate, pre-existing gap). */
+    ASSERT_OK(kdb_exec_sql(db, "INSERT INTO customers (name) VALUES ('alice') RETURNING id", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    int64_t alice_id = 0;
+    if (rows && rows->count == 1) ASSERT_OK(kdb_row_get_int(&rows->rows[0], "id", &alice_id));
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* FK: a valid reference is accepted, a bad one is rejected */
+    {
+        char q[128];
+        snprintf(q, sizeof(q), "INSERT INTO orders (customer_id, amount) VALUES (%lld, 100.0)", (long long)alice_id);
+        ASSERT_OK(sql(db, q));
+    }
+    ASSERT_ERR(sql(db, "INSERT INTO orders (customer_id, amount) VALUES (999999, 50.0)"));
+
+    /* a NULL FK value is always allowed */
+    ASSERT_OK(sql(db, "INSERT INTO orders (amount) VALUES (25.0)"));
+
+    /* CHECK (amount > 0) */
+    {
+        char q[128];
+        snprintf(q, sizeof(q), "INSERT INTO orders (customer_id, amount) VALUES (%lld, -5.0)", (long long)alice_id);
+        ASSERT_ERR(sql(db, q));
+    }
+
+    /* RESTRICT: can't delete/update away a row still referenced */
+    ASSERT_ERR(sql(db, "DELETE FROM customers WHERE name = 'alice'"));
+    {
+        char q[128];
+        snprintf(q, sizeof(q), "UPDATE customers SET id = %lld WHERE name = 'alice'", (long long)(alice_id + 1000));
+        ASSERT_ERR(sql(db, q));
+    }
+    /* once unreferenced, it's fine again */
+    ASSERT_OK(sql(db, "DELETE FROM orders"));
+    ASSERT_OK(sql(db, "DELETE FROM customers WHERE name = 'alice'"));
+
+    /* FK child-side also applies to UPDATE, not just INSERT */
+    ASSERT_OK(sql(db, "INSERT INTO customers (name) VALUES ('bob')"));
+    ASSERT_OK(sql(db, "INSERT INTO orders (amount) VALUES (10.0)"));
+    ASSERT_ERR(sql(db, "UPDATE orders SET customer_id = 888888 WHERE amount = 10.0"));
+
+    /* table-level FOREIGN KEY (col) REFERENCES t(col) / CHECK (col op lit) */
+    ASSERT_OK(sql(db, "CREATE TABLE products (sku TEXT, price FLOAT, "
+                      "CHECK (price >= 0), FOREIGN KEY (sku) REFERENCES customers(name))"));
+    ASSERT_OK(sql(db, "INSERT INTO products (sku, price) VALUES ('bob', 9.99)"));
+    ASSERT_ERR(sql(db, "INSERT INTO products (sku, price) VALUES ('nope', 9.99)"));
+    ASSERT_ERR(sql(db, "INSERT INTO products (sku, price) VALUES ('bob', -1.0)"));
+
+    /* ALTER TABLE ADD FOREIGN KEY / ADD CHECK / DROP FOREIGN KEY */
+    ASSERT_OK(sql(db, "CREATE TABLE reviews (product_sku TEXT, stars INT)"));
+    ASSERT_OK(sql(db, "ALTER TABLE reviews ADD FOREIGN KEY (product_sku) REFERENCES products(sku)"));
+    ASSERT_OK(sql(db, "ALTER TABLE reviews ADD CHECK (stars >= 1)"));
+    ASSERT_ERR(sql(db, "INSERT INTO reviews (product_sku, stars) VALUES ('doesnotexist', 5)"));
+    ASSERT_ERR(sql(db, "INSERT INTO reviews (product_sku, stars) VALUES ('bob', 0)"));
+    ASSERT_OK(sql(db, "INSERT INTO reviews (product_sku, stars) VALUES ('bob', 5)"));
+    ASSERT_OK(sql(db, "ALTER TABLE reviews DROP FOREIGN KEY (product_sku)"));
+    ASSERT_OK(sql(db, "INSERT INTO reviews (product_sku, stars) VALUES ('doesnotexist', 3)"));
+
+    /* DROP COLUMN cleans up any CHECK constraint on it, not left dangling */
+    ASSERT_OK(sql(db, "ALTER TABLE reviews DROP COLUMN stars"));
+    ASSERT_OK(sql(db, "ALTER TABLE reviews ADD COLUMN stars INT"));
+    ASSERT_OK(sql(db, "INSERT INTO reviews (product_sku, stars) VALUES ('bob', 0)")); /* old CHECK didn't linger */
+
+    /* error paths */
+    ASSERT_ERR(sql(db, "CREATE TABLE bad1 (x INT REFERENCES nonexistent(y))"));
+    ASSERT_ERR(sql(db, "CREATE TABLE bad2 (x INT REFERENCES customers(nonexistent))"));
+    ASSERT_ERR(sql(db, "ALTER TABLE orders ADD FOREIGN KEY (customer_id) REFERENCES customers(id)")); /* already has one */
+
+    teardown(db);
+}
+
 static void test_unique_not_null_constraints(void) {
     KumDB *db;
     setup(&db);
@@ -3849,6 +3930,7 @@ int main(void) {
     test_distinct();
     test_alter_table();
     test_alter_column_type();
+    test_foreign_keys_and_checks();
     test_unique_not_null_constraints();
     test_create_drop_index();
     test_composite_indexes();

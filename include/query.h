@@ -8,6 +8,14 @@
 
 void kdb_query_init(KdbQuery *q);
 
+/* id/created_at/updated_at aren't real entries in a table's column list
+ * (kdb_table_has_column is false for them) -- they're always-present
+ * pseudo-columns tracked directly on KdbRecord instead. Returns 1 and
+ * fills *out if col_name is one of them, 0 otherwise (kumdb.c's foreign
+ * key code reuses this: those three are still valid FOREIGN KEY
+ * reference targets even though they're not "real" columns). */
+int kdb__pseudo_column_value(const KdbRecord *r, const char *col_name, KdbValue *out);
+
 /* Starts a new AND-group, OR'd against whatever groups came before it.
  * Filters added after this call land in the new group until the next
  * call (if any). Same precedence as SQL: AND binds tighter than OR. */

@@ -297,6 +297,31 @@ KdbStatus kdb_alter_column_unique(KumDB *db, const char *table_name, const char 
  * new_type is already the column's current type. */
 KdbStatus kdb_alter_column_type(KumDB *db, const char *table_name, const char *col_name, KdbFieldType new_type);
 
+/* Adds a foreign key: col_name on table_name must always be NULL or equal
+ * to some existing ref_table.ref_col value. Both ref_table and ref_col
+ * must already exist (checked right away, not deferred). Enforced from
+ * here on: kdb_add/kdb_update reject a non-NULL col_name value with no
+ * matching row in ref_table.ref_col; deleting or updating away a row in
+ * ref_table that col_name still points to is rejected too (RESTRICT --
+ * no ON DELETE/UPDATE CASCADE or SET NULL). One FK per column
+ * (KDB_ERR_EXISTS if col_name already has one); no composite
+ * (multi-column) foreign keys. kdb_batch_import bypasses this, same as
+ * it bypasses NOT NULL/UNIQUE. */
+KdbStatus kdb_add_foreign_key(KumDB *db, const char *table_name, const char *col_name,
+                              const char *ref_table, const char *ref_col);
+
+/* Removes col_name's foreign key. KDB_ERR_NOT_FOUND if it doesn't have one. */
+KdbStatus kdb_drop_foreign_key(KumDB *db, const char *table_name, const char *col_name);
+
+/* Adds a CHECK (col_name op literal) constraint -- op must be one of
+ * KDB_OP_EQ/NEQ/GT/GTE/LT/LTE (no BETWEEN/IN/LIKE/etc); literal.type must
+ * be INT/FLOAT/BOOL/STRING (literal.name is ignored). Enforced from here
+ * on the same way NOT NULL/UNIQUE are -- a NULL value never violates a
+ * CHECK, existing rows aren't retroactively checked. KDB_ERR_FULL past
+ * KDB_MAX_CHECK_CONSTRAINTS constraints on one table. */
+KdbStatus kdb_add_check_constraint(KumDB *db, const char *table_name, const char *col_name,
+                                   KdbOperator op, const KdbField *literal);
+
 /* Renames the table itself (the file on disk, and the header's own
  * stored name). KDB_ERR_EXISTS if new_name already names a table. */
 KdbStatus kdb_rename_table(KumDB *db, const char *old_name, const char *new_name);

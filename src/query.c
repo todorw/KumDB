@@ -143,7 +143,7 @@ int kdb_query_is_empty(const KdbQuery *q) {
 }
 
 
-static int kdb__pseudo_column_value(const KdbRecord *r, const char *col_name, KdbValue *out) {
+int kdb__pseudo_column_value(const KdbRecord *r, const char *col_name, KdbValue *out) {
     if (strcmp(col_name, "id") == 0) {
         kdb_value_from_int((int64_t)r->id, out);
         return 1;

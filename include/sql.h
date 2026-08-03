@@ -16,9 +16,13 @@ extern "C" {
  * lines) are both stripped like whitespace anywhere a token could start.
  *
  * Supported:
- *   CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX], ...)
- *   ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX]
+ *   CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2)], ...
+ *                   [, FOREIGN KEY (col) REFERENCES t2(col2)]* [, CHECK (col OP literal)]*)
+ *   ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2)]
+ *   ALTER TABLE t ADD FOREIGN KEY (col) REFERENCES t2(col2)
+ *   ALTER TABLE t ADD CHECK (col OP literal)
  *   ALTER TABLE t DROP [COLUMN] col
+ *   ALTER TABLE t DROP FOREIGN KEY (col)
  *   ALTER TABLE t RENAME COLUMN col TO new_col
  *   ALTER TABLE t ALTER [COLUMN] col TYPE newtype | SET NOT NULL | DROP NOT NULL | SET UNIQUE | DROP UNIQUE
  *   ALTER TABLE t RENAME [TO] new_name
@@ -430,6 +434,32 @@ extern "C" {
  * untouched, never half-migrated. A no-op if newtype is already the
  * column's current type. Renaming a column or table to a name that's
  * already taken errors rather than colliding silently.
+ *
+ * REFERENCES t2(col2), as a column modifier (col TYPE ... REFERENCES
+ * t2(col2)) or as its own table-level item (FOREIGN KEY (col) REFERENCES
+ * t2(col2)), declares a foreign key -- t2 and col2 must already exist
+ * (checked immediately, not deferred). From then on, col must be NULL or
+ * equal to some existing t2.col2 value: INSERT/UPDATE giving col a
+ * non-NULL value with no match in t2.col2 is rejected, and deleting or
+ * updating away a t2 row that col still points to is rejected too
+ * (RESTRICT -- no ON DELETE/UPDATE CASCADE or SET NULL, the write is
+ * simply refused). col2 can be a real column or one of the id/created_at/
+ * updated_at pseudo-columns (referencing a table's own auto id is the
+ * most common case, even though it's not a "real" schema column). One FK
+ * per column; no composite (multi-column) foreign keys. ALTER TABLE t ADD
+ * FOREIGN KEY (col) REFERENCES t2(col2) adds one after the fact (same
+ * validation and enforcement); ALTER TABLE t DROP FOREIGN KEY (col)
+ * removes it. Dropping col itself drops its FK along with it.
+ *
+ * CHECK (col OP literal), as its own table-level item in CREATE TABLE or
+ * via ALTER TABLE t ADD CHECK (col OP literal), restricts col's values --
+ * OP is one of =, !=, >, >=, <, <= (no BETWEEN/IN/LIKE/etc), literal an
+ * INT/FLOAT/BOOL/STRING (not NULL -- a NULL value never violates a CHECK,
+ * same as real SQL, so comparing against NULL isn't a meaningful check
+ * and is rejected at parse time). Enforced the same way NOT NULL/UNIQUE
+ * are -- INSERT/UPDATE reject a violation from here on, existing rows
+ * aren't retroactively checked. Dropping col drops any CHECK on it too,
+ * rather than leaving a dangling reference to a nonexistent column.
  *
  * WHERE conditions: col = val, != / <>, >, >=, <, <=, BETWEEN a AND b,
  * IN (a, b, c), IS NULL, IS NOT NULL, LIKE 'pat' (standard SQL wildcards --

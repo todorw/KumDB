@@ -8,8 +8,18 @@
 
 
 #define KDB_MAGIC              0x4B554D44
-#define KDB_VERSION_MAJOR      1
-#define KDB_VERSION_MINOR      3
+/* File format 2.0 -- KdbColumn/KdbTableHeader both grew real fields (FK
+ * definitions, CHECK constraints) instead of carving them out of reserved
+ * padding the way every 1.x extension did; a foreign key alone needs a
+ * whole table-name-sized string, far more than 1.x's padding budget had
+ * left. This makes 2.x genuinely incompatible with 1.x files -- caught by
+ * kdb_storage_validate_header's existing version_major check, which
+ * already rejects a mismatch with a clear "versions are incompatible"
+ * message rather than silently misreading old data. Fine for this
+ * project (no deployed 1.x data to migrate); a real migration tool would
+ * read a 1.x header's own (smaller) layout explicitly and rewrite it. */
+#define KDB_VERSION_MAJOR      2
+#define KDB_VERSION_MINOR      0
 #define KDB_VERSION_PATCH      0
 
 #define KDB__STR(x) #x
@@ -37,6 +47,10 @@
  * format's on-disk layout. */
 #define KDB_MAX_COMPOSITE_COLS    4
 #define KDB_MAX_COMPOSITE_INDEXES 4
+
+/* A table can have at most this many CHECK constraints (see KdbCheckDef) --
+ * independent of column count, since several could target the same column. */
+#define KDB_MAX_CHECK_CONSTRAINTS 8
 
 /* ARRAY/OBJECT values: bounds so a corrupt/malicious file can't make
  * deserialization recurse or allocate without limit. */
@@ -102,7 +116,19 @@ typedef struct {
      * INDEX/INDEXED/KEY (lookup-only, no enforcement) does not -- see
      * sql__parse_column_modifiers in sql.c. */
     uint8_t  unique;
-    uint8_t  _pad[5];
+    /* Added in file format 2.0 -- a real struct growth, not a padding
+     * carve-out (a foreign key needs a whole table-name-sized string; see
+     * the KDB_VERSION_MAJOR comment above). has_fk==0 means this column
+     * has no foreign key; when it's 1, every INSERT/UPDATE giving this
+     * column a non-NULL value requires a matching row in
+     * fk_ref_table.fk_ref_col to already exist (kdb__check_fk_insert in
+     * kumdb.c -- needs KumDB* to open the referenced table, so it can't
+     * live in table.c like NOT NULL/UNIQUE do). One FK per column, no
+     * composite (multi-column) foreign keys. */
+    uint8_t  has_fk;
+    char     fk_ref_table[KDB_MAX_NAME_LEN];
+    char     fk_ref_col[KDB_MAX_NAME_LEN];
+    uint8_t  _pad[4]; /* reserved for a future 2.x minor extension, same discipline as _pad above used to follow */
 } KdbColumn;
 
 
@@ -114,6 +140,26 @@ typedef struct {
     uint8_t col_positions[KDB_MAX_COMPOSITE_COLS];
     uint8_t n_cols;
 } KdbCompositeIndexDef;
+
+/* A CHECK (col_name OP literal) table constraint -- added in file format
+ * 2.0, alongside KdbColumn's FK fields (see KDB_VERSION_MAJOR above).
+ * op is restricted to the six plain comparisons (EQ/NEQ/GT/GTE/LT/LTE,
+ * see kdb_table_add_check in table.c) -- no BETWEEN/IN/LIKE/etc, which
+ * would need more than one literal or a list. The literal is a fixed-size
+ * value (val_type says which union/string member is meaningful), never a
+ * heap pointer, so this stays plain, fwrite-safe data like the rest of
+ * KdbTableHeader -- a real KdbValue's STRING/BLOB/ARRAY/OBJECT variants
+ * hold heap pointers that can't be persisted this way. */
+typedef struct {
+    char     col_name[KDB_MAX_NAME_LEN];
+    uint8_t  op;         /* KdbOperator, one of EQ/NEQ/GT/GTE/LT/LTE */
+    uint8_t  val_type;   /* KdbType: INT/FLOAT/BOOL/STRING */
+    uint8_t  _pad[2];
+    int64_t  as_int;
+    double   as_float;
+    uint8_t  as_bool;
+    char     as_string[128];
+} KdbCheckDef;
 
 typedef struct {
     uint32_t magic;
@@ -139,6 +185,11 @@ typedef struct {
     KdbCompositeIndexDef composite_indexes[KDB_MAX_COMPOSITE_INDEXES];
     uint8_t  n_composite_indexes;
     uint8_t  _pad1[43];
+    /* Added in file format 2.0, a real struct growth like KdbColumn's FK
+     * fields above (see KDB_VERSION_MAJOR) -- CHECK constraints. */
+    KdbCheckDef checks[KDB_MAX_CHECK_CONSTRAINTS];
+    uint8_t     n_checks;
+    uint8_t     _pad2[63]; /* reserved for a future 2.x minor extension */
     KdbColumn columns[KDB_MAX_COLUMNS];
 } KdbTableHeader;
 

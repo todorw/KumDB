@@ -82,6 +82,23 @@ KdbStatus kdb_table_set_unique(KdbTable *tbl, const char *col_name, int unique);
  * new_type is already the column's type. */
 KdbStatus kdb_table_alter_column_type(KdbTable *tbl, const char *col_name, KdbType new_type);
 
+/* Sets col_name's FK metadata only -- doesn't verify ref_table/ref_col
+ * exist (this handle can't look up another table; kdb_add_foreign_key in
+ * kumdb.c does that first). KDB_ERR_EXISTS if col_name already has a FK
+ * (one per column, no composite foreign keys). */
+KdbStatus kdb_table_add_foreign_key(KdbTable *tbl, const char *col_name,
+                                    const char *ref_table, const char *ref_col);
+
+/* Clears col_name's FK metadata. KDB_ERR_NOT_FOUND if it doesn't have one. */
+KdbStatus kdb_table_drop_foreign_key(KdbTable *tbl, const char *col_name);
+
+/* Adds a CHECK (col_name op literal) constraint -- op must be one of
+ * KDB_OP_EQ/NEQ/GT/GTE/LT/LTE, literal one of INT/FLOAT/BOOL/STRING.
+ * Enforced from here on (kdb_table_insert/kdb_table_update reject a
+ * violation), existing rows aren't retroactively checked.
+ * KDB_ERR_FULL past KDB_MAX_CHECK_CONSTRAINTS. */
+KdbStatus kdb_table_add_check(KdbTable *tbl, const char *col_name, KdbOperator op, const KdbValue *literal);
+
 const KdbColumn *kdb_table_get_column(const KdbTable *tbl,
                                       const char     *col_name);
 

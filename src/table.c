@@ -188,7 +188,7 @@ KdbStatus kdb_table_drop_column(KdbTable   *tbl,
         }
     }
 
-    
+
     for (uint32_t i = 0; i < tbl->index_count; i++) {
         if (tbl->indices[i] && strcmp(tbl->indices[i]->col_name, col_name) == 0) {
             kdb_index_free(tbl->indices[i]);
@@ -199,7 +199,22 @@ KdbStatus kdb_table_drop_column(KdbTable   *tbl,
         }
     }
 
-    
+    /* Any FK on col_name goes away automatically -- it lives on the
+     * KdbColumn entry itself, just shifted out above. CHECK constraints
+     * are stored separately (by name, not position), so a dropped
+     * column's checks need their own cleanup -- otherwise a dangling
+     * check referencing a nonexistent column would linger. */
+    for (uint32_t i = 0; i < tbl->header.n_checks; ) {
+        if (strcmp(tbl->header.checks[i].col_name, col_name) == 0) {
+            memmove(&tbl->header.checks[i], &tbl->header.checks[i + 1],
+                    (tbl->header.n_checks - i - 1) * sizeof(KdbCheckDef));
+            tbl->header.n_checks--;
+        } else {
+            i++;
+        }
+    }
+
+
     extern const char *kdb__drop_col_name;
     kdb__drop_col_name = col_name;
 
@@ -551,6 +566,123 @@ KdbStatus kdb_table_alter_column_type(KdbTable *tbl, const char *col_name, KdbTy
     return kdb_storage_flush_header(tbl);
 }
 
+/* Sets col_name's FK metadata only -- doesn't verify ref_table/ref_col
+ * actually exist (this handle has no way to look up another table; see
+ * kdb_add_foreign_key in kumdb.c, which validates that before calling
+ * this). One FK per column -- KDB_ERR_EXISTS if col_name already has one. */
+KdbStatus kdb_table_add_foreign_key(KdbTable *tbl, const char *col_name,
+                                    const char *ref_table, const char *ref_col) {
+    if (!tbl || !col_name || !ref_table || !ref_col) {
+        kdb_err_null_arg("tbl/col_name/ref_table/ref_col", "kdb_table_add_foreign_key");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (!kdb_table_has_column(tbl, col_name)) {
+        kdb_err_field_not_found(col_name, tbl->name);
+        return KDB_ERR_NOT_FOUND;
+    }
+    KdbColumn *col = NULL;
+    for (uint32_t i = 0; i < tbl->header.column_count; i++) {
+        if (strcmp(tbl->header.columns[i].name, col_name) == 0) { col = &tbl->header.columns[i]; break; }
+    }
+    if (col->has_fk) {
+        kdb_set_error(KDB_ERR_EXISTS, "Column '%s' on table '%s' already has a foreign key.", col_name, tbl->name);
+        return KDB_ERR_EXISTS;
+    }
+    col->has_fk = 1;
+    KDB_STRLCPY(col->fk_ref_table, ref_table, KDB_MAX_NAME_LEN);
+    KDB_STRLCPY(col->fk_ref_col, ref_col, KDB_MAX_NAME_LEN);
+
+    tbl->dirty = 1;
+    return kdb_storage_flush_header(tbl);
+}
+
+KdbStatus kdb_table_drop_foreign_key(KdbTable *tbl, const char *col_name) {
+    if (!tbl || !col_name) {
+        kdb_err_null_arg("tbl/col_name", "kdb_table_drop_foreign_key");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (!kdb_table_has_column(tbl, col_name)) {
+        kdb_err_field_not_found(col_name, tbl->name);
+        return KDB_ERR_NOT_FOUND;
+    }
+    KdbColumn *col = NULL;
+    for (uint32_t i = 0; i < tbl->header.column_count; i++) {
+        if (strcmp(tbl->header.columns[i].name, col_name) == 0) { col = &tbl->header.columns[i]; break; }
+    }
+    if (!col->has_fk) {
+        kdb_set_error(KDB_ERR_NOT_FOUND, "Column '%s' on table '%s' has no foreign key.", col_name, tbl->name);
+        return KDB_ERR_NOT_FOUND;
+    }
+    col->has_fk = 0;
+    memset(col->fk_ref_table, 0, sizeof(col->fk_ref_table));
+    memset(col->fk_ref_col, 0, sizeof(col->fk_ref_col));
+
+    tbl->dirty = 1;
+    return kdb_storage_flush_header(tbl);
+}
+
+/* CHECK (col_name op literal) -- op restricted to the six plain
+ * comparisons (see KdbCheckDef), literal one of INT/FLOAT/BOOL/STRING
+ * (not NULL -- a NULL comparison target isn't a meaningful check, reject
+ * it explicitly rather than storing something kdb_value_matches would
+ * evaluate ambiguously). Enforced from here on by kdb_table_check_
+ * insert_constraints/kdb_table_check_update_constraints below, same as
+ * NOT NULL/UNIQUE -- existing rows aren't retroactively checked. */
+KdbStatus kdb_table_add_check(KdbTable *tbl, const char *col_name, KdbOperator op, const KdbValue *literal) {
+    if (!tbl || !col_name || !literal) {
+        kdb_err_null_arg("tbl/col_name/literal", "kdb_table_add_check");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (!kdb_table_has_column(tbl, col_name)) {
+        kdb_err_field_not_found(col_name, tbl->name);
+        return KDB_ERR_NOT_FOUND;
+    }
+    if (op != KDB_OP_EQ && op != KDB_OP_NEQ && op != KDB_OP_GT &&
+        op != KDB_OP_GTE && op != KDB_OP_LT && op != KDB_OP_LTE) {
+        kdb_set_error(KDB_ERR_BAD_ARG, "CHECK only supports =, !=, >, >=, <, <= comparisons.");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (literal->type != KDB_TYPE_INT && literal->type != KDB_TYPE_FLOAT &&
+        literal->type != KDB_TYPE_BOOL && literal->type != KDB_TYPE_STRING) {
+        kdb_set_error(KDB_ERR_BAD_ARG, "CHECK's literal must be an INT, FLOAT, BOOL, or STRING value.");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (tbl->header.n_checks >= KDB_MAX_CHECK_CONSTRAINTS) {
+        kdb_set_error(KDB_ERR_FULL, "Table '%s' already has %d CHECK constraints (max).", tbl->name, KDB_MAX_CHECK_CONSTRAINTS);
+        return KDB_ERR_FULL;
+    }
+
+    KdbCheckDef *def = &tbl->header.checks[tbl->header.n_checks];
+    memset(def, 0, sizeof(*def));
+    KDB_STRLCPY(def->col_name, col_name, KDB_MAX_NAME_LEN);
+    def->op       = (uint8_t)op;
+    def->val_type = (uint8_t)literal->type;
+    switch (literal->type) {
+        case KDB_TYPE_INT:    def->as_int   = literal->v.as_int;   break;
+        case KDB_TYPE_FLOAT:  def->as_float = literal->v.as_float; break;
+        case KDB_TYPE_BOOL:   def->as_bool  = literal->v.as_bool;  break;
+        case KDB_TYPE_STRING: KDB_STRLCPY(def->as_string, literal->v.as_string.data, sizeof(def->as_string)); break;
+        default: break;
+    }
+    tbl->header.n_checks++;
+
+    tbl->dirty = 1;
+    return kdb_storage_flush_header(tbl);
+}
+
+/* Builds a real (non-owning-except-string) KdbValue out of a KdbCheckDef's
+ * fixed-size literal, for handing to kdb_value_matches. Caller must
+ * kdb_value_free() the result (the STRING case owns a fresh strdup). */
+static KdbStatus kdb__check_def_to_value(const KdbCheckDef *def, KdbValue *out) {
+    switch ((KdbType)def->val_type) {
+        case KDB_TYPE_INT:    return kdb_value_from_int(def->as_int, out);
+        case KDB_TYPE_FLOAT:  return kdb_value_from_float(def->as_float, out);
+        case KDB_TYPE_BOOL:   return kdb_value_from_bool(def->as_bool, out);
+        case KDB_TYPE_STRING: return kdb_value_from_string(def->as_string, KDB_TYPE_STRING, out);
+        default:              return KDB_ERR_BAD_TYPE;
+    }
+}
+
 const char *kdb__drop_col_name = NULL;
 
 int kdb__drop_column_transform(KdbRecord *r, void *ud) {
@@ -635,6 +767,26 @@ static KdbStatus kdb_table_check_insert_constraints(KdbTable *tbl, const KdbReco
             }
         }
     }
+
+    for (uint32_t i = 0; i < tbl->header.n_checks; i++) {
+        const KdbCheckDef *def = &tbl->header.checks[i];
+        const KdbValue *val = NULL;
+        for (uint32_t j = 0; j < r->field_count; j++) {
+            if (strcmp(r->fields[j].col_name, def->col_name) == 0) { val = &r->fields[j].value; break; }
+        }
+        if (!val || val->type == KDB_TYPE_NULL) continue; /* NULL never violates a CHECK, same as real SQL */
+
+        KdbValue lit;
+        if (kdb__check_def_to_value(def, &lit) != KDB_OK) return kdb_last_status();
+        int ok = kdb_value_matches(val, (KdbOperator)def->op, &lit, NULL);
+        kdb_value_free(&lit);
+        if (!ok) {
+            kdb_set_error(KDB_ERR_VALIDATION,
+                "CHECK constraint on column '%s' violated on table '%s'.",
+                def->col_name, tbl->name);
+            return KDB_ERR_VALIDATION;
+        }
+    }
     return KDB_OK;
 }
 
@@ -656,8 +808,8 @@ static KdbStatus kdb_table_check_insert_constraints(KdbTable *tbl, const KdbReco
  * error already set -- nothing is rewritten either way when this fails,
  * the caller checks before calling kdb_storage_rewrite at all. */
 static KdbStatus kdb_table_check_update_constraints(KdbTable *tbl, const KdbQuery *query, const KdbRecord *patch) {
-    int any_enforced = 0;
-    for (uint32_t i = 0; i < tbl->header.column_count; i++) {
+    int any_enforced = tbl->header.n_checks > 0;
+    for (uint32_t i = 0; !any_enforced && i < tbl->header.column_count; i++) {
         if (!tbl->header.columns[i].nullable || tbl->header.columns[i].unique) { any_enforced = 1; break; }
     }
     if (!any_enforced) return KDB_OK;
@@ -722,6 +874,38 @@ static KdbStatus kdb_table_check_update_constraints(KdbTable *tbl, const KdbQuer
             }
         }
     }
+
+    for (uint32_t i = 0; i < tbl->header.n_checks && result == KDB_OK; i++) {
+        const KdbCheckDef *def = &tbl->header.checks[i];
+
+        for (size_t r = 0; r < all.count && result == KDB_OK; r++) {
+            KdbRecord *ri = &all.rows[r];
+            if (!kdb_query_matches(query, ri)) continue;
+
+            const KdbValue *vi = NULL;
+            for (uint32_t k = 0; k < patch->field_count; k++) {
+                if (strcmp(patch->fields[k].col_name, def->col_name) == 0) { vi = &patch->fields[k].value; break; }
+            }
+            if (!vi) {
+                for (uint32_t k = 0; k < ri->field_count; k++) {
+                    if (strcmp(ri->fields[k].col_name, def->col_name) == 0) { vi = &ri->fields[k].value; break; }
+                }
+            }
+            if (!vi || vi->type == KDB_TYPE_NULL) continue;
+
+            KdbValue lit;
+            if (kdb__check_def_to_value(def, &lit) != KDB_OK) { result = kdb_last_status(); break; }
+            int ok = kdb_value_matches(vi, (KdbOperator)def->op, &lit, NULL);
+            kdb_value_free(&lit);
+            if (!ok) {
+                kdb_set_error(KDB_ERR_VALIDATION,
+                    "CHECK constraint on column '%s' on table '%s' would be violated by this UPDATE (row %llu).",
+                    def->col_name, tbl->name, (unsigned long long)ri->id);
+                result = KDB_ERR_VALIDATION;
+            }
+        }
+    }
+
     kdb_result_free(&all);
     return result;
 }

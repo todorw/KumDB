@@ -928,6 +928,193 @@ void kdb_close(KumDB *db) {
 }
 
 
+/* Child-side FK enforcement: for every column in tbl with a foreign key,
+ * if the row's value for it is non-NULL, the referenced table must
+ * already have a row whose ref_col equals it. Lives here (not table.c)
+ * because it needs KumDB* to open the referenced table by name -- a bare
+ * KdbTable* handle only knows its own schema. Used by kdb_add_validated
+ * and kdb_update (and, transitively, kdb_tx_add/kdb_tx_update and every
+ * SQL INSERT/UPDATE, all of which route through those two). */
+static KdbStatus kdb__check_fk_child(KumDB *db, KdbTable *tbl, const KdbRecord *r) {
+    for (uint32_t i = 0; i < tbl->header.column_count; i++) {
+        const KdbColumn *col = &tbl->header.columns[i];
+        if (!col->has_fk) continue;
+
+        const KdbRecordField *f = kdb_record_get_field(r, col->name);
+        if (!f || f->value.type == KDB_TYPE_NULL) continue; /* a NULL FK value is never checked, same as UNIQUE */
+
+        KdbTable *ref_tbl = kdb__get_table(db, col->fk_ref_table);
+        if (!ref_tbl) {
+            kdb_set_error(KDB_ERR_VALIDATION,
+                "Foreign key on '%s.%s' references table '%s', which doesn't exist (or couldn't be opened).",
+                tbl->name, col->name, col->fk_ref_table);
+            return KDB_ERR_VALIDATION;
+        }
+
+        KdbQuery q;
+        kdb_query_init(&q);
+        KdbStatus st = kdb_query_add_filter_value(&q, col->fk_ref_col, KDB_OP_EQ, &f->value, NULL);
+        if (st != KDB_OK) { kdb_query_free(&q); return st; }
+        size_t count = 0;
+        st = kdb_query_count(ref_tbl, &q, &count);
+        kdb_query_free(&q);
+        if (st != KDB_OK) return st;
+
+        if (count == 0) {
+            kdb_set_error(KDB_ERR_VALIDATION,
+                "Foreign key violation: '%s.%s' has no matching row in '%s.%s'.",
+                tbl->name, col->name, col->fk_ref_table, col->fk_ref_col);
+            return KDB_ERR_VALIDATION;
+        }
+    }
+    return KDB_OK;
+}
+
+/* Same idea for UPDATE's would-be result -- only columns the patch
+ * actually touches (an untouched FK column can't become invalid). */
+static KdbStatus kdb__check_fk_child_update(KumDB *db, KdbTable *tbl, const KdbRecord *patch) {
+    for (uint32_t i = 0; i < patch->field_count; i++) {
+        const KdbColumn *col = NULL;
+        for (uint32_t c = 0; c < tbl->header.column_count; c++) {
+            if (strcmp(tbl->header.columns[c].name, patch->fields[i].col_name) == 0) { col = &tbl->header.columns[c]; break; }
+        }
+        if (!col || !col->has_fk) continue;
+
+        const KdbValue *val = &patch->fields[i].value;
+        if (val->type == KDB_TYPE_NULL) continue;
+
+        KdbTable *ref_tbl = kdb__get_table(db, col->fk_ref_table);
+        if (!ref_tbl) {
+            kdb_set_error(KDB_ERR_VALIDATION,
+                "Foreign key on '%s.%s' references table '%s', which doesn't exist (or couldn't be opened).",
+                tbl->name, col->name, col->fk_ref_table);
+            return KDB_ERR_VALIDATION;
+        }
+
+        KdbQuery q;
+        kdb_query_init(&q);
+        KdbStatus st = kdb_query_add_filter_value(&q, col->fk_ref_col, KDB_OP_EQ, val, NULL);
+        if (st != KDB_OK) { kdb_query_free(&q); return st; }
+        size_t count = 0;
+        st = kdb_query_count(ref_tbl, &q, &count);
+        kdb_query_free(&q);
+        if (st != KDB_OK) return st;
+
+        if (count == 0) {
+            kdb_set_error(KDB_ERR_VALIDATION,
+                "Foreign key violation: '%s.%s' has no matching row in '%s.%s'.",
+                tbl->name, col->name, col->fk_ref_table, col->fk_ref_col);
+            return KDB_ERR_VALIDATION;
+        }
+    }
+    return KDB_OK;
+}
+
+typedef struct {
+    char table[KDB_MAX_NAME_LEN];
+    char col[KDB_MAX_NAME_LEN];
+} KdbFkReferencer;
+
+/* Every (table, column) anywhere in the data directory whose FK points at
+ * (ref_table_name, ref_col_name) -- scans every table's own schema (not
+ * just already-open ones, via kdb_storage_list_tables + kdb__get_table),
+ * so this also catches a referencing table this KumDB handle hasn't
+ * touched yet this session. Fine at the table counts this engine targets
+ * -- not cached, re-scanned on every call. */
+static KdbStatus kdb__find_fk_referencers(KumDB *db, const char *ref_table_name, const char *ref_col_name,
+                                          KdbFkReferencer *out, uint32_t max_out, uint32_t *count_out) {
+    *count_out = 0;
+    char names[KDB_MAX_TABLES][KDB_MAX_NAME_LEN];
+    uint32_t n = 0;
+    KdbStatus st = kdb_storage_list_tables(db->data_dir, names, &n);
+    if (st != KDB_OK) return st;
+
+    for (uint32_t i = 0; i < n && *count_out < max_out; i++) {
+        KdbTable *t = kdb__get_table(db, names[i]);
+        if (!t) continue;
+        for (uint32_t c = 0; c < t->header.column_count && *count_out < max_out; c++) {
+            const KdbColumn *col = &t->header.columns[c];
+            if (col->has_fk && strcmp(col->fk_ref_table, ref_table_name) == 0 && strcmp(col->fk_ref_col, ref_col_name) == 0) {
+                snprintf(out[*count_out].table, sizeof(out[*count_out].table), "%.127s", names[i]);
+                snprintf(out[*count_out].col, sizeof(out[*count_out].col), "%.127s", col->name);
+                (*count_out)++;
+            }
+        }
+    }
+    return KDB_OK;
+}
+
+#define KDB_MAX_FK_REFERENCERS 32
+
+/* RESTRICT: before removing/changing rows in tbl, reject if any other
+ * table's FK still points at a value one of the affected rows currently
+ * holds. affected is the exact row set this DELETE/UPDATE matches
+ * (fetched by the caller before anything is actually mutated); patch is
+ * NULL for DELETE, or the UPDATE's patch (a column the patch doesn't
+ * touch can't orphan anyone, so those are skipped). No CASCADE/SET NULL
+ * -- the write is simply rejected, same as a real FOREIGN KEY with no ON
+ * DELETE/UPDATE clause defaults to. */
+static KdbStatus kdb__check_fk_restrict(KumDB *db, KdbTable *tbl, const KdbResult *affected, const KdbRecord *patch) {
+    /* Real columns plus the three always-present pseudo-columns (id/
+     * created_at/updated_at, tracked on KdbRecord itself, not in
+     * tbl->header.columns[]) -- "id" is the single most common FOREIGN
+     * KEY reference target, so this can't just loop over header.columns. */
+    uint32_t ncols = tbl->header.column_count;
+    const char *pseudo_names[3] = { "id", "created_at", "updated_at" };
+
+    for (uint32_t ci = 0; ci < ncols + 3; ci++) {
+        const char *col_name = (ci < ncols) ? tbl->header.columns[ci].name : pseudo_names[ci - ncols];
+
+        if (patch) {
+            int touched = 0;
+            for (uint32_t k = 0; k < patch->field_count; k++) {
+                if (strcmp(patch->fields[k].col_name, col_name) == 0) { touched = 1; break; }
+            }
+            if (!touched) continue;
+        }
+
+        KdbFkReferencer refs[KDB_MAX_FK_REFERENCERS];
+        uint32_t nrefs = 0;
+        KdbStatus st = kdb__find_fk_referencers(db, tbl->name, col_name, refs, KDB_MAX_FK_REFERENCERS, &nrefs);
+        if (st != KDB_OK) return st;
+        if (nrefs == 0) continue;
+
+        for (size_t r = 0; r < affected->count; r++) {
+            KdbValue pseudo_val;
+            const KdbValue *fval = NULL;
+            if (kdb__pseudo_column_value(&affected->rows[r], col_name, &pseudo_val)) {
+                fval = &pseudo_val;
+            } else {
+                const KdbRecordField *f = kdb_record_get_field(&affected->rows[r], col_name);
+                if (f) fval = &f->value;
+            }
+            if (!fval || fval->type == KDB_TYPE_NULL) continue;
+
+            for (uint32_t ri = 0; ri < nrefs; ri++) {
+                KdbTable *rt = kdb__get_table(db, refs[ri].table);
+                if (!rt) continue;
+
+                KdbQuery q;
+                kdb_query_init(&q);
+                KdbStatus qst = kdb_query_add_filter_value(&q, refs[ri].col, KDB_OP_EQ, fval, NULL);
+                if (qst != KDB_OK) { kdb_query_free(&q); return qst; }
+                size_t count = 0;
+                qst = kdb_query_count(rt, &q, &count);
+                kdb_query_free(&q);
+                if (qst != KDB_OK) return qst;
+
+                if (count > 0) {
+                    kdb_set_error(KDB_ERR_VALIDATION,
+                        "Foreign key violation: '%s.%s' row(s) referenced by '%s.%s' can't be %s.",
+                        tbl->name, col_name, refs[ri].table, refs[ri].col, patch ? "changed" : "deleted");
+                    return KDB_ERR_VALIDATION;
+                }
+            }
+        }
+    }
+    return KDB_OK;
+}
+
 KdbStatus kdb_add(KumDB *db, const char *table_name, const KdbField *fields) {
     return kdb_add_validated(db, table_name, fields, NULL, NULL);
 }
@@ -965,6 +1152,9 @@ KdbStatus kdb_add_validated(KumDB            *db,
             return KDB_ERR_VALIDATION;
         }
     }
+
+    KdbStatus fkst = kdb__check_fk_child(db, tbl, r);
+    if (fkst != KDB_OK) { kdb_record_free(r); return fkst; }
 
     KdbStatus st = kdb_table_insert(tbl, r);
     kdb_record_free(r);
@@ -1176,6 +1366,19 @@ KdbStatus kdb_update(KumDB            *db,
     KdbRecord *patch = kdb__fields_to_record(set_fields);
     if (!patch) { kdb_query_free(&q); return kdb_last_status(); }
 
+    st = kdb__check_fk_child_update(db, tbl, patch);
+    if (st != KDB_OK) { kdb_record_free(patch); kdb_query_free(&q); return st; }
+
+    /* RESTRICT: fetch exactly the rows this UPDATE matches before anything
+     * is mutated, so kdb__check_fk_restrict can see each one's current
+     * (pre-patch) value for any column another table's FK depends on. */
+    KdbResult affected;
+    st = kdb_query_execute(tbl, &q, &affected);
+    if (st != KDB_OK) { kdb_record_free(patch); kdb_query_free(&q); return st; }
+    st = kdb__check_fk_restrict(db, tbl, &affected, patch);
+    kdb_result_free(&affected);
+    if (st != KDB_OK) { kdb_record_free(patch); kdb_query_free(&q); return st; }
+
     if (updated_out) *updated_out = 0;
     st = kdb_table_update(tbl, &q, patch, updated_out);
 
@@ -1203,6 +1406,15 @@ KdbStatus kdb_delete(KumDB       *db,
     KdbQuery q;
     KdbStatus st = kdb__build_query(filters, &q);
     if (st != KDB_OK) return st;
+
+    /* RESTRICT: same idea as kdb_update -- see which rows this DELETE
+     * would actually remove before removing them. */
+    KdbResult affected;
+    st = kdb_query_execute(tbl, &q, &affected);
+    if (st != KDB_OK) { kdb_query_free(&q); return st; }
+    st = kdb__check_fk_restrict(db, tbl, &affected, NULL);
+    kdb_result_free(&affected);
+    if (st != KDB_OK) { kdb_query_free(&q); return st; }
 
     if (deleted_out) *deleted_out = 0;
     st = kdb_table_delete(tbl, &q, deleted_out);
@@ -1412,6 +1624,76 @@ KdbStatus kdb_alter_column_type(KumDB *db, const char *table_name, const char *c
     KdbTable *tbl = kdb__get_table(db, table_name);
     if (!tbl) return kdb_last_status();
     return kdb_table_alter_column_type(tbl, col_name, new_type);
+}
+
+KdbStatus kdb_add_foreign_key(KumDB *db, const char *table_name, const char *col_name,
+                              const char *ref_table, const char *ref_col) {
+    if (!db || !table_name || !col_name || !ref_table || !ref_col) {
+        kdb_err_null_arg("db/table_name/col_name/ref_table/ref_col", "kdb_add_foreign_key");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+
+    /* Validated here, not in kdb_table_add_foreign_key -- a bare KdbTable*
+     * handle has no way to look up another table by name, only KumDB does. */
+    KdbTable *ref_tbl = kdb__get_table(db, ref_table);
+    if (!ref_tbl) {
+        kdb_set_error(KDB_ERR_NOT_FOUND, "Foreign key on '%s.%s' references table '%s', which doesn't exist.",
+                      table_name, col_name, ref_table);
+        return KDB_ERR_NOT_FOUND;
+    }
+    /* id/created_at/updated_at are always-valid reference targets even
+     * though they're not "real" columns (kdb_table_has_column is false
+     * for them) -- the most natural thing to REFERENCES is a table's own
+     * auto id. */
+    int ref_col_ok = kdb_table_has_column(ref_tbl, ref_col) ||
+                     strcmp(ref_col, "id") == 0 || strcmp(ref_col, "created_at") == 0 ||
+                     strcmp(ref_col, "updated_at") == 0;
+    if (!ref_col_ok) {
+        kdb_set_error(KDB_ERR_NOT_FOUND, "Foreign key on '%s.%s' references column '%s.%s', which doesn't exist.",
+                      table_name, col_name, ref_table, ref_col);
+        return KDB_ERR_NOT_FOUND;
+    }
+    return kdb_table_add_foreign_key(tbl, col_name, ref_table, ref_col);
+}
+
+KdbStatus kdb_drop_foreign_key(KumDB *db, const char *table_name, const char *col_name) {
+    if (!db || !table_name || !col_name) {
+        kdb_err_null_arg("db/table_name/col_name", "kdb_drop_foreign_key");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+    return kdb_table_drop_foreign_key(tbl, col_name);
+}
+
+KdbStatus kdb_add_check_constraint(KumDB *db, const char *table_name, const char *col_name,
+                                   KdbOperator op, const KdbField *literal) {
+    if (!db || !table_name || !col_name || !literal) {
+        kdb_err_null_arg("db/table_name/col_name/literal", "kdb_add_check_constraint");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+
+    KdbValue lit;
+    if (kdb__field_to_value(literal, &lit) != KDB_OK) return kdb_last_status();
+    KdbStatus st = kdb_table_add_check(tbl, col_name, op, &lit);
+    kdb_value_free(&lit);
+    return st;
 }
 
 /* Renames the table itself: evicts any cached handle (closing its fd --

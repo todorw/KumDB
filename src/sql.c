@@ -978,14 +978,20 @@ static KdbStatus sql__type_from_ident(const char *s, KdbFieldType *out) {
     return KDB_ERR_SQL_SYNTAX;
 }
 
-/* NOT NULL / INDEX(ED) / UNIQUE / KEY / PRIMARY KEY / DEFAULT val -- shared
- * between CREATE TABLE's column defs and ALTER TABLE ADD COLUMN. NOT
- * NULL and UNIQUE/PRIMARY KEY are really enforced (kdb_add/kdb_update
- * reject a violation); plain INDEX/INDEXED/KEY only ever set the indexed
- * lookup-hint flag, never enforced -- real SQL's own distinction between
- * a plain index and a uniqueness constraint. The rest (DEFAULT) is
- * accepted and ignored, best-effort SQL DDL compatibility. */
-static KdbStatus sql__parse_column_modifiers(SqlParser *p, const char *col_name, int *nullable, int *indexed, int *unique) {
+/* NOT NULL / INDEX(ED) / UNIQUE / KEY / PRIMARY KEY / REFERENCES / DEFAULT
+ * val -- shared between CREATE TABLE's column defs and ALTER TABLE ADD
+ * COLUMN. NOT NULL and UNIQUE/PRIMARY KEY are really enforced (kdb_add/
+ * kdb_update reject a violation); plain INDEX/INDEXED/KEY only ever set
+ * the indexed lookup-hint flag, never enforced -- real SQL's own
+ * distinction between a plain index and a uniqueness constraint.
+ * REFERENCES ref_table(ref_col) is collected here but not applied --
+ * the caller adds the actual foreign key (via kdb_add_foreign_key, which
+ * needs a KumDB* to validate ref_table/ref_col exist) once the column
+ * itself exists. The rest (DEFAULT) is accepted and ignored, best-effort
+ * SQL DDL compatibility. */
+static KdbStatus sql__parse_column_modifiers(SqlParser *p, const char *col_name, int *nullable, int *indexed, int *unique,
+                                             int *has_fk, char *fk_ref_table, size_t fk_ref_table_size,
+                                             char *fk_ref_col, size_t fk_ref_col_size) {
     for (;;) {
         if (sql__kw_is(&p->cur, "NOT")) {
             sql__advance(p);
@@ -1003,6 +1009,23 @@ static KdbStatus sql__parse_column_modifiers(SqlParser *p, const char *col_name,
             *indexed = 1; *unique = 1; *nullable = 0;
             continue;
         }
+        if (sql__kw_is(&p->cur, "REFERENCES")) {
+            sql__advance(p);
+            const char *rtable;
+            if (!sql__ident_text(&p->cur, &rtable)) return sql__err("expected a table name after REFERENCES for column '%s'", col_name);
+            snprintf(fk_ref_table, fk_ref_table_size, "%.255s", rtable);
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after REFERENCES %s for column '%s'", fk_ref_table, col_name);
+            sql__advance(p);
+            const char *rcol;
+            if (!sql__ident_text(&p->cur, &rcol)) return sql__err("expected a column name inside REFERENCES %s(...) for column '%s'", fk_ref_table, col_name);
+            snprintf(fk_ref_col, fk_ref_col_size, "%.255s", rcol);
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing REFERENCES %s(...) for column '%s'", fk_ref_table, col_name);
+            sql__advance(p);
+            *has_fk = 1;
+            continue;
+        }
         if (sql__kw_is(&p->cur, "DEFAULT")) {
             sql__advance(p);
             sql__advance(p);
@@ -1011,6 +1034,33 @@ static KdbStatus sql__parse_column_modifiers(SqlParser *p, const char *col_name,
         break;
     }
     return KDB_OK;
+}
+
+/* Forward declaration -- sql__case_value_from_token's full definition lives
+ * down with CASE's own parsing code, but CREATE TABLE's CHECK (col op
+ * literal) items (just below) need it too, and CREATE TABLE is parsed
+ * well before CASE is in this file. KDB_SQL_CASE_VAL_BUF (the string
+ * buffer size both share) is defined early for the same reason -- see
+ * its own comment near CASE's other constants for why 512. */
+#define KDB_SQL_CASE_VAL_BUF 512
+static int sql__case_value_from_token(const SqlToken *t, KdbFieldType *type_out,
+                                      int64_t *int_out, double *float_out, int *bool_out,
+                                      char *str_out, size_t str_out_size);
+
+/* Maps a comparison-operator token to the matching KdbOperator -- used by
+ * CREATE TABLE's CHECK (col op literal) items to hand the parsed operator
+ * to kdb_add_check_constraint. t is always one of the six comparison
+ * tokens by construction (checked before this is called). */
+static KdbOperator sql__tok_to_kdb_op(SqlTokType t) {
+    switch (t) {
+        case SQLTOK_EQ:  return KDB_OP_EQ;
+        case SQLTOK_NEQ: return KDB_OP_NEQ;
+        case SQLTOK_GT:  return KDB_OP_GT;
+        case SQLTOK_GTE: return KDB_OP_GTE;
+        case SQLTOK_LT:  return KDB_OP_LT;
+        case SQLTOK_LTE: return KDB_OP_LTE;
+        default:         return KDB_OP_EQ; /* unreachable -- validated at parse time */
+    }
 }
 
 /* Views are stored as rows in a reserved internal table -- reuses the
@@ -1507,7 +1557,116 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
     char names[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
     uint32_t n = 0;
 
+    /* A column's own REFERENCES modifier -- applied (via kdb_add_foreign_
+     * key, which needs KumDB* to validate the referenced table/column)
+     * only after kdb_create_table has actually made the column exist. */
+    int  col_has_fk[KDB_SQL_MAX_COLUMNS];
+    char col_fk_ref_table[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
+    char col_fk_ref_col[KDB_SQL_MAX_COLUMNS][KDB_SQL_IDENT_BUF];
+
+    /* Table-level FOREIGN KEY (col) REFERENCES ref_table(ref_col) items --
+     * same thing, spelled the other standard-SQL way, not tied to one
+     * column definition's own line. */
+#define KDB_SQL_MAX_TABLE_LEVEL_FKS 8
+    char tfk_col[KDB_SQL_MAX_TABLE_LEVEL_FKS][KDB_SQL_IDENT_BUF];
+    char tfk_ref_table[KDB_SQL_MAX_TABLE_LEVEL_FKS][KDB_SQL_IDENT_BUF];
+    char tfk_ref_col[KDB_SQL_MAX_TABLE_LEVEL_FKS][KDB_SQL_IDENT_BUF];
+    int  n_tfk = 0;
+
+    /* Table-level CHECK (col op literal) items. */
+    char         chk_col[KDB_MAX_CHECK_CONSTRAINTS][KDB_SQL_IDENT_BUF];
+    SqlTokType   chk_op_tok[KDB_MAX_CHECK_CONSTRAINTS];
+    KdbFieldType chk_lit_type[KDB_MAX_CHECK_CONSTRAINTS];
+    int64_t      chk_lit_int[KDB_MAX_CHECK_CONSTRAINTS];
+    double       chk_lit_float[KDB_MAX_CHECK_CONSTRAINTS];
+    int          chk_lit_bool[KDB_MAX_CHECK_CONSTRAINTS];
+    char         chk_lit_string[KDB_MAX_CHECK_CONSTRAINTS][KDB_SQL_CASE_VAL_BUF];
+    int          n_chk = 0;
+
     for (;;) {
+        if (sql__kw_is(&p->cur, "FOREIGN")) {
+            sql__advance(p);
+            if (!sql__kw_is(&p->cur, "KEY")) return sql__err("expected KEY after FOREIGN in CREATE TABLE '%s'", table_name);
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after FOREIGN KEY in CREATE TABLE '%s'", table_name);
+            sql__advance(p);
+            const char *fcol;
+            if (!sql__ident_text(&p->cur, &fcol)) return sql__err("expected a column name after FOREIGN KEY ( in CREATE TABLE '%s'", table_name);
+            char fcol_buf[KDB_SQL_IDENT_BUF];
+            snprintf(fcol_buf, sizeof(fcol_buf), "%.255s", fcol);
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' after FOREIGN KEY (%s in CREATE TABLE '%s'", fcol_buf, table_name);
+            sql__advance(p);
+            if (!sql__kw_is(&p->cur, "REFERENCES")) return sql__err("expected REFERENCES after FOREIGN KEY (%s) in CREATE TABLE '%s'", fcol_buf, table_name);
+            sql__advance(p);
+            const char *rtable;
+            if (!sql__ident_text(&p->cur, &rtable)) return sql__err("expected a table name after REFERENCES in CREATE TABLE '%s'", table_name);
+            char rtable_buf[KDB_SQL_IDENT_BUF];
+            snprintf(rtable_buf, sizeof(rtable_buf), "%.255s", rtable);
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after REFERENCES %s in CREATE TABLE '%s'", rtable_buf, table_name);
+            sql__advance(p);
+            const char *rcol;
+            if (!sql__ident_text(&p->cur, &rcol)) return sql__err("expected a column name after REFERENCES %s( in CREATE TABLE '%s'", rtable_buf, table_name);
+            char rcol_buf[KDB_SQL_IDENT_BUF];
+            snprintf(rcol_buf, sizeof(rcol_buf), "%.255s", rcol);
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing REFERENCES %s(%s in CREATE TABLE '%s'", rtable_buf, rcol_buf, table_name);
+            sql__advance(p);
+
+            if (n_tfk >= KDB_SQL_MAX_TABLE_LEVEL_FKS)
+                return sql__err("too many FOREIGN KEY entries in CREATE TABLE '%s' (max %d)", table_name, KDB_SQL_MAX_TABLE_LEVEL_FKS);
+            snprintf(tfk_col[n_tfk], sizeof(tfk_col[0]), "%s", fcol_buf);
+            snprintf(tfk_ref_table[n_tfk], sizeof(tfk_ref_table[0]), "%s", rtable_buf);
+            snprintf(tfk_ref_col[n_tfk], sizeof(tfk_ref_col[0]), "%s", rcol_buf);
+            n_tfk++;
+
+            if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+            break;
+        }
+
+        if (sql__kw_is(&p->cur, "CHECK")) {
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after CHECK in CREATE TABLE '%s'", table_name);
+            sql__advance(p);
+            const char *ccol;
+            if (!sql__ident_text(&p->cur, &ccol)) return sql__err("expected a column name after CHECK ( in CREATE TABLE '%s'", table_name);
+            char ccol_buf[KDB_SQL_IDENT_BUF];
+            snprintf(ccol_buf, sizeof(ccol_buf), "%.255s", ccol);
+            sql__advance(p);
+
+            SqlTokType optok = p->cur.type;
+            if (optok != SQLTOK_EQ && optok != SQLTOK_NEQ && optok != SQLTOK_GT &&
+                optok != SQLTOK_GTE && optok != SQLTOK_LT && optok != SQLTOK_LTE)
+                return sql__err("expected a comparison operator (=, !=, >, >=, <, <=) after CHECK (%s in CREATE TABLE '%s'", ccol_buf, table_name);
+            sql__advance(p);
+
+            KdbFieldType lit_type = KDB_TYPE_NULL;
+            int64_t lit_int = 0; double lit_float = 0; int lit_bool = 0;
+            char lit_str[KDB_SQL_CASE_VAL_BUF];
+            if (!sql__case_value_from_token(&p->cur, &lit_type, &lit_int, &lit_float, &lit_bool, lit_str, sizeof(lit_str)) ||
+                lit_type == KDB_TYPE_NULL)
+                return sql__err("expected an INT/FLOAT/BOOL/STRING literal in CHECK (%s ...) in CREATE TABLE '%s'", ccol_buf, table_name);
+            sql__advance(p);
+
+            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing CHECK (...) in CREATE TABLE '%s'", table_name);
+            sql__advance(p);
+
+            if (n_chk >= KDB_MAX_CHECK_CONSTRAINTS)
+                return sql__err("too many CHECK constraints in CREATE TABLE '%s' (max %d)", table_name, KDB_MAX_CHECK_CONSTRAINTS);
+            snprintf(chk_col[n_chk], sizeof(chk_col[0]), "%s", ccol_buf);
+            chk_op_tok[n_chk]     = optok;
+            chk_lit_type[n_chk]   = lit_type;
+            chk_lit_int[n_chk]    = lit_int;
+            chk_lit_float[n_chk]  = lit_float;
+            chk_lit_bool[n_chk]   = lit_bool;
+            snprintf(chk_lit_string[n_chk], sizeof(chk_lit_string[0]), "%s", lit_str);
+            n_chk++;
+
+            if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
+            break;
+        }
+
         const char *cname;
         if (!sql__ident_text(&p->cur, &cname)) return sql__err("expected a column name in CREATE TABLE '%s'", table_name);
         char this_name[KDB_SQL_IDENT_BUF];
@@ -1530,8 +1689,11 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
             sql__advance(p);
         }
 
-        int nullable = 1, indexed = 0, unique = 0;
-        KdbStatus mst = sql__parse_column_modifiers(p, this_name, &nullable, &indexed, &unique);
+        int nullable = 1, indexed = 0, unique = 0, has_fk = 0;
+        char fk_ref_table[KDB_SQL_IDENT_BUF], fk_ref_col[KDB_SQL_IDENT_BUF];
+        KdbStatus mst = sql__parse_column_modifiers(p, this_name, &nullable, &indexed, &unique,
+                                                    &has_fk, fk_ref_table, sizeof(fk_ref_table),
+                                                    fk_ref_col, sizeof(fk_ref_col));
         if (mst != KDB_OK) return mst;
 
         if (!sql__is_reserved_column(this_name)) {
@@ -1542,6 +1704,11 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
             cols[n].nullable = nullable;
             cols[n].indexed  = indexed;
             cols[n].unique   = unique;
+            col_has_fk[n] = has_fk;
+            if (has_fk) {
+                snprintf(col_fk_ref_table[n], sizeof(col_fk_ref_table[0]), "%s", fk_ref_table);
+                snprintf(col_fk_ref_col[n], sizeof(col_fk_ref_col[0]), "%s", fk_ref_col);
+            }
             n++;
         }
 
@@ -1552,7 +1719,34 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
     if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing the column list for '%s'", table_name);
     sql__advance(p);
 
-    return kdb_create_table(db, table_name, cols, n);
+    KdbStatus cst = kdb_create_table(db, table_name, cols, n);
+    if (cst != KDB_OK) return cst;
+
+    for (uint32_t i = 0; i < n; i++) {
+        if (!col_has_fk[i]) continue;
+        KdbStatus ast = kdb_add_foreign_key(db, table_name, cols[i].name, col_fk_ref_table[i], col_fk_ref_col[i]);
+        if (ast != KDB_OK) { kdb_drop_table(db, table_name); return ast; }
+    }
+    for (int i = 0; i < n_tfk; i++) {
+        KdbStatus ast = kdb_add_foreign_key(db, table_name, tfk_col[i], tfk_ref_table[i], tfk_ref_col[i]);
+        if (ast != KDB_OK) { kdb_drop_table(db, table_name); return ast; }
+    }
+    for (int i = 0; i < n_chk; i++) {
+        KdbField lit;
+        lit.name = NULL;
+        lit.type = chk_lit_type[i];
+        switch (chk_lit_type[i]) {
+            case KDB_TYPE_INT:    lit.v.as_int    = chk_lit_int[i];      break;
+            case KDB_TYPE_FLOAT:  lit.v.as_float  = chk_lit_float[i];    break;
+            case KDB_TYPE_BOOL:   lit.v.as_bool   = chk_lit_bool[i];     break;
+            case KDB_TYPE_STRING: lit.v.as_string = chk_lit_string[i];   break;
+            default: break;
+        }
+        KdbOperator op = sql__tok_to_kdb_op(chk_op_tok[i]);
+        KdbStatus ast = kdb_add_check_constraint(db, table_name, chk_col[i], op, &lit);
+        if (ast != KDB_OK) { kdb_drop_table(db, table_name); return ast; }
+    }
+    return KDB_OK;
 }
 
 /* DROP INDEX [name] ON t (col [, col2, ...]) -- mirrors CREATE INDEX's
@@ -1630,6 +1824,79 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
 
     if (sql__kw_is(&p->cur, "ADD")) {
         sql__advance(p);
+
+        if (sql__kw_is(&p->cur, "FOREIGN")) {
+            sql__advance(p);
+            if (!sql__kw_is(&p->cur, "KEY")) return sql__err("expected KEY after FOREIGN in ALTER TABLE %s ADD", table_name);
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after FOREIGN KEY in ALTER TABLE %s ADD", table_name);
+            sql__advance(p);
+            const char *fcol;
+            if (!sql__ident_text(&p->cur, &fcol)) return sql__err("expected a column name after FOREIGN KEY ( in ALTER TABLE %s ADD", table_name);
+            char fcol_buf[KDB_SQL_IDENT_BUF];
+            snprintf(fcol_buf, sizeof(fcol_buf), "%.255s", fcol);
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' after FOREIGN KEY (%s in ALTER TABLE %s ADD", fcol_buf, table_name);
+            sql__advance(p);
+            if (!sql__kw_is(&p->cur, "REFERENCES")) return sql__err("expected REFERENCES after FOREIGN KEY (%s) in ALTER TABLE %s ADD", fcol_buf, table_name);
+            sql__advance(p);
+            const char *rtable;
+            if (!sql__ident_text(&p->cur, &rtable)) return sql__err("expected a table name after REFERENCES in ALTER TABLE %s ADD", table_name);
+            char rtable_buf[KDB_SQL_IDENT_BUF];
+            snprintf(rtable_buf, sizeof(rtable_buf), "%.255s", rtable);
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after REFERENCES %s in ALTER TABLE %s ADD", rtable_buf, table_name);
+            sql__advance(p);
+            const char *rcol;
+            if (!sql__ident_text(&p->cur, &rcol)) return sql__err("expected a column name after REFERENCES %s( in ALTER TABLE %s ADD", rtable_buf, table_name);
+            char rcol_buf[KDB_SQL_IDENT_BUF];
+            snprintf(rcol_buf, sizeof(rcol_buf), "%.255s", rcol);
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing REFERENCES %s(%s in ALTER TABLE %s ADD", rtable_buf, rcol_buf, table_name);
+            sql__advance(p);
+            return kdb_add_foreign_key(db, table_name, fcol_buf, rtable_buf, rcol_buf);
+        }
+
+        if (sql__kw_is(&p->cur, "CHECK")) {
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after CHECK in ALTER TABLE %s ADD", table_name);
+            sql__advance(p);
+            const char *ccol;
+            if (!sql__ident_text(&p->cur, &ccol)) return sql__err("expected a column name after CHECK ( in ALTER TABLE %s ADD", table_name);
+            char ccol_buf[KDB_SQL_IDENT_BUF];
+            snprintf(ccol_buf, sizeof(ccol_buf), "%.255s", ccol);
+            sql__advance(p);
+
+            SqlTokType optok = p->cur.type;
+            if (optok != SQLTOK_EQ && optok != SQLTOK_NEQ && optok != SQLTOK_GT &&
+                optok != SQLTOK_GTE && optok != SQLTOK_LT && optok != SQLTOK_LTE)
+                return sql__err("expected a comparison operator (=, !=, >, >=, <, <=) after CHECK (%s in ALTER TABLE %s ADD", ccol_buf, table_name);
+            sql__advance(p);
+
+            KdbFieldType lit_type = KDB_TYPE_NULL;
+            int64_t lit_int = 0; double lit_float = 0; int lit_bool = 0;
+            char lit_str[KDB_SQL_CASE_VAL_BUF];
+            if (!sql__case_value_from_token(&p->cur, &lit_type, &lit_int, &lit_float, &lit_bool, lit_str, sizeof(lit_str)) ||
+                lit_type == KDB_TYPE_NULL)
+                return sql__err("expected an INT/FLOAT/BOOL/STRING literal in CHECK (%s ...) in ALTER TABLE %s ADD", ccol_buf, table_name);
+            sql__advance(p);
+
+            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' closing CHECK (...) in ALTER TABLE %s ADD", table_name);
+            sql__advance(p);
+
+            KdbField lit;
+            lit.name = NULL;
+            lit.type = lit_type;
+            switch (lit_type) {
+                case KDB_TYPE_INT:    lit.v.as_int    = lit_int;   break;
+                case KDB_TYPE_FLOAT:  lit.v.as_float  = lit_float; break;
+                case KDB_TYPE_BOOL:   lit.v.as_bool   = lit_bool;  break;
+                case KDB_TYPE_STRING: lit.v.as_string = lit_str;   break;
+                default: break;
+            }
+            return kdb_add_check_constraint(db, table_name, ccol_buf, sql__tok_to_kdb_op(optok), &lit);
+        }
+
         if (sql__kw_is(&p->cur, "COLUMN")) sql__advance(p); /* optional, both spellings accepted */
 
         const char *cname;
@@ -1653,18 +1920,44 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
             sql__advance(p);
         }
 
-        int nullable = 1, indexed = 0, unique = 0;
-        KdbStatus mst = sql__parse_column_modifiers(p, col_name, &nullable, &indexed, &unique);
+        int nullable = 1, indexed = 0, unique = 0, has_fk = 0;
+        char fk_ref_table[KDB_SQL_IDENT_BUF], fk_ref_col[KDB_SQL_IDENT_BUF];
+        KdbStatus mst = sql__parse_column_modifiers(p, col_name, &nullable, &indexed, &unique,
+                                                    &has_fk, fk_ref_table, sizeof(fk_ref_table),
+                                                    fk_ref_col, sizeof(fk_ref_col));
         if (mst != KDB_OK) return mst;
 
         if (sql__is_reserved_column(col_name))
             return sql__err("'%s' is reserved -- KumDB already manages id/created_at/updated_at", col_name);
 
-        return kdb_add_column(db, table_name, col_name, ftype, nullable, indexed, unique);
+        KdbStatus ast = kdb_add_column(db, table_name, col_name, ftype, nullable, indexed, unique);
+        if (ast != KDB_OK) return ast;
+        if (has_fk) {
+            ast = kdb_add_foreign_key(db, table_name, col_name, fk_ref_table, fk_ref_col);
+            if (ast != KDB_OK) { kdb_drop_column(db, table_name, col_name); return ast; }
+        }
+        return KDB_OK;
     }
 
     if (sql__kw_is(&p->cur, "DROP")) {
         sql__advance(p);
+
+        if (sql__kw_is(&p->cur, "FOREIGN")) {
+            sql__advance(p);
+            if (!sql__kw_is(&p->cur, "KEY")) return sql__err("expected KEY after FOREIGN in ALTER TABLE %s DROP", table_name);
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_LPAREN) return sql__err("expected '(' after FOREIGN KEY in ALTER TABLE %s DROP", table_name);
+            sql__advance(p);
+            const char *fcol;
+            if (!sql__ident_text(&p->cur, &fcol)) return sql__err("expected a column name after FOREIGN KEY ( in ALTER TABLE %s DROP", table_name);
+            char fcol_buf[KDB_SQL_IDENT_BUF];
+            snprintf(fcol_buf, sizeof(fcol_buf), "%.255s", fcol);
+            sql__advance(p);
+            if (p->cur.type != SQLTOK_RPAREN) return sql__err("expected ')' after FOREIGN KEY (%s in ALTER TABLE %s DROP", fcol_buf, table_name);
+            sql__advance(p);
+            return kdb_drop_foreign_key(db, table_name, fcol_buf);
+        }
+
         if (sql__kw_is(&p->cur, "COLUMN")) sql__advance(p);
 
         const char *cname;
@@ -2275,7 +2568,8 @@ typedef enum {
 #define KDB_SQL_MAX_WINDOW_ORDER_COLS     4
 
 #define KDB_SQL_MAX_CASE_BRANCHES  4
-#define KDB_SQL_CASE_VAL_BUF       512
+/* KDB_SQL_CASE_VAL_BUF is defined earlier (with CREATE TABLE's CHECK
+ * parsing, which needs it too) -- see the comment there. */
 #define KDB_SQL_MAX_CASE_SUBCONDS  3
 
 typedef enum {
