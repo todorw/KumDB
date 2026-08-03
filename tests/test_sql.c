@@ -2877,6 +2877,102 @@ static void test_window_functions(void) {
      * the same SELECT */
     ASSERT_ERR(sql(db, "SELECT region, COUNT(*), ROW_NUMBER() OVER (ORDER BY region) FROM sales GROUP BY region"));
 
+    /* LAG/LEAD: neighbor within the partition, in ORDER BY order; NULL
+     * (or the given default) past the partition's edge */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT rep, LAG(amount) OVER (PARTITION BY region ORDER BY amount ASC) AS prev, "
+        "LEAD(amount) OVER (PARTITION BY region ORDER BY amount ASC) AS next "
+        "FROM sales WHERE region = 'west' ORDER BY amount ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        const KdbField *prev0 = kdb_row_get(&rows->rows[0], "prev");
+        const KdbField *next1 = kdb_row_get(&rows->rows[1], "next");
+        ASSERT(prev0 && prev0->type == KDB_TYPE_NULL); /* first row in the partition -- no predecessor */
+        ASSERT(next1 && next1->type == KDB_TYPE_NULL); /* last row -- no successor */
+        double next0 = 0, prev1 = 0;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "next", &next0));
+        ASSERT_OK(kdb_row_get_float(&rows->rows[1], "prev", &prev1));
+        ASSERT(next0 > 199.9 && next0 < 200.1); /* dave(50) -> next is erin(200) */
+        ASSERT(prev1 > 49.9 && prev1 < 50.1);   /* erin(200) -> prev is dave(50) */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* LAG with an explicit offset and a default for out-of-range rows */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT rep, LAG(amount, 2, -1) OVER (PARTITION BY region ORDER BY amount ASC) AS lag2 "
+        "FROM sales WHERE region = 'east' ORDER BY amount ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        double l0 = 0, l2 = 0;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "lag2", &l0));
+        ASSERT_OK(kdb_row_get_float(&rows->rows[2], "lag2", &l2));
+        ASSERT(l0 > -1.1 && l0 < -0.9);         /* 100 is the first row -- 2 back is out of range, default -1 */
+        ASSERT(l2 > 99.9 && l2 < 100.1);        /* 3rd row (150) -- 2 back is the 1st row (100) */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* FIRST_VALUE/LAST_VALUE: same value on every row of the partition,
+     * whole-partition frame (no ROWS/RANGE BETWEEN) */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT rep, FIRST_VALUE(rep) OVER (PARTITION BY region ORDER BY amount ASC) AS f, "
+        "LAST_VALUE(rep) OVER (PARTITION BY region ORDER BY amount ASC) AS l "
+        "FROM sales WHERE region = 'east' ORDER BY amount ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        const char *f0 = NULL, *l0 = NULL, *f2 = NULL, *l2 = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "f", &f0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "l", &l0));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[2], "f", &f2));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[2], "l", &l2));
+        ASSERT_STR(f0, "alice"); ASSERT_STR(l0, "carol");
+        ASSERT_STR(f2, "alice"); ASSERT_STR(l2, "carol"); /* same on every row */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* NTILE: splits a partition into n roughly-equal buckets in ORDER BY
+     * order -- an uneven split gives earlier buckets the extra row(s) */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT rep, NTILE(2) OVER (PARTITION BY region ORDER BY amount ASC) AS bucket "
+        "FROM sales WHERE region = 'east' ORDER BY amount ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        int64_t b0 = 0, b1 = 0, b2 = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "bucket", &b0));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[1], "bucket", &b1));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[2], "bucket", &b2));
+        ASSERT_EQ(b0, 1); ASSERT_EQ(b1, 1); ASSERT_EQ(b2, 2); /* 3 rows into 2 buckets: 2,1 */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* NTILE(n) with n bigger than the partition -- each row its own
+     * bucket, no error */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT rep, NTILE(10) OVER (PARTITION BY region ORDER BY amount ASC) AS bucket "
+        "FROM sales WHERE region = 'west' ORDER BY amount ASC", &rows, NULL));
+    ASSERT(rows && rows->count == 2u);
+    if (rows && rows->count == 2) {
+        int64_t b0 = 0, b1 = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "bucket", &b0));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[1], "bucket", &b1));
+        ASSERT_EQ(b0, 1); ASSERT_EQ(b1, 2);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTILE all require OVER */
+    ASSERT_ERR(sql(db, "SELECT LAG(amount) FROM sales"));
+    ASSERT_ERR(sql(db, "SELECT FIRST_VALUE(amount) FROM sales"));
+    ASSERT_ERR(sql(db, "SELECT NTILE(2) FROM sales"));
+
+    /* NTILE needs a positive integer bucket count */
+    ASSERT_ERR(sql(db, "SELECT NTILE(0) OVER (ORDER BY amount) FROM sales"));
+    ASSERT_ERR(sql(db, "SELECT NTILE(-1) OVER (ORDER BY amount) FROM sales"));
+
+    /* LAG/LEAD's offset must be a non-negative integer literal */
+    ASSERT_ERR(sql(db, "SELECT LAG(amount, -1) OVER (ORDER BY amount) FROM sales"));
+
+    /* explicit ROWS/RANGE BETWEEN frame clauses aren't supported */
+    ASSERT_ERR(sql(db, "SELECT SUM(amount) OVER (ORDER BY amount ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM sales"));
+
     teardown(db);
 }
 

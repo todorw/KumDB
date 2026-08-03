@@ -781,7 +781,9 @@ the whole query — same latitude a bad comparison in `WHERE` already has.
 casts to `0`/`0.0` rather than erroring. `NULL` in, `NULL` out for every
 function except `COALESCE` (that's the point of it) and `NULLIF`.
 
-**Window functions**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, and
+**Window functions**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`,
+`LAG(col[, offset[, default]])`, `LEAD(col[, offset[, default]])`,
+`FIRST_VALUE(col)`, `LAST_VALUE(col)`, `NTILE(n)`, and
 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` all work as window functions with
 `OVER ([PARTITION BY col, ...] [ORDER BY col [ASC|DESC], ...])` — unlike
 `GROUP BY`, rows aren't collapsed; every row keeps its own value alongside
@@ -790,23 +792,42 @@ whatever else is selected:
 ```sql
 SELECT region, rep, amount,
        RANK() OVER (PARTITION BY region ORDER BY amount DESC) AS rank_in_region,
-       SUM(amount) OVER (PARTITION BY region) AS region_total
+       SUM(amount) OVER (PARTITION BY region) AS region_total,
+       LAG(amount) OVER (PARTITION BY region ORDER BY amount ASC) AS prev_amount
     FROM sales
 ```
 
 `RANK`/`DENSE_RANK` give tied rows (equal `ORDER BY` values within a
 partition) the same rank; `RANK` leaves a gap afterward (`1, 1, 3`),
-`DENSE_RANK` doesn't (`1, 1, 2`). A windowed aggregate covers the whole
-partition, not a running/cumulative total — no `ROWS`/`RANGE BETWEEN`
-frame clause. `PARTITION BY`/`ORDER BY` are both optional (omit
-`PARTITION BY` and the whole result set is one partition); omitting
-`ORDER BY` inside `OVER` for `RANK`/`DENSE_RANK` means everything ties
-(rank 1 for every row in the partition) — same as real SQL. `ROW_NUMBER`/
-`RANK`/`DENSE_RANK` always need `OVER` (there's no non-window use of
-them); `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` use `OVER` to switch from their
-`GROUP BY`-collapsing form to this one — a `SELECT` can't mix a window
-function with `GROUP BY` or a plain (non-window) aggregate. Works fine
-after a `JOIN`, on qualified columns, same as anything else there.
+`DENSE_RANK` doesn't (`1, 1, 2`).
+
+`LAG`/`LEAD` return the value of a column `offset` rows before/after the
+current one, in `ORDER BY` order, within the same partition (`offset`
+defaults to `1`); past the partition's edge they return `default` if
+given, `NULL` otherwise. `FIRST_VALUE`/`LAST_VALUE` return the first/last
+row's value in the partition (in `ORDER BY` order) — same value on every
+row of it, not a running value. `NTILE(n)` divides each partition's rows
+into `n` roughly-equal buckets in `ORDER BY` order and returns the bucket
+number (`1..n`); an uneven split gives the earlier buckets the extra
+row(s) (5 rows into 2 buckets: 3, 2); `n` larger than the partition just
+means some rows each get their own bucket and the rest of the numbers
+(up to `n`) go unused, not an error.
+
+A windowed aggregate — `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`FIRST_VALUE`/
+`LAST_VALUE` — covers the whole partition, not a running/cumulative
+total, and `LAG`/`LEAD` look at a fixed-offset neighbor within it: there's
+no `ROWS`/`RANGE BETWEEN` frame clause to narrow any of that to a
+running or bounded sub-window (using one is a parse error, not a silent
+no-op). `PARTITION BY`/`ORDER BY` are both optional (omit `PARTITION BY`
+and the whole result set is one partition); omitting `ORDER BY` inside
+`OVER` for `RANK`/`DENSE_RANK` means everything ties (rank 1 for every
+row in the partition) — same as real SQL. `ROW_NUMBER`/`RANK`/
+`DENSE_RANK`/`LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/`NTILE` always need
+`OVER` (there's no non-window use of them); `COUNT`/`SUM`/`AVG`/`MIN`/
+`MAX` use `OVER` to switch from their `GROUP BY`-collapsing form to this
+one — a `SELECT` can't mix a window function with `GROUP BY` or a plain
+(non-window) aggregate. Works fine after a `JOIN`, on qualified columns,
+same as anything else there.
 
 **`CASE`** as a `SELECT` item: `CASE WHEN cond THEN val [WHEN cond THEN
 val ...] [ELSE val] END`. First matching `WHEN` wins; with no `ELSE` and

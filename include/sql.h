@@ -151,18 +151,32 @@ extern "C" {
  * produces NULL for that row rather than erroring the query (CAST fails
  * the same soft way -- an unparseable string casts to 0/0.0).
  *
- * Window functions: ROW_NUMBER()/RANK()/DENSE_RANK() and COUNT/SUM/AVG/
- * MIN/MAX all work with OVER ([PARTITION BY col,...] [ORDER BY col
- * [ASC|DESC],...]) -- unlike GROUP BY, rows aren't collapsed, every row
- * keeps its own computed value. RANK/DENSE_RANK give tied rows (equal
- * ORDER BY values within a partition) the same rank, RANK leaving a gap
- * afterward (1,1,3), DENSE_RANK not (1,1,2). A windowed aggregate covers
- * the whole partition (no running/cumulative ROWS/RANGE BETWEEN frame
- * clause). PARTITION BY/ORDER BY are both optional. ROW_NUMBER/RANK/
- * DENSE_RANK always need OVER; COUNT/SUM/AVG/MIN/MAX use OVER to switch
- * from their GROUP BY-collapsing form to this one -- a SELECT can't mix a
- * window function with GROUP BY or a plain aggregate. Works after a JOIN,
- * on qualified columns, same as anything else there.
+ * Window functions: ROW_NUMBER()/RANK()/DENSE_RANK()/LAG(col[,offset[,
+ * default]])/LEAD(col[,offset[,default]])/FIRST_VALUE(col)/LAST_VALUE(col)/
+ * NTILE(n) and COUNT/SUM/AVG/MIN/MAX all work with OVER ([PARTITION BY
+ * col,...] [ORDER BY col [ASC|DESC],...]) -- unlike GROUP BY, rows aren't
+ * collapsed, every row keeps its own computed value. RANK/DENSE_RANK give
+ * tied rows (equal ORDER BY values within a partition) the same rank,
+ * RANK leaving a gap afterward (1,1,3), DENSE_RANK not (1,1,2). LAG/LEAD
+ * return a column's value offset rows before/after the current one (offset
+ * defaults to 1) within the same partition, in ORDER BY order; past the
+ * partition's edge they return default if given, NULL otherwise.
+ * FIRST_VALUE/LAST_VALUE return the partition's first/last row's value
+ * (ORDER BY order) -- same on every row, not a running value. NTILE(n)
+ * divides each partition's rows into n roughly-equal buckets in ORDER BY
+ * order and returns the bucket number (1..n); an uneven split gives
+ * earlier buckets the extra row(s); n larger than the partition just
+ * leaves some bucket numbers unused, not an error. A windowed aggregate
+ * (COUNT/SUM/AVG/MIN/MAX/FIRST_VALUE/LAST_VALUE) covers the whole
+ * partition, and LAG/LEAD look at a fixed-offset neighbor within it --
+ * no running/cumulative ROWS/RANGE BETWEEN frame clause to narrow either
+ * of those (a parse error, not a silent no-op, if you write one).
+ * PARTITION BY/ORDER BY are both optional. ROW_NUMBER/RANK/DENSE_RANK/
+ * LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTILE always need OVER; COUNT/SUM/AVG/
+ * MIN/MAX use OVER to switch from their GROUP BY-collapsing form to this
+ * one -- a SELECT can't mix a window function with GROUP BY or a plain
+ * aggregate. Works after a JOIN, on qualified columns, same as anything
+ * else there.
  *
  * JOIN (INNER, LEFT [OUTER], RIGHT [OUTER], FULL [OUTER], or CROSS)
  * matches rows via a conjunction of comparisons in ON -- =, !=, >, >=, <,

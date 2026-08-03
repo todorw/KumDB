@@ -1982,7 +1982,8 @@ static void sql__free_row_fields(KdbRow *row) {
 
 typedef enum {
     SQL_AGG_NONE, SQL_AGG_COUNT, SQL_AGG_SUM, SQL_AGG_AVG, SQL_AGG_MIN, SQL_AGG_MAX,
-    SQL_AGG_ROW_NUMBER, SQL_AGG_RANK, SQL_AGG_DENSE_RANK, SQL_AGG_STRING_AGG
+    SQL_AGG_ROW_NUMBER, SQL_AGG_RANK, SQL_AGG_DENSE_RANK, SQL_AGG_STRING_AGG,
+    SQL_AGG_LAG, SQL_AGG_LEAD, SQL_AGG_FIRST_VALUE, SQL_AGG_LAST_VALUE, SQL_AGG_NTILE
 } SqlAggFn;
 
 #define KDB_SQL_MAX_WINDOW_PARTITION_COLS 4
@@ -2074,6 +2075,22 @@ typedef struct {
     int      window_order_asc[KDB_SQL_MAX_WINDOW_ORDER_COLS];
     int      n_window_order_cols;
 
+    /* LAG(col[, offset[, default]]) / LEAD(...) only: offset (default 1,
+     * rows before/after the current one within the partition) and an
+     * optional literal default for when that neighbor falls outside the
+     * partition (NULL otherwise). Same inline-literal shape SqlCaseBranch's
+     * THEN/ELSE use, via sql__case_value_from_token. */
+    int64_t      win_offset;
+    int          has_win_default;
+    KdbFieldType win_default_type;
+    int64_t      win_default_int;
+    double       win_default_float;
+    int          win_default_bool;
+    char         win_default_string[KDB_SQL_CASE_VAL_BUF];
+
+    /* NTILE(n) only: the bucket count. */
+    int64_t      win_ntile_n;
+
     /* A scalar function call: UPPER(col), ROUND(col, 2), CONCAT(a, b),
      * CAST(col AS INT), etc -- is_func==0 for everything else. Each
      * argument is either a column reference or a literal (same "no
@@ -2102,15 +2119,20 @@ static int sql__agg_fn_from_ident(const char *s, SqlAggFn *out) {
     return 0;
 }
 
-/* ROW_NUMBER/RANK/DENSE_RANK take no arguments and only ever exist as
- * window functions (an OVER clause is mandatory for them, checked by the
- * caller right after this) -- unlike COUNT/SUM/AVG/MIN/MAX, which can be
- * either a window function (with OVER) or a GROUP BY-collapsing aggregate
- * (without), so they aren't in this list. */
+/* ROW_NUMBER/RANK/DENSE_RANK/LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTILE only
+ * ever exist as window functions (an OVER clause is mandatory for them,
+ * checked by the caller right after this) -- unlike COUNT/SUM/AVG/MIN/MAX,
+ * which can be either a window function (with OVER) or a GROUP BY-
+ * collapsing aggregate (without), so they aren't in this list. */
 static int sql__window_only_fn_from_ident(const char *s, SqlAggFn *out) {
-    if (strcasecmp(s, "ROW_NUMBER") == 0) { *out = SQL_AGG_ROW_NUMBER; return 1; }
-    if (strcasecmp(s, "RANK")       == 0) { *out = SQL_AGG_RANK;       return 1; }
-    if (strcasecmp(s, "DENSE_RANK") == 0) { *out = SQL_AGG_DENSE_RANK; return 1; }
+    if (strcasecmp(s, "ROW_NUMBER")   == 0) { *out = SQL_AGG_ROW_NUMBER;   return 1; }
+    if (strcasecmp(s, "RANK")         == 0) { *out = SQL_AGG_RANK;         return 1; }
+    if (strcasecmp(s, "DENSE_RANK")   == 0) { *out = SQL_AGG_DENSE_RANK;   return 1; }
+    if (strcasecmp(s, "LAG")          == 0) { *out = SQL_AGG_LAG;          return 1; }
+    if (strcasecmp(s, "LEAD")         == 0) { *out = SQL_AGG_LEAD;         return 1; }
+    if (strcasecmp(s, "FIRST_VALUE")  == 0) { *out = SQL_AGG_FIRST_VALUE;  return 1; }
+    if (strcasecmp(s, "LAST_VALUE")   == 0) { *out = SQL_AGG_LAST_VALUE;   return 1; }
+    if (strcasecmp(s, "NTILE")        == 0) { *out = SQL_AGG_NTILE;        return 1; }
     return 0;
 }
 
@@ -2207,6 +2229,15 @@ static int sql__parse_window_over(SqlParser *p, SqlSelectItem *item) {
             if (p->cur.type == SQLTOK_COMMA) { sql__advance(p); continue; }
             break;
         }
+    }
+
+    if (sql__kw_is(&p->cur, "ROWS") || sql__kw_is(&p->cur, "RANGE")) {
+        sql__err("explicit ROWS/RANGE BETWEEN frame clauses aren't supported -- every window function here "
+                 "covers the whole partition (ROW_NUMBER/RANK/DENSE_RANK/NTILE assign per-row positions "
+                 "within it, LAG/LEAD look at a fixed-offset neighbor within it, and the rest -- COUNT/SUM/"
+                 "AVG/MIN/MAX/FIRST_VALUE/LAST_VALUE -- summarize the whole thing, not a running/bounded "
+                 "sub-frame of it)");
+        return 0;
     }
 
     if (p->cur.type != SQLTOK_RPAREN) { sql__err("expected ')' closing OVER (...)"); return 0; }
@@ -3548,6 +3579,11 @@ static KdbStatus sql__compute_aggregates(KdbRows *all, SqlSelectItem *items, uin
                 case SQL_AGG_ROW_NUMBER:
                 case SQL_AGG_RANK:
                 case SQL_AGG_DENSE_RANK:
+                case SQL_AGG_LAG:
+                case SQL_AGG_LEAD:
+                case SQL_AGG_FIRST_VALUE:
+                case SQL_AGG_LAST_VALUE:
+                case SQL_AGG_NTILE:
                     /* unreachable: these are always is_window, and a window
                      * item is rejected up front if GROUP BY/aggregates are
                      * also present -- never routed through this GROUP BY-
@@ -3942,6 +3978,7 @@ static KdbStatus sql__compute_window_functions(KdbRows *rows, SqlSelectItem *ite
         int64_t agg_count = 0;
         const KdbField *agg_min = NULL, *agg_max = NULL;
         size_t  part_start = 0;
+        size_t  part_end = 0; /* [part_start, part_end) -- recomputed below whenever part_start changes */
 
         for (size_t si = 0; si <= rows->count && st == KDB_OK; si++) {
             int at_boundary = (si == rows->count) ||
@@ -3978,6 +4015,22 @@ static KdbStatus sql__compute_window_functions(KdbRows *rows, SqlSelectItem *ite
             }
             if (si == rows->count) break;
 
+            /* LAG/LEAD need to look at a neighboring row's position without
+             * waiting for the partition's end to be found the way the
+             * accumulate-then-backfill aggregates above do; FIRST_VALUE/
+             * LAST_VALUE/NTILE need the partition's size up front too. All
+             * four need this lookahead, computed once per partition (not
+             * once per row) right as each new partition starts. Cheap: a
+             * partition's rows are only scanned twice total across the
+             * whole function (once here, once in the main pass), not once
+             * per row within it. */
+            if (si == part_start) {
+                part_end = part_start;
+                while (part_end < rows->count &&
+                       (part_end == part_start || sql__win_partition_equal(item, &rows->rows[order_idx[part_end]], &rows->rows[order_idx[part_start]])))
+                    part_end++;
+            }
+
             size_t ridx = order_idx[si];
             KdbRow *row = &rows->rows[ridx];
 
@@ -3995,6 +4048,52 @@ static KdbStatus sql__compute_window_functions(KdbRows *rows, SqlSelectItem *ite
                 computed[ridx].v.as_int = (item->fn == SQL_AGG_ROW_NUMBER) ? row_num
                                           : (item->fn == SQL_AGG_RANK)     ? rank
                                                                             : dense_rank;
+            } else if (item->fn == SQL_AGG_LAG || item->fn == SQL_AGG_LEAD) {
+                size_t off = (size_t)item->win_offset;
+                int have_neighbor;
+                size_t target = 0;
+                if (item->fn == SQL_AGG_LAG) {
+                    have_neighbor = (si >= part_start + off);
+                    if (have_neighbor) target = si - off;
+                } else {
+                    have_neighbor = (si + off < part_end);
+                    if (have_neighbor) target = si + off;
+                }
+                if (have_neighbor) {
+                    const KdbField *f = kdb_row_get(&rows->rows[order_idx[target]], item->arg_col);
+                    if (f) { computed[ridx].type = f->type; if (!sql__copy_field_value(&computed[ridx], f)) st = KDB_ERR_OOM; }
+                    else      computed[ridx].type = KDB_TYPE_NULL;
+                } else if (item->has_win_default) {
+                    computed[ridx].type = item->win_default_type;
+                    switch (item->win_default_type) {
+                        case KDB_TYPE_INT:    computed[ridx].v.as_int   = item->win_default_int;   break;
+                        case KDB_TYPE_FLOAT:  computed[ridx].v.as_float = item->win_default_float; break;
+                        case KDB_TYPE_BOOL:   computed[ridx].v.as_bool  = item->win_default_bool;  break;
+                        case KDB_TYPE_STRING:
+                            computed[ridx].v.as_string = strdup(item->win_default_string);
+                            if (!computed[ridx].v.as_string) st = KDB_ERR_OOM;
+                            break;
+                        default: computed[ridx].type = KDB_TYPE_NULL; break;
+                    }
+                } else {
+                    computed[ridx].type = KDB_TYPE_NULL;
+                }
+            } else if (item->fn == SQL_AGG_FIRST_VALUE || item->fn == SQL_AGG_LAST_VALUE) {
+                size_t target = (item->fn == SQL_AGG_FIRST_VALUE) ? part_start : (part_end - 1);
+                const KdbField *f = kdb_row_get(&rows->rows[order_idx[target]], item->arg_col);
+                if (f) { computed[ridx].type = f->type; if (!sql__copy_field_value(&computed[ridx], f)) st = KDB_ERR_OOM; }
+                else      computed[ridx].type = KDB_TYPE_NULL;
+            } else if (item->fn == SQL_AGG_NTILE) {
+                size_t part_size = part_end - part_start;
+                size_t n = (size_t)item->win_ntile_n;
+                size_t pos = si - part_start;
+                size_t base = part_size / n;
+                size_t rem  = part_size % n;
+                size_t bucket = (pos < rem * (base + 1))
+                    ? pos / (base + 1) + 1
+                    : rem + (pos - rem * (base + 1)) / base + 1; /* only reached when base > 0 -- see comment above sql__compute_window_functions */
+                computed[ridx].type = KDB_TYPE_INT;
+                computed[ridx].v.as_int = (int64_t)bucket;
             } else {
                 const KdbField *f = (strcmp(item->arg_col, "*") == 0) ? NULL : kdb_row_get(row, item->arg_col);
                 if (item->fn == SQL_AGG_COUNT) {
@@ -4779,9 +4878,50 @@ static KdbStatus sql__exec_select_core(SqlParser *p, KumDB *db, KdbRows **rows_o
                 int is_window_only_fn = sql__window_only_fn_from_ident(first_ident, &fn);
                 if ((is_window_only_fn || sql__agg_fn_from_ident(first_ident, &fn)) && p->cur.type == SQLTOK_LPAREN) {
                     sql__advance(p);
-                    if (is_window_only_fn) {
+                    if (is_window_only_fn && (fn == SQL_AGG_ROW_NUMBER || fn == SQL_AGG_RANK || fn == SQL_AGG_DENSE_RANK)) {
                         if (p->cur.type != SQLTOK_RPAREN) return sql__err("%s() takes no arguments", first_ident);
                         snprintf(item.alias, sizeof(item.alias), "%.100s()", first_ident);
+                    } else if (is_window_only_fn && fn == SQL_AGG_NTILE) {
+                        if (p->cur.type != SQLTOK_NUMBER || strchr(p->cur.text, '.'))
+                            return sql__err("NTILE(...) needs a positive integer bucket count");
+                        long long n = atoll(p->cur.text);
+                        if (n < 1) return sql__err("NTILE(...) needs a positive integer bucket count");
+                        item.win_ntile_n = n;
+                        sql__advance(p);
+                        snprintf(item.alias, sizeof(item.alias), "NTILE(%lld)", n);
+                    } else if (is_window_only_fn && (fn == SQL_AGG_FIRST_VALUE || fn == SQL_AGG_LAST_VALUE)) {
+                        const char *acol;
+                        if (!sql__ident_text(&p->cur, &acol))
+                            return sql__err("expected a column name inside %s(...)", first_ident);
+                        snprintf(item.arg_col, sizeof(item.arg_col), "%.255s", acol);
+                        sql__advance(p);
+                        snprintf(item.alias, sizeof(item.alias), "%.100s(%.100s)", first_ident, item.arg_col);
+                    } else if (is_window_only_fn && (fn == SQL_AGG_LAG || fn == SQL_AGG_LEAD)) {
+                        const char *acol;
+                        if (!sql__ident_text(&p->cur, &acol))
+                            return sql__err("expected a column name inside %s(...)", first_ident);
+                        snprintf(item.arg_col, sizeof(item.arg_col), "%.255s", acol);
+                        sql__advance(p);
+                        item.win_offset = 1;
+                        if (p->cur.type == SQLTOK_COMMA) {
+                            sql__advance(p);
+                            if (p->cur.type != SQLTOK_NUMBER || strchr(p->cur.text, '.'))
+                                return sql__err("%s's offset must be a non-negative integer literal", first_ident);
+                            long long off = atoll(p->cur.text);
+                            if (off < 0) return sql__err("%s's offset must be a non-negative integer literal", first_ident);
+                            item.win_offset = off;
+                            sql__advance(p);
+                            if (p->cur.type == SQLTOK_COMMA) {
+                                sql__advance(p);
+                                if (!sql__case_value_from_token(&p->cur, &item.win_default_type, &item.win_default_int,
+                                                                &item.win_default_float, &item.win_default_bool,
+                                                                item.win_default_string, sizeof(item.win_default_string)))
+                                    return sql__err("%s's default value must be a literal", first_ident);
+                                item.has_win_default = 1;
+                                sql__advance(p);
+                            }
+                        }
+                        snprintf(item.alias, sizeof(item.alias), "%.100s(%.100s)", first_ident, item.arg_col);
                     } else if (fn == SQL_AGG_COUNT && sql__kw_is(&p->cur, "DISTINCT")) {
                         sql__advance(p);
                         item.is_distinct = 1;
