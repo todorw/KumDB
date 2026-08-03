@@ -155,13 +155,20 @@ typedef struct {
     KdbFieldType type;
     int          nullable;
     int          indexed;
+    /* Real uniqueness enforcement (not just an indexing hint): kdb_add/
+     * kdb_update reject a value that already exists elsewhere in this
+     * column (NULLs never conflict with each other, same convention real
+     * SQL UNIQUE constraints use). Implies indexed -- a unique column
+     * always gets a real index to check against, whether or not indexed
+     * is also set explicitly. */
+    int          unique;
 } KdbColumnDef;
 
-/* Create a table with an explicit schema up front (indexed columns only take
- * effect when declared here). Optional: kdb_add() on a table that doesn't
- * exist yet will still create one and infer its schema from the first row,
- * same as always -- this is for when you want to nail the schema down,
- * including indexes, before any data goes in. */
+/* Create a table with an explicit schema up front (indexed/unique columns
+ * only take effect when declared here). Optional: kdb_add() on a table
+ * that doesn't exist yet will still create one and infer its schema from
+ * the first row, same as always -- this is for when you want to nail the
+ * schema down, including indexes and uniqueness, before any data goes in. */
 KdbStatus kdb_create_table(KumDB *db, const char *table_name,
                            const KdbColumnDef *columns, uint32_t column_count);
 
@@ -170,6 +177,7 @@ typedef struct {
     KdbFieldType type;
     int          nullable;
     int          indexed;
+    int          unique;
 } KdbColumnInfo;
 
 /* Structured schema introspection (kdb_print_schema() only gives you text).
@@ -179,9 +187,12 @@ KdbStatus kdb_get_schema(KumDB *db, const char *table_name,
                          uint32_t *count_out);
 
 /* Add a column to an existing table's schema. Existing rows just don't have
- * a value for it until you set one -- same as any other missing field. */
+ * a value for it until you set one -- same as any other missing field.
+ * unique on a column added to a table that already has rows only affects
+ * rows written from here on -- existing NULL/missing values for the new
+ * column never conflict with each other (see KdbColumnDef.unique). */
 KdbStatus kdb_add_column(KumDB *db, const char *table_name, const char *col_name,
-                         KdbFieldType type, int nullable, int indexed);
+                         KdbFieldType type, int nullable, int indexed, int unique);
 
 /* Drop a column: removes it from the schema and rewrites every row to
  * strip that field. Like kdb_compact(), this touches the whole table file. */
@@ -204,10 +215,16 @@ KdbStatus kdb_drop_index(KumDB *db, const char *table_name, const char *col_name
  * column on this table. */
 KdbStatus kdb_rename_column(KumDB *db, const char *table_name, const char *old_col, const char *new_col);
 
-/* Toggles a column's declared nullable flag -- metadata only, not
- * enforced against inserted/updated values anywhere in this engine, just
- * recorded and reported back by schema introspection. */
+/* Toggles a column's declared nullable flag. Setting it to 0 (NOT NULL)
+ * only affects rows written from here on -- kdb_add/kdb_update will
+ * reject a NULL/missing value for it from that point, but existing rows
+ * that already have one aren't retroactively validated or rewritten. */
 KdbStatus kdb_alter_column_nullable(KumDB *db, const char *table_name, const char *col_name, int nullable);
+
+/* Toggles a column's declared unique flag the same way -- only affects
+ * rows written from here on. Setting it on forces the column indexed too
+ * (a unique column always needs a real index to check against). */
+KdbStatus kdb_alter_column_unique(KumDB *db, const char *table_name, const char *col_name, int unique);
 
 /* Renames the table itself (the file on disk, and the header's own
  * stored name). KDB_ERR_EXISTS if new_name already names a table. */

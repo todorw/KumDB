@@ -1027,6 +1027,8 @@ KdbStatus kdb_create_table(KumDB *db, const char *table_name,
         cols[i].type     = (KdbType)columns[i].type;
         cols[i].nullable = columns[i].nullable ? 1 : 0;
         cols[i].indexed  = columns[i].indexed  ? 1 : 0;
+        cols[i].unique   = columns[i].unique   ? 1 : 0;
+        if (cols[i].unique) cols[i].indexed = 1; /* a unique column always gets a real index to check against */
     }
 
     return kdb_table_create(db->data_dir, table_name, cols, column_count);
@@ -1051,13 +1053,14 @@ KdbStatus kdb_get_schema(KumDB *db, const char *table_name,
         out->type     = (KdbFieldType)c->type;
         out->nullable = c->nullable ? 1 : 0;
         out->indexed  = c->indexed  ? 1 : 0;
+        out->unique   = c->unique   ? 1 : 0;
         (*count_out)++;
     }
     return KDB_OK;
 }
 
 KdbStatus kdb_add_column(KumDB *db, const char *table_name, const char *col_name,
-                         KdbFieldType type, int nullable, int indexed) {
+                         KdbFieldType type, int nullable, int indexed, int unique) {
     if (!db || !table_name || !col_name) {
         kdb_err_null_arg("db/table_name/col_name", "kdb_add_column");
         return KDB_ERR_BAD_ARG;
@@ -1068,7 +1071,7 @@ KdbStatus kdb_add_column(KumDB *db, const char *table_name, const char *col_name
     }
     KdbTable *tbl = kdb__get_table(db, table_name);
     if (!tbl) return kdb_last_status();
-    return kdb_table_add_column(tbl, col_name, (KdbType)type, nullable ? 1 : 0, indexed ? 1 : 0);
+    return kdb_table_add_column(tbl, col_name, (KdbType)type, nullable ? 1 : 0, indexed ? 1 : 0, unique ? 1 : 0);
 }
 
 KdbStatus kdb_drop_column(KumDB *db, const char *table_name, const char *col_name) {
@@ -1139,6 +1142,20 @@ KdbStatus kdb_alter_column_nullable(KumDB *db, const char *table_name, const cha
     KdbTable *tbl = kdb__get_table(db, table_name);
     if (!tbl) return kdb_last_status();
     return kdb_table_set_nullable(tbl, col_name, nullable);
+}
+
+KdbStatus kdb_alter_column_unique(KumDB *db, const char *table_name, const char *col_name, int unique) {
+    if (!db || !table_name || !col_name) {
+        kdb_err_null_arg("db/table_name/col_name", "kdb_alter_column_unique");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+    return kdb_table_set_unique(tbl, col_name, unique);
 }
 
 /* Renames the table itself: evicts any cached handle (closing its fd --

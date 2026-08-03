@@ -16,11 +16,11 @@ extern "C" {
  * lines) are both stripped like whitespace anywhere a token could start.
  *
  * Supported:
- *   CREATE TABLE t (col TYPE [NOT NULL] [INDEX], ...)
- *   ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [INDEX]
+ *   CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX], ...)
+ *   ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX]
  *   ALTER TABLE t DROP [COLUMN] col
  *   ALTER TABLE t RENAME COLUMN col TO new_col
- *   ALTER TABLE t ALTER [COLUMN] col SET NOT NULL | DROP NOT NULL
+ *   ALTER TABLE t ALTER [COLUMN] col SET NOT NULL | DROP NOT NULL | SET UNIQUE | DROP UNIQUE
  *   ALTER TABLE t RENAME [TO] new_name
  *   DROP TABLE t
  *   CREATE VIEW v AS SELECT ...
@@ -70,16 +70,17 @@ extern "C" {
  *
  * ON CONFLICT (cols) DO NOTHING / DO UPDATE SET col = val, ... turns a
  * single-row VALUES insert into an upsert (rejected after a multi-row
- * VALUES list). KumDB has no real uniqueness enforcement to react to the
- * way real SQL's ON CONFLICT does (CREATE TABLE's UNIQUE/PRIMARY KEY only
- * ever mark a column indexed), so "conflict" here means checking, before
- * inserting anything, whether a row already matches every named column's
- * value -- DO NOTHING leaves things as they are if so (0 affected); DO
- * UPDATE SET updates it, or all of them if more than one matches (since
- * uniqueness isn't enforced, that's possible, and every match gets the
- * same SET, same as any other filtered UPDATE). No match either way falls
- * back to a plain insert. Every ON CONFLICT column must be one of the
- * INSERT's own target columns; DO UPDATE SET's values are literals, same
+ * VALUES list). Unlike real SQL's ON CONFLICT (which reacts to an actual
+ * constraint-violation error), this checks proactively: before inserting
+ * anything, whether a row already matches every named column's value --
+ * DO NOTHING leaves things as they are if so (0 affected); DO UPDATE SET
+ * updates it. The named columns don't need to be declared UNIQUE/PRIMARY
+ * KEY (see CREATE TABLE below, where those ARE really enforced) -- this
+ * works as a general existence check on any column combination; if
+ * they're not unique, more than one row can match, and every match gets
+ * the same SET, same as any other filtered UPDATE. No match either way
+ * falls back to a plain insert. Every ON CONFLICT column must be one of
+ * the INSERT's own target columns; DO UPDATE SET's values are literals, same
  * as a plain UPDATE's SET (no referencing the row about to be inserted).
  *
  * RETURNING * | col, ... trails INSERT (every form, including multi-row
@@ -333,6 +334,15 @@ extern "C" {
  * or ALTER TABLE ADD is silently ignored / rejected rather than corrupting
  * anything, so a copy-pasted "id INTEGER PRIMARY KEY" doesn't blow up on you.
  *
+ * NOT NULL and UNIQUE/PRIMARY KEY on a column definition are both really
+ * enforced (INSERT/UPDATE reject a violation), not just recorded metadata
+ * -- a NULL value never conflicts with another NULL for UNIQUE, same
+ * convention real SQL uses. PRIMARY KEY implies both. A plain INDEX/
+ * INDEXED/KEY modifier is still just a lookup hint, never enforced --
+ * real SQL's own distinction between an index and a uniqueness
+ * constraint. UNIQUE/PRIMARY KEY always gets a real index to check
+ * against, whether or not INDEX is also given.
+ *
  * ALTER TABLE ADD only changes the schema -- existing rows don't get the
  * new column's value until you UPDATE them, same as any other missing
  * field. ALTER TABLE DROP rewrites the whole table file to strip that
@@ -355,10 +365,14 @@ extern "C" {
  * rewrite same cost as ALTER TABLE ... DROP COLUMN. ALTER TABLE t RENAME
  * [TO] new_name renames the table itself (the file on disk too, not just
  * in-memory state) -- TO is optional. ALTER TABLE t ALTER [COLUMN] col
- * SET NOT NULL / DROP NOT NULL toggles the nullable flag -- metadata
- * only, not enforced anywhere, same as NOT NULL on a CREATE TABLE column
- * definition. Changing a column's type isn't supported -- that would
- * mean converting every existing row's value, a real data migration this
+ * SET NOT NULL / DROP NOT NULL / SET UNIQUE / DROP UNIQUE toggle the
+ * nullable/unique flags -- both really enforced from that point on
+ * (INSERT/UPDATE reject a violation, same as NOT NULL/UNIQUE on a CREATE
+ * TABLE column definition), but only for rows written after the ALTER;
+ * existing rows that already violate the new rule aren't retroactively
+ * checked or rewritten. SET UNIQUE also indexes the column if it wasn't
+ * already. Changing a column's type isn't supported -- that would mean
+ * converting every existing row's value, a real data migration this
  * engine doesn't attempt. Renaming a column or table to a name that's
  * already taken errors rather than colliding silently.
  *

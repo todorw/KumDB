@@ -979,10 +979,13 @@ static KdbStatus sql__type_from_ident(const char *s, KdbFieldType *out) {
 }
 
 /* NOT NULL / INDEX(ED) / UNIQUE / KEY / PRIMARY KEY / DEFAULT val -- shared
- * between CREATE TABLE's column defs and ALTER TABLE ADD COLUMN. Only
- * NOT NULL and INDEX(ED)/UNIQUE/PRIMARY KEY actually change the schema;
- * the rest are accepted and ignored, best-effort SQL DDL compatibility. */
-static KdbStatus sql__parse_column_modifiers(SqlParser *p, const char *col_name, int *nullable, int *indexed) {
+ * between CREATE TABLE's column defs and ALTER TABLE ADD COLUMN. NOT
+ * NULL and UNIQUE/PRIMARY KEY are really enforced (kdb_add/kdb_update
+ * reject a violation); plain INDEX/INDEXED/KEY only ever set the indexed
+ * lookup-hint flag, never enforced -- real SQL's own distinction between
+ * a plain index and a uniqueness constraint. The rest (DEFAULT) is
+ * accepted and ignored, best-effort SQL DDL compatibility. */
+static KdbStatus sql__parse_column_modifiers(SqlParser *p, const char *col_name, int *nullable, int *indexed, int *unique) {
     for (;;) {
         if (sql__kw_is(&p->cur, "NOT")) {
             sql__advance(p);
@@ -992,12 +995,12 @@ static KdbStatus sql__parse_column_modifiers(SqlParser *p, const char *col_name,
             continue;
         }
         if (sql__kw_is(&p->cur, "INDEX") || sql__kw_is(&p->cur, "INDEXED")) { sql__advance(p); *indexed = 1; continue; }
-        if (sql__kw_is(&p->cur, "UNIQUE")) { sql__advance(p); *indexed = 1; continue; }
+        if (sql__kw_is(&p->cur, "UNIQUE")) { sql__advance(p); *indexed = 1; *unique = 1; continue; }
         if (sql__kw_is(&p->cur, "KEY"))    { sql__advance(p); *indexed = 1; continue; }
         if (sql__kw_is(&p->cur, "PRIMARY")) {
             sql__advance(p);
             if (sql__kw_is(&p->cur, "KEY")) sql__advance(p);
-            *indexed = 1; *nullable = 0;
+            *indexed = 1; *unique = 1; *nullable = 0;
             continue;
         }
         if (sql__kw_is(&p->cur, "DEFAULT")) {
@@ -1526,8 +1529,8 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
             sql__advance(p);
         }
 
-        int nullable = 1, indexed = 0;
-        KdbStatus mst = sql__parse_column_modifiers(p, this_name, &nullable, &indexed);
+        int nullable = 1, indexed = 0, unique = 0;
+        KdbStatus mst = sql__parse_column_modifiers(p, this_name, &nullable, &indexed, &unique);
         if (mst != KDB_OK) return mst;
 
         if (!sql__is_reserved_column(this_name)) {
@@ -1537,6 +1540,7 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
             cols[n].type     = ftype;
             cols[n].nullable = nullable;
             cols[n].indexed  = indexed;
+            cols[n].unique   = unique;
             n++;
         }
 
@@ -1643,14 +1647,14 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
             sql__advance(p);
         }
 
-        int nullable = 1, indexed = 0;
-        KdbStatus mst = sql__parse_column_modifiers(p, col_name, &nullable, &indexed);
+        int nullable = 1, indexed = 0, unique = 0;
+        KdbStatus mst = sql__parse_column_modifiers(p, col_name, &nullable, &indexed, &unique);
         if (mst != KDB_OK) return mst;
 
         if (sql__is_reserved_column(col_name))
             return sql__err("'%s' is reserved -- KumDB already manages id/created_at/updated_at", col_name);
 
-        return kdb_add_column(db, table_name, col_name, ftype, nullable, indexed);
+        return kdb_add_column(db, table_name, col_name, ftype, nullable, indexed, unique);
     }
 
     if (sql__kw_is(&p->cur, "DROP")) {
@@ -1716,30 +1720,44 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
         snprintf(col_name, sizeof(col_name), "%.255s", cname);
         sql__advance(p);
 
-        /* Only the nullable flag can actually be changed here -- and even
-         * that's metadata-only, not enforced anywhere (see
-         * kdb_table_set_nullable). Changing a column's TYPE would mean
-         * converting every existing row's value, a real data migration
-         * this file doesn't attempt -- deliberately not supported, not
-         * just unimplemented, same "honest about scope" call as
-         * composite indexes and ROLLUP/CUBE elsewhere in this push. */
+        /* NOT NULL and UNIQUE are both really enforced from here on (see
+         * kdb_table_check_insert_constraints/kdb_table_check_update_
+         * constraints in table.c) -- SET only affects rows written after
+         * this statement, existing rows aren't retroactively checked or
+         * rewritten. Changing a column's TYPE would mean converting every
+         * existing row's value, a real data migration this file doesn't
+         * attempt -- deliberately not supported, not just unimplemented,
+         * same "honest about scope" call as composite indexes and
+         * ROLLUP/CUBE elsewhere in this push. */
         if (sql__kw_is(&p->cur, "SET")) {
             sql__advance(p);
-            if (!sql__kw_is(&p->cur, "NOT")) return sql__err("expected NOT NULL after ALTER COLUMN %s SET", col_name);
-            sql__advance(p);
-            if (!sql__kw_is(&p->cur, "NULL")) return sql__err("expected NOT NULL after ALTER COLUMN %s SET", col_name);
-            sql__advance(p);
-            return kdb_alter_column_nullable(db, table_name, col_name, 0);
+            if (sql__kw_is(&p->cur, "NOT")) {
+                sql__advance(p);
+                if (!sql__kw_is(&p->cur, "NULL")) return sql__err("expected NOT NULL after ALTER COLUMN %s SET NOT", col_name);
+                sql__advance(p);
+                return kdb_alter_column_nullable(db, table_name, col_name, 0);
+            }
+            if (sql__kw_is(&p->cur, "UNIQUE")) {
+                sql__advance(p);
+                return kdb_alter_column_unique(db, table_name, col_name, 1);
+            }
+            return sql__err("expected NOT NULL or UNIQUE after ALTER COLUMN %s SET", col_name);
         }
         if (sql__kw_is(&p->cur, "DROP")) {
             sql__advance(p);
-            if (!sql__kw_is(&p->cur, "NOT")) return sql__err("expected NOT NULL after ALTER COLUMN %s DROP", col_name);
-            sql__advance(p);
-            if (!sql__kw_is(&p->cur, "NULL")) return sql__err("expected NOT NULL after ALTER COLUMN %s DROP", col_name);
-            sql__advance(p);
-            return kdb_alter_column_nullable(db, table_name, col_name, 1);
+            if (sql__kw_is(&p->cur, "NOT")) {
+                sql__advance(p);
+                if (!sql__kw_is(&p->cur, "NULL")) return sql__err("expected NOT NULL after ALTER COLUMN %s DROP NOT", col_name);
+                sql__advance(p);
+                return kdb_alter_column_nullable(db, table_name, col_name, 1);
+            }
+            if (sql__kw_is(&p->cur, "UNIQUE")) {
+                sql__advance(p);
+                return kdb_alter_column_unique(db, table_name, col_name, 0);
+            }
+            return sql__err("expected NOT NULL or UNIQUE after ALTER COLUMN %s DROP", col_name);
         }
-        return sql__err("ALTER COLUMN only supports SET NOT NULL or DROP NOT NULL -- changing a column's type isn't supported");
+        return sql__err("ALTER COLUMN only supports SET|DROP NOT NULL or SET|DROP UNIQUE -- changing a column's type isn't supported");
     }
 
     return sql__err("expected ADD [COLUMN], DROP [COLUMN], RENAME, or ALTER [COLUMN] after ALTER TABLE %s", table_name);

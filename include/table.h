@@ -26,7 +26,8 @@ KdbStatus kdb_table_add_column(KdbTable       *tbl,
                                const char     *col_name,
                                KdbType         type,
                                uint8_t         nullable,
-                               uint8_t         indexed);
+                               uint8_t         indexed,
+                               uint8_t         unique);
 
 KdbStatus kdb_table_drop_column(KdbTable   *tbl,
                                 const char *col_name);
@@ -47,11 +48,17 @@ KdbStatus kdb_table_drop_index(KdbTable *tbl, const char *col_name);
  * already a column on this table. */
 KdbStatus kdb_table_rename_column(KdbTable *tbl, const char *old_name, const char *new_name);
 
-/* Toggles a column's declared nullable flag -- metadata only, same as a
- * column's nullable flag anywhere else in this engine: not actually
- * enforced against inserted/updated values anywhere, just recorded and
- * reported back by schema introspection. */
+/* Toggles a column's declared nullable flag. Setting it to 0 (NOT NULL)
+ * only affects rows written from here on -- existing rows that already
+ * have a NULL/missing value for this column aren't retroactively
+ * validated or rewritten. */
 KdbStatus kdb_table_set_nullable(KdbTable *tbl, const char *col_name, int nullable);
+
+/* Toggles a column's declared unique flag the same way -- only affects
+ * rows written from here on; existing duplicate values already in the
+ * table aren't retroactively checked or rejected. Setting it on forces
+ * the column indexed too (see KdbColumnDef.unique). */
+KdbStatus kdb_table_set_unique(KdbTable *tbl, const char *col_name, int unique);
 
 const KdbColumn *kdb_table_get_column(const KdbTable *tbl,
                                       const char     *col_name);

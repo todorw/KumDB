@@ -253,13 +253,13 @@ static void test_alter_table_api(void) {
     KumDB *db;
     setup(&db);
 
-    KdbColumnDef cols[] = { { "name", KDB_TYPE_STRING, 0, 0 } };
+    KdbColumnDef cols[] = { { "name", KDB_TYPE_STRING, 0, 0, 0 } };
     ASSERT_OK(kdb_create_table(db, TABLE, cols, 1));
 
     KdbField f[] = { kdb_field_string("name", "Alice"), kdb_field_end() };
     ASSERT_OK(kdb_add(db, TABLE, f));
 
-    ASSERT_OK(kdb_add_column(db, TABLE, "age", KDB_TYPE_INT, 1, 1));
+    ASSERT_OK(kdb_add_column(db, TABLE, "age", KDB_TYPE_INT, 1, 1, 0));
 
     KdbColumnInfo schema[16];
     uint32_t n = 0;
@@ -271,7 +271,7 @@ static void test_alter_table_api(void) {
     }
 
     /* duplicate column: real column-specific error, not a table-exists one */
-    ASSERT_ERR(kdb_add_column(db, TABLE, "age", KDB_TYPE_INT, 1, 0));
+    ASSERT_ERR(kdb_add_column(db, TABLE, "age", KDB_TYPE_INT, 1, 0, 0));
     ASSERT_EQ(kdb_last_status(), KDB_ERR_EXISTS);
 
     KdbField patch[] = { kdb_field_int("age", 30), kdb_field_end() };
@@ -290,6 +290,54 @@ static void test_alter_table_api(void) {
         ASSERT(kdb_row_get(row, "age") == NULL);
         kdb_row_free(row);
     }
+
+    teardown(db);
+}
+
+static void test_constraints_api(void) {
+    KumDB *db;
+    setup(&db);
+
+    KdbColumnDef cols[] = {
+        { "email", KDB_TYPE_STRING, 1, 0, 1 }, /* unique, nullable */
+        { "name",  KDB_TYPE_STRING, 0, 0, 0 }, /* not null */
+    };
+    ASSERT_OK(kdb_create_table(db, TABLE, cols, 2));
+
+    KdbField f1[] = { kdb_field_string("email", "a@x.com"), kdb_field_string("name", "alice"), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, TABLE, f1));
+
+    /* duplicate unique value rejected */
+    KdbField f2[] = { kdb_field_string("email", "a@x.com"), kdb_field_string("name", "bob"), kdb_field_end() };
+    ASSERT_ERR(kdb_add(db, TABLE, f2));
+    ASSERT_EQ(kdb_last_status(), KDB_ERR_VALIDATION);
+
+    /* missing NOT NULL value rejected */
+    KdbField f3[] = { kdb_field_string("email", "b@x.com"), kdb_field_end() }; /* no "name" at all */
+    ASSERT_ERR(kdb_add(db, TABLE, f3));
+    ASSERT_EQ(kdb_last_status(), KDB_ERR_VALIDATION);
+
+    /* NULL email doesn't conflict with another NULL email */
+    KdbField f4[] = { kdb_field_null("email"), kdb_field_string("name", "carol"), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, TABLE, f4));
+    KdbField f5[] = { kdb_field_null("email"), kdb_field_string("name", "dave"), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, TABLE, f5));
+
+    /* kdb_update also enforces it: rejects creating a duplicate */
+    KdbField patch[] = { kdb_field_string("email", "a@x.com"), kdb_field_end() };
+    const char *where[] = { "name=carol", NULL };
+    size_t updated = 0;
+    ASSERT_ERR(kdb_update(db, TABLE, where, patch, &updated));
+    ASSERT_EQ(kdb_last_status(), KDB_ERR_VALIDATION);
+
+    /* a table with no unique/not-null columns skips the check entirely --
+     * cheap path, still correct (nothing to reject) */
+    KdbColumnDef plain_cols[] = { { "x", KDB_TYPE_INT, 1, 0, 0 } };
+    ASSERT_OK(kdb_create_table(db, "plain", plain_cols, 1));
+    KdbField p1[] = { kdb_field_int("x", 1), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, "plain", p1));
+    KdbField p2[] = { kdb_field_int("x", 1), kdb_field_end() };
+    ASSERT_OK(kdb_add(db, "plain", p2)); /* duplicate x is fine -- not unique */
 
     teardown(db);
 }
@@ -807,6 +855,7 @@ int main(void) {
     test_compact();
     test_table_exists_and_drop();
     test_alter_table_api();
+    test_constraints_api();
     test_tx_commit();
     test_tx_rollback();
     test_tx_failed_op_forces_rollback();

@@ -139,6 +139,7 @@ bool KumDbHandle::createTable(const QString &name, const QVector<KColumnMeta> &c
         d.type = c.type;
         d.nullable = c.nullable ? 1 : 0;
         d.indexed  = c.indexed  ? 1 : 0;
+        d.unique   = 0; /* not exposed in the New Table dialog yet -- indexed/nullable only */
         defs.append(d);
     }
 

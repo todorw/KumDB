@@ -107,7 +107,8 @@ KdbStatus kdb_table_add_column(KdbTable   *tbl,
                                const char *col_name,
                                KdbType     type,
                                uint8_t     nullable,
-                               uint8_t     indexed) {
+                               uint8_t     indexed,
+                               uint8_t     unique) {
     if (!tbl || !col_name) {
         kdb_err_null_arg("tbl/col_name", "kdb_table_add_column");
         return KDB_ERR_BAD_ARG;
@@ -121,12 +122,15 @@ KdbStatus kdb_table_add_column(KdbTable   *tbl,
         return KDB_ERR_FULL;
     }
 
+    if (unique) indexed = 1; /* a unique column always gets a real index to check against */
+
     KdbColumn *col = &tbl->header.columns[tbl->header.column_count];
     memset(col, 0, sizeof(*col));
     KDB_STRLCPY(col->name, col_name, KDB_MAX_NAME_LEN);
     col->type     = type;
     col->nullable = nullable;
     col->indexed  = indexed;
+    col->unique   = unique;
     tbl->header.column_count++;
     tbl->dirty = 1;
 
@@ -340,6 +344,26 @@ KdbStatus kdb_table_set_nullable(KdbTable *tbl, const char *col_name, int nullab
     return kdb_storage_flush_header(tbl);
 }
 
+KdbStatus kdb_table_set_unique(KdbTable *tbl, const char *col_name, int unique) {
+    if (!tbl || !col_name) {
+        kdb_err_null_arg("tbl/col_name", "kdb_table_set_unique");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (!kdb_table_has_column(tbl, col_name)) {
+        kdb_err_field_not_found(col_name, tbl->name);
+        return KDB_ERR_NOT_FOUND;
+    }
+    KdbColumn *col = NULL;
+    for (uint32_t i = 0; i < tbl->header.column_count; i++) {
+        if (strcmp(tbl->header.columns[i].name, col_name) == 0) { col = &tbl->header.columns[i]; break; }
+    }
+    col->unique = unique ? 1 : 0;
+    if (unique && !col->indexed) return kdb_table_create_index(tbl, col_name); /* also flushes the header */
+
+    tbl->dirty = 1;
+    return kdb_storage_flush_header(tbl);
+}
+
 
 const char *kdb__drop_col_name = NULL;
 
@@ -385,6 +409,137 @@ KdbStatus kdb_table_infer_schema(KdbTable *tbl, const KdbRecord *r) {
 }
 
 
+/* NOT NULL + UNIQUE checks for a record about to be inserted (not yet
+ * written anywhere) -- a straightforward query per unique column, safe
+ * because nothing is mid-scan of tbl->fp here (contrast with UPDATE's
+ * version below). NULLs never conflict with each other for UNIQUE, same
+ * convention real SQL uses. */
+static KdbStatus kdb_table_check_insert_constraints(KdbTable *tbl, const KdbRecord *r) {
+    for (uint32_t i = 0; i < tbl->header.column_count; i++) {
+        const KdbColumn *col = &tbl->header.columns[i];
+        if (col->nullable && !col->unique) continue;
+
+        const KdbValue *val = NULL;
+        for (uint32_t j = 0; j < r->field_count; j++) {
+            if (strcmp(r->fields[j].col_name, col->name) == 0) { val = &r->fields[j].value; break; }
+        }
+        int is_null = !val || val->type == KDB_TYPE_NULL;
+
+        if (!col->nullable && is_null) {
+            kdb_set_error(KDB_ERR_VALIDATION,
+                "Column '%s' on table '%s' is NOT NULL -- can't insert a NULL/missing value into it.",
+                col->name, tbl->name);
+            return KDB_ERR_VALIDATION;
+        }
+
+        if (col->unique && !is_null) {
+            KdbQuery q;
+            kdb_query_init(&q);
+            KdbStatus st = kdb_query_add_filter_value(&q, col->name, KDB_OP_EQ, val, NULL);
+            if (st != KDB_OK) { kdb_query_free(&q); return st; }
+            size_t count = 0;
+            st = kdb_query_count(tbl, &q, &count);
+            kdb_query_free(&q);
+            if (st != KDB_OK) return st;
+            if (count > 0) {
+                kdb_set_error(KDB_ERR_VALIDATION,
+                    "Duplicate value for UNIQUE column '%s' on table '%s'.",
+                    col->name, tbl->name);
+                return KDB_ERR_VALIDATION;
+            }
+        }
+    }
+    return KDB_OK;
+}
+
+/* Same NOT NULL + UNIQUE checks, but for an UPDATE's would-be result --
+ * this can't just query tbl per matching row like the insert version
+ * does, because kdb_table_update's own rewrite (see kdb_storage_rewrite)
+ * streams through tbl->fp sequentially via a transform callback; a nested
+ * query against the same file handle mid-scan would corrupt that scan's
+ * read position. Instead this takes its own single, separate, complete
+ * snapshot of every row up front (safe -- not nested inside another scan),
+ * computes what each row's value would be after the patch (only for rows
+ * the query actually matches; everything else keeps its current value),
+ * and compares every pair of *effective* values for a would-be conflict.
+ * O(matched-rows * total-rows * enforced-columns), fine at the row counts
+ * this engine targets (same precedent this file's dedupe/set-op helpers
+ * already established). Catches a new row-vs-existing-row conflict AND a
+ * conflict between two rows both being changed by this same UPDATE to the
+ * same new value. Returns KDB_OK, or KDB_ERR_VALIDATION with a clear
+ * error already set -- nothing is rewritten either way when this fails,
+ * the caller checks before calling kdb_storage_rewrite at all. */
+static KdbStatus kdb_table_check_update_constraints(KdbTable *tbl, const KdbQuery *query, const KdbRecord *patch) {
+    int any_enforced = 0;
+    for (uint32_t i = 0; i < tbl->header.column_count; i++) {
+        if (!tbl->header.columns[i].nullable || tbl->header.columns[i].unique) { any_enforced = 1; break; }
+    }
+    if (!any_enforced) return KDB_OK;
+
+    KdbQuery all_q;
+    kdb_query_init(&all_q);
+    KdbResult all;
+    KdbStatus st = kdb_query_execute(tbl, &all_q, &all);
+    kdb_query_free(&all_q);
+    if (st != KDB_OK) return st;
+
+    KdbStatus result = KDB_OK;
+    for (uint32_t ci = 0; ci < tbl->header.column_count && result == KDB_OK; ci++) {
+        const KdbColumn *col = &tbl->header.columns[ci];
+        if (col->nullable && !col->unique) continue;
+
+        for (size_t i = 0; i < all.count && result == KDB_OK; i++) {
+            KdbRecord *ri = &all.rows[i];
+            if (!kdb_query_matches(query, ri)) continue; /* only rows this UPDATE actually touches need checking */
+
+            const KdbValue *vi = NULL;
+            for (uint32_t k = 0; k < patch->field_count; k++) {
+                if (strcmp(patch->fields[k].col_name, col->name) == 0) { vi = &patch->fields[k].value; break; }
+            }
+            if (!vi) {
+                for (uint32_t k = 0; k < ri->field_count; k++) {
+                    if (strcmp(ri->fields[k].col_name, col->name) == 0) { vi = &ri->fields[k].value; break; }
+                }
+            }
+            int is_null_i = !vi || vi->type == KDB_TYPE_NULL;
+
+            if (!col->nullable && is_null_i) {
+                kdb_set_error(KDB_ERR_VALIDATION,
+                    "Column '%s' on table '%s' is NOT NULL -- this UPDATE would leave it NULL/missing on row %llu.",
+                    col->name, tbl->name, (unsigned long long)ri->id);
+                result = KDB_ERR_VALIDATION;
+                break;
+            }
+            if (!col->unique || is_null_i) continue;
+
+            for (size_t j = 0; j < all.count; j++) {
+                if (j == i) continue;
+                KdbRecord *rj = &all.rows[j];
+                const KdbValue *vj = NULL;
+                if (kdb_query_matches(query, rj)) {
+                    for (uint32_t k = 0; k < patch->field_count; k++) {
+                        if (strcmp(patch->fields[k].col_name, col->name) == 0) { vj = &patch->fields[k].value; break; }
+                    }
+                }
+                if (!vj) {
+                    for (uint32_t k = 0; k < rj->field_count; k++) {
+                        if (strcmp(rj->fields[k].col_name, col->name) == 0) { vj = &rj->fields[k].value; break; }
+                    }
+                }
+                if (vj && vj->type != KDB_TYPE_NULL && kdb_value_compare(vi, vj) == 0) {
+                    kdb_set_error(KDB_ERR_VALIDATION,
+                        "This UPDATE would give UNIQUE column '%s' on table '%s' a duplicate value (rows %llu and %llu).",
+                        col->name, tbl->name, (unsigned long long)ri->id, (unsigned long long)rj->id);
+                    result = KDB_ERR_VALIDATION;
+                    break;
+                }
+            }
+        }
+    }
+    kdb_result_free(&all);
+    return result;
+}
+
 KdbStatus kdb_table_insert(KdbTable *tbl, KdbRecord *r) {
     if (!tbl || !r) {
         kdb_err_null_arg("tbl/r", "kdb_table_insert");
@@ -399,13 +554,16 @@ KdbStatus kdb_table_insert(KdbTable *tbl, KdbRecord *r) {
     KdbStatus st = kdb_lock_acquire(&lock, tbl->path, 1);
     if (st != KDB_OK) return st;
 
-    
+
     if (tbl->header.column_count == 0) {
         st = kdb_table_infer_schema(tbl, r);
         if (st != KDB_OK) { kdb_lock_release(&lock); return st; }
     }
 
-    
+    st = kdb_table_check_insert_constraints(tbl, r);
+    if (st != KDB_OK) { kdb_lock_release(&lock); return st; }
+
+
     if (fseek(tbl->fp, 0, SEEK_END) != 0) {
         kdb_lock_release(&lock);
         kdb_err_io(tbl->path, "fseek before insert");
@@ -446,6 +604,9 @@ KdbStatus kdb_table_insert_batch(KdbTable  *tbl,
     }
 
     for (size_t i = 0; i < count; i++) {
+        st = kdb_table_check_insert_constraints(tbl, &records[i]);
+        if (st != KDB_OK) { kdb_lock_release(&lock); return st; }
+
         if (fseek(tbl->fp, 0, SEEK_END) != 0) {
             kdb_lock_release(&lock);
             return KDB_ERR_IO;
@@ -509,6 +670,9 @@ KdbStatus kdb_table_update(KdbTable        *tbl,
     KdbLock lock = { .fd = -1 };
     KdbStatus st = kdb_lock_acquire(&lock, tbl->path, 1);
     if (st != KDB_OK) return st;
+
+    st = kdb_table_check_update_constraints(tbl, query, patch);
+    if (st != KDB_OK) { kdb_lock_release(&lock); return st; }
 
     KdbUpdateCtx ctx = { .query = query, .patch = patch, .updated_out = updated_out };
     st = kdb_storage_rewrite(tbl, kdb__update_transform, &ctx);

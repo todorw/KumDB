@@ -2131,6 +2131,86 @@ static void test_alter_table(void) {
     teardown(db);
 }
 
+static void test_unique_not_null_constraints(void) {
+    KumDB *db;
+    setup(&db);
+
+    ASSERT_OK(sql(db, "CREATE TABLE users (email TEXT UNIQUE, name TEXT NOT NULL, age INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO users (email, name, age) VALUES ('a@x.com', 'alice', 30)"));
+
+    /* UNIQUE rejects a duplicate */
+    ASSERT_ERR(sql(db, "INSERT INTO users (email, name, age) VALUES ('a@x.com', 'bob', 40)"));
+
+    /* NOT NULL rejects a missing/NULL value */
+    ASSERT_ERR(sql(db, "INSERT INTO users (email, name, age) VALUES ('b@x.com', NULL, 40)"));
+
+    /* NULLs never conflict with each other for UNIQUE */
+    ASSERT_OK(sql(db, "INSERT INTO users (email, name, age) VALUES (NULL, 'carol', 22)"));
+    ASSERT_OK(sql(db, "INSERT INTO users (email, name, age) VALUES (NULL, 'dave', 25)"));
+
+    /* UPDATE also enforces it */
+    ASSERT_ERR(sql(db, "UPDATE users SET email = 'a@x.com' WHERE name = 'carol'"));
+    ASSERT_OK(sql(db, "UPDATE users SET age = 99 WHERE name = 'carol'")); /* untouched column is fine */
+
+    /* two rows in the same UPDATE both landing on the same new value is
+     * rejected too, and nothing gets written */
+    ASSERT_ERR(sql(db, "UPDATE users SET email = 'dup@x.com' WHERE name = 'dave' OR name = 'carol'"));
+    {
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM users WHERE email = 'dup@x.com'", &rows, NULL));
+        ASSERT(rows && rows->count == 0u);
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* PRIMARY KEY implies both UNIQUE and NOT NULL */
+    ASSERT_OK(sql(db, "CREATE TABLE accounts (acct_id INT PRIMARY KEY, balance FLOAT)"));
+    ASSERT_OK(sql(db, "INSERT INTO accounts (acct_id, balance) VALUES (1, 100.0)"));
+    ASSERT_ERR(sql(db, "INSERT INTO accounts (acct_id, balance) VALUES (1, 200.0)"));
+    ASSERT_ERR(sql(db, "INSERT INTO accounts (acct_id, balance) VALUES (NULL, 300.0)"));
+
+    /* a multi-row VALUES insert catches an intra-batch duplicate; the row
+     * before it in the same statement stays committed (no implicit
+     * per-statement rollback, same convention as everywhere else here) */
+    ASSERT_ERR(sql(db, "INSERT INTO accounts (acct_id, balance) VALUES (2, 1.0), (2, 2.0)"));
+    {
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM accounts WHERE acct_id = 2", &rows, NULL));
+        ASSERT(rows && rows->count == 1u);
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* ALTER TABLE ... ALTER COLUMN SET/DROP UNIQUE */
+    ASSERT_OK(sql(db, "CREATE TABLE tags (name TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO tags (name) VALUES ('x')"));
+    ASSERT_OK(sql(db, "INSERT INTO tags (name) VALUES ('x')")); /* fine before UNIQUE is set */
+    ASSERT_OK(sql(db, "ALTER TABLE tags ALTER COLUMN name SET UNIQUE"));
+    ASSERT_ERR(sql(db, "INSERT INTO tags (name) VALUES ('x')")); /* rejected now */
+    ASSERT_OK(sql(db, "INSERT INTO tags (name) VALUES ('y')"));
+    ASSERT_OK(sql(db, "ALTER TABLE tags ALTER COLUMN name DROP UNIQUE"));
+    ASSERT_OK(sql(db, "INSERT INTO tags (name) VALUES ('y')")); /* fine again */
+
+    /* ON CONFLICT (upsert) still works alongside real UNIQUE enforcement */
+    ASSERT_OK(sql(db, "INSERT INTO accounts (acct_id, balance) VALUES (1, 999.0) ON CONFLICT (acct_id) DO NOTHING"));
+    {
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_exec_sql(db, "SELECT balance FROM accounts WHERE acct_id = 1", &rows, NULL));
+        ASSERT(rows && rows->count == 1u);
+        if (rows && rows->count == 1) {
+            double v = 0;
+            ASSERT_OK(kdb_row_get_float(&rows->rows[0], "balance", &v));
+            ASSERT(v > 99.9 && v < 100.1); /* unchanged */
+        }
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* ADD COLUMN ... UNIQUE on an existing table */
+    ASSERT_OK(sql(db, "ALTER TABLE accounts ADD COLUMN nickname TEXT UNIQUE"));
+    ASSERT_OK(sql(db, "INSERT INTO accounts (acct_id, balance, nickname) VALUES (3, 1.0, 'foo')"));
+    ASSERT_ERR(sql(db, "INSERT INTO accounts (acct_id, balance, nickname) VALUES (4, 1.0, 'foo')"));
+
+    teardown(db);
+}
+
 static void test_create_drop_index(void) {
     KumDB *db;
     setup(&db);
@@ -3337,6 +3417,7 @@ int main(void) {
     test_case_when();
     test_distinct();
     test_alter_table();
+    test_unique_not_null_constraints();
     test_create_drop_index();
     test_alter_table_rename();
     test_nested_values_through_sql();

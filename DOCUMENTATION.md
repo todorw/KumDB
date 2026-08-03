@@ -24,7 +24,8 @@ that directory (`<table>.kdb`), append-only on disk, with deleted rows
 marked rather than removed until you `compact`. Tables don't need a schema
 up front — the first `kdb_add()` into a new table infers one from whatever
 fields you pass — but you can also declare one explicitly with
-`kdb_create_table()`, including which columns are indexed.
+`kdb_create_table()`, including which columns are indexed, `NOT NULL`, or
+`UNIQUE` (both actually enforced -- see Schema management below).
 
 Every row has three fields the engine manages for you and that you never
 set directly: `id` (auto-incrementing, unique per table), `created_at`, and
@@ -129,12 +130,12 @@ kdb_delete(db, "users", where, &deleted);
 
 ```c
 KdbColumnDef cols[] = {
-    { "name", KDB_TYPE_STRING, /*nullable*/ 0, /*indexed*/ 0 },
-    { "age",  KDB_TYPE_INT,    1,              1 },
+    { "email", KDB_TYPE_STRING, /*nullable*/ 1, /*indexed*/ 0, /*unique*/ 1 },
+    { "age",   KDB_TYPE_INT,    1,              1,             0 },
 };
 kdb_create_table(db, "users", cols, 2);
 
-kdb_add_column (db, "users", "vip", KDB_TYPE_BOOL, /*nullable*/ 1, /*indexed*/ 0);
+kdb_add_column (db, "users", "vip", KDB_TYPE_BOOL, /*nullable*/ 1, /*indexed*/ 0, /*unique*/ 0);
 kdb_drop_column(db, "users", "vip");   // rewrites the whole table file
 
 KdbColumnInfo schema[16]; uint32_t n = 0;
@@ -149,8 +150,20 @@ kdb_list_tables(db, names, 64, &count);   // names point into TLS, valid until t
 ```
 
 `kdb_add_column`/`kdb_add()` on a table with no explicit schema yet both
-work — an explicit schema is for when you want to nail down types and
-indexes up front, not a requirement.
+work — an explicit schema is for when you want to nail down types,
+indexes, and constraints up front, not a requirement.
+
+`nullable=0` and `unique=1` are both really enforced (not just recorded
+metadata): `kdb_add`/`kdb_update` reject a NULL/missing value for a
+NOT-NULL column, and reject a value that already exists elsewhere in a
+unique column (a `NULL` value never conflicts with another `NULL`, same
+convention real SQL `UNIQUE` constraints use). `unique` implies
+`indexed` — a unique column always gets a real index to check against.
+Turning either flag on later (`kdb_alter_column_nullable`/
+`kdb_alter_column_unique`, or SQL's `ALTER COLUMN SET/DROP NOT NULL`/
+`UNIQUE` below) only affects rows written from that point on — existing
+rows that already violate the new rule aren't retroactively checked or
+rewritten.
 
 ### Errors, printing, misc
 
@@ -354,11 +367,11 @@ kdb_exec_sql_params(db, "SELECT * FROM employees WHERE age >= ? AND dept = ?",
 ```
 
 ```sql
-CREATE TABLE t (col TYPE [NOT NULL] [INDEX], ...)
-ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [INDEX]
+CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX], ...)
+ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX]
 ALTER TABLE t DROP [COLUMN] col
 ALTER TABLE t RENAME COLUMN col TO new_col
-ALTER TABLE t ALTER [COLUMN] col SET NOT NULL | DROP NOT NULL
+ALTER TABLE t ALTER [COLUMN] col SET NOT NULL | DROP NOT NULL | SET UNIQUE | DROP UNIQUE
 ALTER TABLE t RENAME [TO] new_name
 DROP TABLE t
 
@@ -408,17 +421,20 @@ the `SELECT`'s results fails to insert.
 
 **`ON CONFLICT (col, ...) DO NOTHING`/`DO UPDATE SET ...`** turns a
 single-row `VALUES` insert into an upsert — only single-row, an `ON
-CONFLICT` after a multi-row `VALUES` list is rejected. KumDB has no real
-uniqueness enforcement to react to the way real SQL's `ON CONFLICT`
-does — `CREATE TABLE`'s `UNIQUE`/`PRIMARY KEY` only ever mark a column
-indexed (see the `CREATE TABLE` section), never reject a duplicate value
-— so "conflict" here means something more direct: before inserting
-anything, it checks whether a row already matches every named column's
-value. If one does, `DO NOTHING` leaves things exactly as they are (0
-rows affected) and `DO UPDATE SET ...` updates it (or all of them —
-since uniqueness genuinely isn't enforced, more than one row can match,
-and every match gets the same `SET`, same as any other filtered
-`UPDATE`). If none matches, both forms fall back to a plain insert:
+CONFLICT` after a multi-row `VALUES` list is rejected. Unlike real SQL's
+`ON CONFLICT`, which reacts to an actual constraint-violation error,
+this checks proactively: before inserting anything, it checks whether a
+row already matches every named column's value. If one does, `DO
+NOTHING` leaves things exactly as they are (0 rows affected) and `DO
+UPDATE SET ...` updates it. The named columns don't have to be declared
+`UNIQUE`/`PRIMARY KEY` at all — `ON CONFLICT` works as a general
+"does a matching row already exist" check on any column combination; if
+they *aren't* unique, more than one row can match, and every match gets
+the same `SET`, same as any other filtered `UPDATE`. (If the named
+columns *are* declared `UNIQUE`/`PRIMARY KEY`, real enforcement already
+guarantees at most one row can ever match, on top of whichever branch
+`ON CONFLICT` takes.) If none matches, both forms fall back to a plain
+insert:
 
 ```sql
 INSERT INTO users (email, name, visits) VALUES ('a@x.com', 'Alice', 1)
@@ -509,13 +525,16 @@ a full table rewrite, same cost as `ALTER TABLE ... DROP COLUMN`.
 **`ALTER TABLE t RENAME [TO] new_name`** renames the table itself (the
 file on disk, not just in-memory state) — `TO` is optional, both spellings
 work. **`ALTER TABLE t ALTER [COLUMN] col SET NOT NULL`**/**`DROP NOT
-NULL`** toggles a column's declared nullable flag — metadata only, same
-as `NOT NULL` on a `CREATE TABLE` column definition elsewhere in this
-dialect: not actually enforced against inserted or updated values, just
-recorded and reported back by schema introspection. Changing a column's
-*type* isn't supported — that would mean converting every existing row's
-value, a real data migration this engine doesn't attempt, not just an
-oversight.
+NULL`**/**`SET UNIQUE`**/**`DROP UNIQUE`** toggle a column's declared
+nullable/unique flags — both really enforced from that point on
+(`INSERT`/`UPDATE` reject a violation, same as `NOT NULL`/`UNIQUE` on a
+`CREATE TABLE` column definition), but only for rows written *after* the
+`ALTER`; existing rows that already violate the new rule aren't
+retroactively checked or rewritten. `SET UNIQUE` also indexes the column
+if it wasn't already (a unique column always needs a real index to check
+against). Changing a column's *type* isn't supported — that would mean
+converting every existing row's value, a real data migration this engine
+doesn't attempt, not just an oversight.
 
 ```sql
 ALTER TABLE employees RENAME COLUMN dept TO department

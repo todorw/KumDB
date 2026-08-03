@@ -9,7 +9,7 @@
 
 #define KDB_MAGIC              0x4B554D44
 #define KDB_VERSION_MAJOR      1
-#define KDB_VERSION_MINOR      1
+#define KDB_VERSION_MINOR      2
 #define KDB_VERSION_PATCH      0
 
 #define KDB__STR(x) #x
@@ -84,7 +84,17 @@ typedef struct {
     KdbType  type;
     uint8_t  nullable;
     uint8_t  indexed;
-    uint8_t  _pad[6];
+    /* Added in file format 1.2 (KDB_VERSION_MINOR) -- takes one byte out of
+     * what used to be _pad[6], so a 1.1-or-earlier file (whose column
+     * entries were always memset to 0 before being written -- see
+     * kdb_table_add_column/kdb_storage_create) reads back unique=0 for
+     * every column, exactly matching that file's actual pre-1.2 behavior
+     * (no real uniqueness enforcement existed yet). Forward-compatible
+     * without a migration step. UNIQUE/PRIMARY KEY set this; a plain
+     * INDEX/INDEXED/KEY (lookup-only, no enforcement) does not -- see
+     * sql__parse_column_modifiers in sql.c. */
+    uint8_t  unique;
+    uint8_t  _pad[5];
 } KdbColumn;
 
 
