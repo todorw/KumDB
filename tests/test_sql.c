@@ -3494,8 +3494,131 @@ static void test_window_functions(void) {
     /* LAG/LEAD's offset must be a non-negative integer literal */
     ASSERT_ERR(sql(db, "SELECT LAG(amount, -1) OVER (ORDER BY amount) FROM sales"));
 
-    /* explicit ROWS/RANGE BETWEEN frame clauses aren't supported */
-    ASSERT_ERR(sql(db, "SELECT SUM(amount) OVER (ORDER BY amount ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM sales"));
+    /* ROWS/RANGE BETWEEN frame clauses are covered in test_window_frame_clauses */
+
+    teardown(db);
+}
+
+static void test_window_frame_clauses(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (grp TEXT, n INT, amount INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (grp, n, amount) VALUES ('a', 1, 10)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (grp, n, amount) VALUES ('a', 2, 20)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (grp, n, amount) VALUES ('a', 3, 30)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (grp, n, amount) VALUES ('a', 4, 40)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (grp, n, amount) VALUES ('b', 1, 100)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (grp, n, amount) VALUES ('b', 2, 200)"));
+
+    KdbRows *rows = NULL;
+
+    /* ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW -- running total */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT amount, SUM(amount) OVER (PARTITION BY grp ORDER BY n "
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running "
+        "FROM t ORDER BY grp, n", &rows, NULL));
+    ASSERT(rows && rows->count == 6u);
+    if (rows && rows->count == 6) {
+        int64_t want[] = { 10, 30, 60, 100, 100, 300 };
+        for (int i = 0; i < 6; i++) {
+            double got = 0;
+            ASSERT_OK(kdb_row_get_float(&rows->rows[i], "running", &got));
+            ASSERT(got > (double)want[i] - 0.1 && got < (double)want[i] + 0.1);
+        }
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* shorthand (no BETWEEN): ROWS UNBOUNDED PRECEDING means BETWEEN
+     * UNBOUNDED PRECEDING AND CURRENT ROW -- same running total */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT amount, SUM(amount) OVER (PARTITION BY grp ORDER BY n "
+        "ROWS UNBOUNDED PRECEDING) AS running FROM t ORDER BY grp, n", &rows, NULL));
+    ASSERT(rows && rows->count == 6u);
+    if (rows && rows->count == 6) {
+        double last;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[3], "running", &last));
+        ASSERT(last > 99.9 && last < 100.1); /* 10+20+30+40 */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* ROWS BETWEEN 1 PRECEDING AND CURRENT ROW -- moving sum, window 2 */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT amount, SUM(amount) OVER (PARTITION BY grp ORDER BY n "
+        "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS mv FROM t ORDER BY grp, n", &rows, NULL));
+    ASSERT(rows && rows->count == 6u);
+    if (rows && rows->count == 6) {
+        int64_t want[] = { 10, 30, 50, 70, 100, 300 };
+        for (int i = 0; i < 6; i++) {
+            double got = 0;
+            ASSERT_OK(kdb_row_get_float(&rows->rows[i], "mv", &got));
+            ASSERT(got > (double)want[i] - 0.1 && got < (double)want[i] + 0.1);
+        }
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING -- forward-looking window */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT amount, MAX(amount) OVER (PARTITION BY grp ORDER BY n "
+        "ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS mx FROM t ORDER BY grp, n", &rows, NULL));
+    ASSERT(rows && rows->count == 6u);
+    if (rows && rows->count == 6) {
+        int64_t want[] = { 20, 30, 40, 40, 200, 200 };
+        for (int i = 0; i < 6; i++) {
+            double got = 0;
+            ASSERT_OK(kdb_row_get_float(&rows->rows[i], "mx", &got));
+            ASSERT(got > (double)want[i] - 0.1 && got < (double)want[i] + 0.1);
+        }
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING matches the
+     * pre-existing no-frame default (whole partition, same on every row) */
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT amount, COUNT(*) OVER (PARTITION BY grp ORDER BY n "
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS c FROM t ORDER BY grp, n", &rows, NULL));
+    ASSERT(rows && rows->count == 6u);
+    if (rows && rows->count == 6) {
+        int64_t c0 = 0, c4 = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "c", &c0));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[4], "c", &c4));
+        ASSERT_EQ(c0, 4); /* group a has 4 rows */
+        ASSERT_EQ(c4, 2); /* group b has 2 rows */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW -- ties (peers on
+     * ORDER BY) see the same cumulative result, not split mid-tie */
+    ASSERT_OK(sql(db, "CREATE TABLE tt (grp TEXT, n INT, amount INT)"));
+    ASSERT_OK(sql(db, "INSERT INTO tt (grp, n, amount) VALUES ('a', 1, 10)"));
+    ASSERT_OK(sql(db, "INSERT INTO tt (grp, n, amount) VALUES ('a', 1, 15)")); /* ties the row above on n */
+    ASSERT_OK(sql(db, "INSERT INTO tt (grp, n, amount) VALUES ('a', 2, 20)"));
+    ASSERT_OK(kdb_exec_sql(db,
+        "SELECT amount, SUM(amount) OVER (PARTITION BY grp ORDER BY n "
+        "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s "
+        "FROM tt ORDER BY grp, n, amount", &rows, NULL));
+    ASSERT(rows && rows->count == 3u);
+    if (rows && rows->count == 3) {
+        double s0 = 0, s1 = 0, s2 = 0;
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "s", &s0));
+        ASSERT_OK(kdb_row_get_float(&rows->rows[1], "s", &s1));
+        ASSERT_OK(kdb_row_get_float(&rows->rows[2], "s", &s2));
+        ASSERT(s0 > 24.9 && s0 < 25.1); /* both n=1 rows see 10+15 */
+        ASSERT(s1 > 24.9 && s1 < 25.1);
+        ASSERT(s2 > 44.9 && s2 < 45.1); /* n=2 sees everything */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* error paths */
+    ASSERT_ERR(sql(db, /* frame clause needs an ORDER BY */
+        "SELECT SUM(amount) OVER (PARTITION BY grp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t"));
+    ASSERT_ERR(sql(db, /* frame clause only applies to COUNT/SUM/AVG/MIN/MAX */
+        "SELECT ROW_NUMBER() OVER (ORDER BY n ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t"));
+    ASSERT_ERR(sql(db, "SELECT LAG(amount) OVER (ORDER BY n ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t"));
+    ASSERT_ERR(sql(db, /* numeric RANGE offsets aren't supported */
+        "SELECT SUM(amount) OVER (ORDER BY n RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t"));
+    ASSERT_ERR(sql(db, "SELECT SUM(amount) OVER (ORDER BY n ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW) FROM t"));
+    ASSERT_ERR(sql(db, "SELECT SUM(amount) OVER (ORDER BY n ROWS BETWEEN CURRENT ROW AND UNBOUNDED PRECEDING) FROM t"));
+    ASSERT_ERR(sql(db, "SELECT SUM(amount) OVER (ORDER BY n ROWS BETWEEN UNBOUNDED PRECEDING CURRENT ROW) FROM t"));
 
     teardown(db);
 }
@@ -3592,6 +3715,7 @@ int main(void) {
     test_arithmetic_expressions();
     test_scalar_functions();
     test_window_functions();
+    test_window_frame_clauses();
     test_comments();
     test_syntax_errors();
 

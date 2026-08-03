@@ -874,12 +874,34 @@ row(s) (5 rows into 2 buckets: 3, 2); `n` larger than the partition just
 means some rows each get their own bucket and the rest of the numbers
 (up to `n`) go unused, not an error.
 
-A windowed aggregate — `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`FIRST_VALUE`/
-`LAST_VALUE` — covers the whole partition, not a running/cumulative
-total, and `LAG`/`LEAD` look at a fixed-offset neighbor within it: there's
-no `ROWS`/`RANGE BETWEEN` frame clause to narrow any of that to a
-running or bounded sub-window (using one is a parse error, not a silent
-no-op). `PARTITION BY`/`ORDER BY` are both optional (omit `PARTITION BY`
+`FIRST_VALUE`/`LAST_VALUE` always cover the whole partition, and `LAG`/
+`LEAD` look at a fixed-offset neighbor within it — neither takes a frame
+clause (using one is a parse error, not a silent no-op). `COUNT`/`SUM`/
+`AVG`/`MIN`/`MAX` default to the whole partition too, but accept an
+explicit `ROWS`/`RANGE BETWEEN <start> AND <end>` frame clause — this
+needs `ORDER BY` in the same `OVER (...)` — to narrow that to a running
+or moving window instead:
+
+```sql
+SELECT date, amount,
+       SUM(amount) OVER (PARTITION BY region ORDER BY date
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total,
+       AVG(amount) OVER (PARTITION BY region ORDER BY date
+                          ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS moving_avg_3
+    FROM sales
+```
+
+`ROWS` accepts the full bound vocabulary, each relative to the current
+row and clipped to the partition: `UNBOUNDED PRECEDING`, `n PRECEDING`,
+`CURRENT ROW`, `n FOLLOWING`, `UNBOUNDED FOLLOWING`. `RANGE` only supports
+`UNBOUNDED PRECEDING` as the start bound and `CURRENT ROW`/`UNBOUNDED
+FOLLOWING` as the end bound — resolved via peer groups, so rows tied on
+`ORDER BY` all see the same result rather than being split mid-tie;
+numeric `RANGE` offsets (`n PRECEDING`/`FOLLOWING`) aren't supported, use
+`ROWS` for those. `ROWS <bound>`/`RANGE <bound>` with no `BETWEEN` is
+shorthand for `BETWEEN <bound> AND CURRENT ROW` (so `ROWS UNBOUNDED
+PRECEDING` alone is a running total, same as spelling out the `BETWEEN`
+above). `PARTITION BY`/`ORDER BY` are both optional (omit `PARTITION BY`
 and the whole result set is one partition); omitting `ORDER BY` inside
 `OVER` for `RANK`/`DENSE_RANK` means everything ties (rank 1 for every
 row in the partition) — same as real SQL. `ROW_NUMBER`/`RANK`/

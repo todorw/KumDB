@@ -175,11 +175,24 @@ extern "C" {
  * divides each partition's rows into n roughly-equal buckets in ORDER BY
  * order and returns the bucket number (1..n); an uneven split gives
  * earlier buckets the extra row(s); n larger than the partition just
- * leaves some bucket numbers unused, not an error. A windowed aggregate
- * (COUNT/SUM/AVG/MIN/MAX/FIRST_VALUE/LAST_VALUE) covers the whole
- * partition, and LAG/LEAD look at a fixed-offset neighbor within it --
- * no running/cumulative ROWS/RANGE BETWEEN frame clause to narrow either
- * of those (a parse error, not a silent no-op, if you write one).
+ * leaves some bucket numbers unused, not an error. FIRST_VALUE/LAST_VALUE
+ * always cover the whole partition, and LAG/LEAD look at a fixed-offset
+ * neighbor within it -- neither takes a frame clause (a parse error, not
+ * a silent no-op, if you write one). COUNT/SUM/AVG/MIN/MAX default to
+ * the whole partition too, but accept an explicit ROWS/RANGE BETWEEN
+ * <start> AND <end> frame clause -- requires ORDER BY in the same OVER
+ * (...) -- to narrow that to a running/moving window instead: UNBOUNDED
+ * PRECEDING, n PRECEDING, CURRENT ROW, n FOLLOWING, and UNBOUNDED
+ * FOLLOWING are all valid bounds under ROWS (row offsets from the current
+ * row, clipped to the partition). RANGE only supports UNBOUNDED PRECEDING
+ * as the start bound and CURRENT ROW/UNBOUNDED FOLLOWING as the end bound
+ * (peer-group based -- ties on ORDER BY all see the same result rather
+ * than being split mid-tie); numeric RANGE offsets (n PRECEDING/
+ * FOLLOWING) aren't supported, use ROWS for those. `ROWS <bound>`/`RANGE
+ * <bound>` with no BETWEEN is shorthand for `BETWEEN <bound> AND CURRENT
+ * ROW`. E.g. `SUM(amount) OVER (PARTITION BY region ORDER BY d ROWS
+ * BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)` is a running total;
+ * `ROWS BETWEEN 1 PRECEDING AND CURRENT ROW` is a 2-row moving sum.
  * PARTITION BY/ORDER BY are both optional. ROW_NUMBER/RANK/DENSE_RANK/
  * LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTILE always need OVER; COUNT/SUM/AVG/
  * MIN/MAX use OVER to switch from their GROUP BY-collapsing form to this

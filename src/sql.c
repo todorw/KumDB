@@ -2244,6 +2244,13 @@ typedef enum {
     SQL_AGG_LAG, SQL_AGG_LEAD, SQL_AGG_FIRST_VALUE, SQL_AGG_LAST_VALUE, SQL_AGG_NTILE
 } SqlAggFn;
 
+/* A ROWS/RANGE BETWEEN frame bound -- see sql__parse_frame_bound and the
+ * SqlSelectItem.has_frame fields below. */
+typedef enum {
+    SQL_FRAME_UNBOUNDED_PRECEDING, SQL_FRAME_N_PRECEDING, SQL_FRAME_CURRENT_ROW,
+    SQL_FRAME_N_FOLLOWING, SQL_FRAME_UNBOUNDED_FOLLOWING
+} SqlFrameBoundType;
+
 #define KDB_SQL_MAX_WINDOW_PARTITION_COLS 4
 #define KDB_SQL_MAX_WINDOW_ORDER_COLS     4
 
@@ -2384,6 +2391,24 @@ typedef struct {
     int      window_order_asc[KDB_SQL_MAX_WINDOW_ORDER_COLS];
     int      n_window_order_cols;
 
+    /* ROWS/RANGE BETWEEN <start> AND <end> -- only meaningful for the
+     * COUNT/SUM/AVG/MIN/MAX window aggregates (enforced at parse time),
+     * and only once ORDER BY is present in the same OVER (...) (a frame
+     * needs a defined row order to mean anything). RANGE is only accepted
+     * for the two bound combinations that don't need numeric distance
+     * arithmetic over the ORDER BY column(s) -- UNBOUNDED PRECEDING as the
+     * start and CURRENT ROW/UNBOUNDED FOLLOWING as the end, both resolved
+     * via peer groups (rows tied on ORDER BY) -- see
+     * sql__compute_window_functions. Numeric RANGE offsets (N PRECEDING/
+     * FOLLOWING under RANGE) aren't supported; use ROWS for those, which
+     * supports the full bound vocabulary. */
+    int               has_frame;
+    int               frame_is_range; /* 0 = ROWS, 1 = RANGE */
+    SqlFrameBoundType frame_start_type;
+    int64_t           frame_start_n;  /* SQL_FRAME_N_PRECEDING/N_FOLLOWING only */
+    SqlFrameBoundType frame_end_type;
+    int64_t           frame_end_n;    /* SQL_FRAME_N_PRECEDING/N_FOLLOWING only */
+
     /* LAG(col[, offset[, default]]) / LEAD(...) only: offset (default 1,
      * rows before/after the current one within the partition) and an
      * optional literal default for when that neighbor falls outside the
@@ -2491,7 +2516,38 @@ static void sql__scalar_fn_arity(SqlScalarFn fn, int *min_args, int *max_args) {
     }
 }
 
-/* OVER ([PARTITION BY col, ...] [ORDER BY col [ASC|DESC], ...]). p is
+/* One frame bound: UNBOUNDED PRECEDING | UNBOUNDED FOLLOWING | CURRENT ROW |
+ * n PRECEDING | n FOLLOWING. Returns 0 on error (error already set). */
+static int sql__parse_frame_bound(SqlParser *p, SqlFrameBoundType *type, int64_t *n) {
+    if (sql__kw_is(&p->cur, "UNBOUNDED")) {
+        sql__advance(p);
+        if (sql__kw_is(&p->cur, "PRECEDING")) { *type = SQL_FRAME_UNBOUNDED_PRECEDING; sql__advance(p); return 1; }
+        if (sql__kw_is(&p->cur, "FOLLOWING")) { *type = SQL_FRAME_UNBOUNDED_FOLLOWING; sql__advance(p); return 1; }
+        sql__err("expected PRECEDING or FOLLOWING after UNBOUNDED");
+        return 0;
+    }
+    if (sql__kw_is(&p->cur, "CURRENT")) {
+        sql__advance(p);
+        if (!sql__kw_is(&p->cur, "ROW")) { sql__err("expected ROW after CURRENT"); return 0; }
+        sql__advance(p);
+        *type = SQL_FRAME_CURRENT_ROW;
+        return 1;
+    }
+    if (p->cur.type != SQLTOK_NUMBER || strchr(p->cur.text, '.')) {
+        sql__err("expected UNBOUNDED, CURRENT ROW, or a non-negative integer row count in a ROWS/RANGE frame bound");
+        return 0;
+    }
+    long long val = atoll(p->cur.text);
+    if (val < 0) { sql__err("a ROWS/RANGE frame bound's row count must be non-negative"); return 0; }
+    sql__advance(p);
+    if (sql__kw_is(&p->cur, "PRECEDING")) { *type = SQL_FRAME_N_PRECEDING; *n = val; sql__advance(p); return 1; }
+    if (sql__kw_is(&p->cur, "FOLLOWING")) { *type = SQL_FRAME_N_FOLLOWING; *n = val; sql__advance(p); return 1; }
+    sql__err("expected PRECEDING or FOLLOWING after the frame bound's row count");
+    return 0;
+}
+
+/* OVER ([PARTITION BY col, ...] [ORDER BY col [ASC|DESC], ...]
+ *       [(ROWS|RANGE) [BETWEEN <bound> AND <bound> | <bound>]]). p is
  * positioned at "OVER" (not yet consumed). Returns 0 on error (error
  * already set), 1 on success. */
 static int sql__parse_window_over(SqlParser *p, SqlSelectItem *item) {
@@ -2541,12 +2597,55 @@ static int sql__parse_window_over(SqlParser *p, SqlSelectItem *item) {
     }
 
     if (sql__kw_is(&p->cur, "ROWS") || sql__kw_is(&p->cur, "RANGE")) {
-        sql__err("explicit ROWS/RANGE BETWEEN frame clauses aren't supported -- every window function here "
-                 "covers the whole partition (ROW_NUMBER/RANK/DENSE_RANK/NTILE assign per-row positions "
-                 "within it, LAG/LEAD look at a fixed-offset neighbor within it, and the rest -- COUNT/SUM/"
-                 "AVG/MIN/MAX/FIRST_VALUE/LAST_VALUE -- summarize the whole thing, not a running/bounded "
-                 "sub-frame of it)");
-        return 0;
+        int is_range = sql__kw_is(&p->cur, "RANGE");
+        sql__advance(p);
+
+        if (item->fn != SQL_AGG_COUNT && item->fn != SQL_AGG_SUM && item->fn != SQL_AGG_AVG &&
+            item->fn != SQL_AGG_MIN   && item->fn != SQL_AGG_MAX) {
+            sql__err("ROWS/RANGE BETWEEN only applies to COUNT/SUM/AVG/MIN/MAX window aggregates -- "
+                     "ROW_NUMBER/RANK/DENSE_RANK/LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTILE already have "
+                     "well-defined per-row semantics and don't take a frame clause");
+            return 0;
+        }
+        if (item->n_window_order_cols == 0) {
+            sql__err("ROWS/RANGE BETWEEN needs an ORDER BY inside OVER (...) to define row order");
+            return 0;
+        }
+
+        SqlFrameBoundType start_type, end_type;
+        int64_t start_n = 0, end_n = 0;
+        if (sql__kw_is(&p->cur, "BETWEEN")) {
+            sql__advance(p);
+            if (!sql__parse_frame_bound(p, &start_type, &start_n)) return 0;
+            if (!sql__kw_is(&p->cur, "AND")) { sql__err("expected AND in a ROWS/RANGE BETWEEN frame clause"); return 0; }
+            sql__advance(p);
+            if (!sql__parse_frame_bound(p, &end_type, &end_n)) return 0;
+        } else {
+            /* shorthand: ROWS/RANGE <bound> means BETWEEN <bound> AND CURRENT ROW */
+            if (!sql__parse_frame_bound(p, &start_type, &start_n)) return 0;
+            end_type = SQL_FRAME_CURRENT_ROW;
+        }
+
+        if (start_type == SQL_FRAME_UNBOUNDED_FOLLOWING) { sql__err("a frame's start bound can't be UNBOUNDED FOLLOWING"); return 0; }
+        if (end_type == SQL_FRAME_UNBOUNDED_PRECEDING)   { sql__err("a frame's end bound can't be UNBOUNDED PRECEDING"); return 0; }
+
+        if (is_range) {
+            int start_ok = (start_type == SQL_FRAME_UNBOUNDED_PRECEDING);
+            int end_ok   = (end_type == SQL_FRAME_CURRENT_ROW || end_type == SQL_FRAME_UNBOUNDED_FOLLOWING);
+            if (!start_ok || !end_ok) {
+                sql__err("RANGE BETWEEN here only supports UNBOUNDED PRECEDING as the start bound and "
+                         "CURRENT ROW or UNBOUNDED FOLLOWING as the end bound -- numeric RANGE offsets "
+                         "(n PRECEDING/FOLLOWING) aren't supported, use ROWS instead");
+                return 0;
+            }
+        }
+
+        item->has_frame       = 1;
+        item->frame_is_range  = is_range;
+        item->frame_start_type = start_type;
+        item->frame_start_n    = start_n;
+        item->frame_end_type   = end_type;
+        item->frame_end_n      = end_n;
     }
 
     if (p->cur.type != SQLTOK_RPAREN) { sql__err("expected ')' closing OVER (...)"); return 0; }
@@ -4421,11 +4520,11 @@ static int sql__win_cmp(const void *a, const void *b) {
  * Mechanically: sort a row-index array by PARTITION BY then ORDER BY (see
  * sql__win_cmp), which makes each partition's rows contiguous and, within
  * a partition, correctly ordered; then a single pass over that sorted
- * order computes ROW_NUMBER/RANK/DENSE_RANK directly, or (for COUNT/SUM/
- * AVG/MIN/MAX) accumulates over each partition and backfills every row in
- * it once the partition's end is found -- there's no running/cumulative
- * frame clause (ROWS/RANGE BETWEEN), every aggregate window function
- * covers the whole partition, same value on every row in it. */
+ * order computes ROW_NUMBER/RANK/DENSE_RANK directly. With no explicit
+ * ROWS/RANGE BETWEEN, COUNT/SUM/AVG/MIN/MAX accumulate over the whole
+ * partition and backfill every row in it once the partition's end is
+ * found; with one (item->has_frame), they're instead computed per row
+ * over that row's own [lo, hi] frame -- see the has_frame branch below. */
 static KdbStatus sql__compute_window_functions(KdbRows *rows, SqlSelectItem *items, uint32_t nitems) {
     if (rows->count == 0) return KDB_OK;
 
@@ -4454,14 +4553,16 @@ static KdbStatus sql__compute_window_functions(KdbRows *rows, SqlSelectItem *ite
         const KdbField *agg_min = NULL, *agg_max = NULL;
         size_t  part_start = 0;
         size_t  part_end = 0; /* [part_start, part_end) -- recomputed below whenever part_start changes */
+        size_t  range_peer_hi = 0; /* RANGE ... AND CURRENT ROW only -- see below */
 
         for (size_t si = 0; si <= rows->count && st == KDB_OK; si++) {
             int at_boundary = (si == rows->count) ||
                                (si > part_start && !sql__win_partition_equal(item, &rows->rows[order_idx[si]], &rows->rows[order_idx[si - 1]]));
 
             if (at_boundary && si > part_start) {
-                if (item->fn == SQL_AGG_COUNT || item->fn == SQL_AGG_SUM || item->fn == SQL_AGG_AVG ||
-                    item->fn == SQL_AGG_MIN   || item->fn == SQL_AGG_MAX) {
+                if (!item->has_frame &&
+                    (item->fn == SQL_AGG_COUNT || item->fn == SQL_AGG_SUM || item->fn == SQL_AGG_AVG ||
+                     item->fn == SQL_AGG_MIN   || item->fn == SQL_AGG_MAX)) {
                     KdbField val;
                     memset(&val, 0, sizeof(val));
                     switch (item->fn) {
@@ -4508,6 +4609,23 @@ static KdbStatus sql__compute_window_functions(KdbRows *rows, SqlSelectItem *ite
 
             size_t ridx = order_idx[si];
             KdbRow *row = &rows->rows[ridx];
+
+            /* RANGE ... AND CURRENT ROW resolves "CURRENT ROW" to the last
+             * row tied with this one on ORDER BY (a peer group), not just
+             * this row -- ties must see the same frame and so the same
+             * result, same rule RANK/DENSE_RANK's tie handling above
+             * already follows. Recomputed once per peer group (not once
+             * per row in it) by scanning forward from the group's first
+             * row the moment a new group is detected. */
+            if (item->has_frame && item->frame_is_range && item->frame_end_type == SQL_FRAME_CURRENT_ROW) {
+                int new_peer_group = (si == part_start) || !sql__win_order_equal(item, row, &rows->rows[order_idx[si - 1]]);
+                if (new_peer_group) {
+                    range_peer_hi = si;
+                    while (range_peer_hi + 1 < part_end &&
+                           sql__win_order_equal(item, &rows->rows[order_idx[range_peer_hi + 1]], row))
+                        range_peer_hi++;
+                }
+            }
 
             if (item->fn == SQL_AGG_ROW_NUMBER || item->fn == SQL_AGG_RANK || item->fn == SQL_AGG_DENSE_RANK) {
                 row_num++;
@@ -4569,6 +4687,72 @@ static KdbStatus sql__compute_window_functions(KdbRows *rows, SqlSelectItem *ite
                     : rem + (pos - rem * (base + 1)) / base + 1; /* only reached when base > 0 -- see comment above sql__compute_window_functions */
                 computed[ridx].type = KDB_TYPE_INT;
                 computed[ridx].v.as_int = (int64_t)bucket;
+            } else if (item->has_frame) {
+                /* Moving-window aggregate: recomputed from scratch over
+                 * [lo, hi] for every row rather than accumulated
+                 * incrementally as the window slides -- correct and
+                 * simple, not optimized for huge partitions, consistent
+                 * with this engine's existing preference for simplicity
+                 * over scale (see the whole-table transaction backup and
+                 * composite-index scope elsewhere in this file). */
+                long long lo, hi;
+                switch (item->frame_start_type) {
+                    case SQL_FRAME_UNBOUNDED_PRECEDING: lo = (long long)part_start; break;
+                    case SQL_FRAME_N_PRECEDING:         lo = (long long)si - item->frame_start_n; break;
+                    case SQL_FRAME_CURRENT_ROW:         lo = (long long)si; break;
+                    case SQL_FRAME_N_FOLLOWING:         lo = (long long)si + item->frame_start_n; break;
+                    default:                             lo = (long long)part_start; break; /* unreachable, rejected at parse time */
+                }
+                switch (item->frame_end_type) {
+                    case SQL_FRAME_CURRENT_ROW:
+                        hi = item->frame_is_range ? (long long)range_peer_hi : (long long)si;
+                        break;
+                    case SQL_FRAME_N_FOLLOWING:         hi = (long long)si + item->frame_end_n; break;
+                    case SQL_FRAME_UNBOUNDED_FOLLOWING: hi = (long long)part_end - 1; break;
+                    case SQL_FRAME_N_PRECEDING:         hi = (long long)si - item->frame_end_n; break;
+                    default:                             hi = (long long)part_end - 1; break; /* unreachable, rejected at parse time */
+                }
+                if (lo < (long long)part_start)   lo = (long long)part_start;
+                if (hi > (long long)part_end - 1) hi = (long long)part_end - 1;
+
+                double  f_sum = 0.0;
+                int64_t f_count = 0;
+                const KdbField *f_min = NULL, *f_max = NULL;
+                for (long long k = lo; k <= hi; k++) {
+                    const KdbField *f = (strcmp(item->arg_col, "*") == 0) ? NULL : kdb_row_get(&rows->rows[order_idx[k]], item->arg_col);
+                    if (item->fn == SQL_AGG_COUNT) {
+                        if (strcmp(item->arg_col, "*") == 0 || f) f_count++;
+                    } else if (f) {
+                        double v;
+                        if ((item->fn == SQL_AGG_SUM || item->fn == SQL_AGG_AVG) && sql__field_to_double(f, &v)) {
+                            f_sum += v;
+                            f_count++;
+                        } else if (item->fn == SQL_AGG_MIN) {
+                            if (!f_min || sql__field_cmp(f, f_min) < 0) f_min = f;
+                        } else if (item->fn == SQL_AGG_MAX) {
+                            if (!f_max || sql__field_cmp(f, f_max) > 0) f_max = f;
+                        }
+                    }
+                }
+                KdbField val;
+                memset(&val, 0, sizeof(val));
+                switch (item->fn) {
+                    case SQL_AGG_COUNT: val.type = KDB_TYPE_INT;   val.v.as_int   = f_count; break;
+                    case SQL_AGG_SUM:   val.type = KDB_TYPE_FLOAT; val.v.as_float = f_sum;   break;
+                    case SQL_AGG_AVG:   val.type = KDB_TYPE_FLOAT; val.v.as_float = f_count > 0 ? f_sum / (double)f_count : 0.0; break;
+                    case SQL_AGG_MIN:
+                        if (f_min) { val.type = f_min->type; if (!sql__copy_field_value(&val, f_min)) st = KDB_ERR_OOM; }
+                        else         val.type = KDB_TYPE_NULL;
+                        break;
+                    case SQL_AGG_MAX:
+                        if (f_max) { val.type = f_max->type; if (!sql__copy_field_value(&val, f_max)) st = KDB_ERR_OOM; }
+                        else         val.type = KDB_TYPE_NULL;
+                        break;
+                    default: break;
+                }
+                computed[ridx].type = val.type;
+                if (!sql__copy_field_value(&computed[ridx], &val)) st = KDB_ERR_OOM;
+                sql__free_field(&val);
             } else {
                 const KdbField *f = (strcmp(item->arg_col, "*") == 0) ? NULL : kdb_row_get(row, item->arg_col);
                 if (item->fn == SQL_AGG_COUNT) {
