@@ -304,6 +304,33 @@ rollback). This means a transaction costs a full copy of each table it
 touches on first touch — fine for coordinating a handful of tables, not
 meant for wrapping bulk operations on a huge one.
 
+**From SQL**: `BEGIN` (`TRANSACTION`/`WORK` optional, and `START
+TRANSACTION` works too) opens a `kdb_tx_*` transaction on the connection;
+every `INSERT`/`UPDATE`/`DELETE` after that runs through it instead of the
+plain non-transactional call, until `COMMIT` or `ROLLBACK` ends it —
+same semantics as the C API above, just without threading a `KdbTx*`
+through by hand:
+
+```sql
+BEGIN
+INSERT INTO accounts (name, balance) VALUES ('alice', 50)
+UPDATE accounts SET balance = balance - 10 WHERE name = 'alice'
+COMMIT
+```
+
+No nested transactions (`BEGIN` while one is already open errors —
+`COMMIT`/`ROLLBACK` it first), and `COMMIT`/`ROLLBACK` with no open
+transaction errors too. Schema changes (`CREATE`/`ALTER`/`DROP`) aren't
+wrapped by `kdb_tx_*`, so they're rejected while a transaction is open
+rather than silently running outside it, where `ROLLBACK` wouldn't
+actually undo them. `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO
+SAVEPOINT` aren't supported — `kdb_tx_*` only backs up/restores a whole
+transaction, it has no concept of a partial rollback point to wrap, and
+faking one wouldn't actually roll back to it. A transaction still open
+when the connection is closed is rolled back automatically (same outcome
+a crash mid-transaction already gets from the next `kdb_open()`, just
+immediate instead of deferred to next open).
+
 ## SQL
 
 `kdb_exec_sql(db, sql, &rows_out, &affected_out)` runs one statement and

@@ -200,11 +200,17 @@ typedef struct {
 
 
 typedef struct {
-    char      data_dir[4096];       
+    char      data_dir[4096];
     KdbTable *tables[KDB_MAX_TABLES];
     uint32_t  table_count;
     uint8_t   read_only;
     uint8_t   _pad[7];
+    /* SQL BEGIN/COMMIT/ROLLBACK's open transaction, or NULL -- really a
+     * KdbTx*, but KdbTx is defined in kumdb.h, which includes this header
+     * (not the other way around), so it can't be named here without a
+     * circular include. Left void* and cast at the handful of sql.c call
+     * sites that touch it; nothing in this file dereferences it. */
+    void     *sql_tx;
 } KumDB;
 
 

@@ -42,6 +42,22 @@ extern "C" {
  *   UPDATE t SET col = val, ... [WHERE cond [AND|OR cond ...]] [RETURNING * | col, ...]
  *   DELETE FROM t [WHERE cond [AND|OR cond ...]] [RETURNING * | col, ...]
  *
+ *   BEGIN [TRANSACTION | WORK] | START TRANSACTION
+ *   COMMIT [TRANSACTION | WORK]
+ *   ROLLBACK [TRANSACTION | WORK]
+ *
+ * BEGIN opens a kdb_tx_* transaction on the connection (see kumdb.h) --
+ * every INSERT/UPDATE/DELETE after that runs through it instead of the
+ * plain non-transactional call, until COMMIT or ROLLBACK ends it. No
+ * nested transactions (BEGIN while one is already open errors). Schema
+ * changes (CREATE/ALTER/DROP) aren't wrapped by kdb_tx_*, so they're
+ * rejected while a transaction is open rather than silently running
+ * outside it, where ROLLBACK wouldn't actually undo them. SAVEPOINT/
+ * RELEASE SAVEPOINT/ROLLBACK TO SAVEPOINT aren't supported -- kdb_tx_*
+ * only backs up/restores a whole transaction, it has no partial rollback
+ * point to wrap. A transaction still open when the connection closes is
+ * rolled back automatically.
+ *
  * INSERT always needs an explicit column list, never a bare
  * "INSERT INTO t VALUES (...)". VALUES accepts more than one
  * comma-separated tuple in one statement, each inserted as its own row in

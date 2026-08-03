@@ -71,6 +71,30 @@ static KdbStatus sql__err(const char *fmt, ...) {
     return KDB_ERR_SQL_SYNTAX;
 }
 
+/* Drop-in replacements for kdb_add/kdb_update/kdb_delete's own signature
+ * -- go through db->sql_tx (BEGIN/COMMIT/ROLLBACK's open kdb_tx_* handle,
+ * see internal.h) when a SQL transaction is open, straight through the
+ * non-transactional call otherwise. Every INSERT/UPDATE/DELETE code path
+ * in this file already calls exactly one of these three shapes, so
+ * swapping the callee to one of these is a drop-in change at every call
+ * site -- none of them need to know or care whether a transaction is
+ * open. */
+static KdbStatus sql__db_add(KumDB *db, const char *table_name, const KdbField *fields) {
+    if (db->sql_tx) return kdb_tx_add((KdbTx *)db->sql_tx, table_name, fields);
+    return kdb_add(db, table_name, fields);
+}
+
+static KdbStatus sql__db_update(KumDB *db, const char *table_name, const char **where_filters,
+                                const KdbField *set_fields, size_t *updated_out) {
+    if (db->sql_tx) return kdb_tx_update((KdbTx *)db->sql_tx, table_name, where_filters, set_fields, updated_out);
+    return kdb_update(db, table_name, where_filters, set_fields, updated_out);
+}
+
+static KdbStatus sql__db_delete(KumDB *db, const char *table_name, const char **filters, size_t *deleted_out) {
+    if (db->sql_tx) return kdb_tx_delete((KdbTx *)db->sql_tx, table_name, filters, deleted_out);
+    return kdb_delete(db, table_name, filters, deleted_out);
+}
+
 static void sql__skip_ws(SqlLexer *lx) {
     for (;;) {
         while (lx->src[lx->pos] && isspace((unsigned char)lx->src[lx->pos])) lx->pos++;
@@ -1561,7 +1585,7 @@ static KdbStatus sql__exec_insert_on_conflict(SqlParser *p, KumDB *db, const cha
                     return sql__err("unsupported value for column '%s'", col_names[i]);
             }
             fields[ncols] = kdb_field_end();
-            KdbStatus st = kdb_add(db, table_name, fields);
+            KdbStatus st = sql__db_add(db, table_name, fields);
             if (st != KDB_OK) return st;
             did_insert = 1;
             action_count = 1;
@@ -1598,7 +1622,7 @@ static KdbStatus sql__exec_insert_on_conflict(SqlParser *p, KumDB *db, const cha
             }
             patch[nset] = kdb_field_end();
             size_t updated = 0;
-            KdbStatus st = kdb_update(db, table_name, nkeys > 0 ? filters : NULL, patch, &updated);
+            KdbStatus st = sql__db_update(db, table_name, nkeys > 0 ? filters : NULL, patch, &updated);
             if (st != KDB_OK) return st;
             did_update = 1;
             action_count = updated;
@@ -1609,7 +1633,7 @@ static KdbStatus sql__exec_insert_on_conflict(SqlParser *p, KumDB *db, const cha
                     return sql__err("unsupported value for column '%s'", col_names[i]);
             }
             fields[ncols] = kdb_field_end();
-            KdbStatus st = kdb_add(db, table_name, fields);
+            KdbStatus st = sql__db_add(db, table_name, fields);
             if (st != KDB_OK) return st;
             did_insert = 1;
             action_count = 1;
@@ -1736,7 +1760,7 @@ static KdbStatus sql__exec_insert(SqlParser *p, KumDB *db, size_t *affected_out,
             }
             fields[ncols] = kdb_field_end();
 
-            st = kdb_add(db, table_name, fields);
+            st = sql__db_add(db, table_name, fields);
             if (st != KDB_OK) break;
             affected++;
         }
@@ -1822,7 +1846,7 @@ static KdbStatus sql__exec_insert(SqlParser *p, KumDB *db, size_t *affected_out,
         }
         fields[ncols] = kdb_field_end();
 
-        KdbStatus st = kdb_add(db, table_name, fields);
+        KdbStatus st = sql__db_add(db, table_name, fields);
         if (st != KDB_OK) { if (affected_out) *affected_out = affected; return st; }
         affected++;
         first_tuple = 0;
@@ -5469,7 +5493,7 @@ static KdbStatus sql__exec_update(SqlParser *p, KumDB *db, size_t *affected_out,
             return KDB_OK;
         }
         const char *fp[2] = { id_filter, NULL };
-        st = kdb_update(db, table_name, fp, patch, &updated);
+        st = sql__db_update(db, table_name, fp, patch, &updated);
         /* RETURNING re-fetches by the same filter, after the update --
          * correct here since fp names rows by id, which SET can't change. */
         if (st == KDB_OK && has_returning && rows_out) {
@@ -5506,7 +5530,7 @@ static KdbStatus sql__exec_update(SqlParser *p, KumDB *db, size_t *affected_out,
             if (!id_filter) { sql__free_filters(flat_filters, nfilt); return KDB_ERR_OOM; }
         }
 
-        st = kdb_update(db, table_name, nfilt > 0 ? filter_ptrs : NULL, patch, &updated);
+        st = sql__db_update(db, table_name, nfilt > 0 ? filter_ptrs : NULL, patch, &updated);
         if (st == KDB_OK && has_returning && rows_out) {
             const char *idf[2] = { id_filter, NULL };
             KdbStatus rst = sql__build_returning_rows_from_filter(db, table_name, idf, return_all, ret_cols, rncols, rows_out);
@@ -5567,7 +5591,7 @@ static KdbStatus sql__exec_delete(SqlParser *p, KumDB *db, size_t *affected_out,
             KdbStatus rst = sql__build_returning_rows_from_filter(db, table_name, fp, return_all, ret_cols, rncols, &ret_rows);
             if (rst != KDB_OK) { free(id_filter); return rst; }
         }
-        st = kdb_delete(db, table_name, fp, &deleted);
+        st = sql__db_delete(db, table_name, fp, &deleted);
         if (st == KDB_OK && ret_rows) *rows_out = ret_rows;
         else if (ret_rows) kdb_rows_free(ret_rows);
         free(id_filter);
@@ -5590,12 +5614,60 @@ static KdbStatus sql__exec_delete(SqlParser *p, KumDB *db, size_t *affected_out,
                                                                     return_all, ret_cols, rncols, &ret_rows);
             if (rst != KDB_OK) { sql__free_filters(flat_filters, nfilt); return rst; }
         }
-        st = kdb_delete(db, table_name, nfilt > 0 ? filter_ptrs : NULL, &deleted);
+        st = sql__db_delete(db, table_name, nfilt > 0 ? filter_ptrs : NULL, &deleted);
         if (st == KDB_OK && ret_rows) *rows_out = ret_rows;
         else if (ret_rows) kdb_rows_free(ret_rows);
         sql__free_filters(flat_filters, nfilt);
     }
     if (st == KDB_OK && affected_out) *affected_out = deleted;
+    return st;
+}
+
+/* BEGIN/COMMIT/ROLLBACK's shared state transitions -- db->sql_tx is a
+ * KdbTx*, stored as void* in the KumDB struct (see internal.h) since it
+ * can't be named there without a circular include; cast back to KdbTx*
+ * here, where kumdb.h's real definition is visible. */
+static KdbStatus sql__begin_tx(KumDB *db) {
+    if (db->sql_tx)
+        return sql__err("a transaction is already open on this connection -- COMMIT or ROLLBACK it first (no nested transactions)");
+    KdbTx *tx = kdb_tx_begin(db);
+    if (!tx) return kdb_last_status();
+    db->sql_tx = tx;
+    return KDB_OK;
+}
+
+static KdbStatus sql__exec_begin(SqlParser *p, KumDB *db) {
+    sql__advance(p); /* BEGIN */
+    if (sql__kw_is(&p->cur, "TRANSACTION") || sql__kw_is(&p->cur, "WORK")) sql__advance(p);
+    return sql__begin_tx(db);
+}
+
+static KdbStatus sql__exec_start_transaction(SqlParser *p, KumDB *db) {
+    sql__advance(p); /* START */
+    if (!sql__kw_is(&p->cur, "TRANSACTION")) return sql__err("expected TRANSACTION after START");
+    sql__advance(p);
+    return sql__begin_tx(db);
+}
+
+static KdbStatus sql__exec_commit(SqlParser *p, KumDB *db) {
+    sql__advance(p); /* COMMIT */
+    if (sql__kw_is(&p->cur, "TRANSACTION") || sql__kw_is(&p->cur, "WORK")) sql__advance(p);
+    if (!db->sql_tx) return sql__err("no transaction is open -- nothing to COMMIT");
+    KdbStatus st = kdb_tx_commit((KdbTx *)db->sql_tx);
+    if (st == KDB_OK) db->sql_tx = NULL; /* failed commit leaves tx open -- retry COMMIT or ROLLBACK, same as the C API */
+    return st;
+}
+
+static KdbStatus sql__exec_rollback(SqlParser *p, KumDB *db) {
+    sql__advance(p); /* ROLLBACK */
+    if (sql__kw_is(&p->cur, "TRANSACTION") || sql__kw_is(&p->cur, "WORK")) sql__advance(p);
+    if (sql__kw_is(&p->cur, "TO"))
+        return sql__err("ROLLBACK TO SAVEPOINT isn't supported -- the underlying transaction API only "
+                         "backs up/restores a whole transaction, not partial rollback points; ROLLBACK "
+                         "undoes the whole transaction instead");
+    if (!db->sql_tx) return sql__err("no transaction is open -- nothing to ROLLBACK");
+    KdbStatus st = kdb_tx_rollback((KdbTx *)db->sql_tx);
+    db->sql_tx = NULL; /* kdb_tx_rollback always frees tx, success or not */
     return st;
 }
 
@@ -5611,6 +5683,14 @@ KdbStatus kdb_exec_sql(KumDB *db, const char *sql, KdbRows **rows_out, size_t *a
     if (p.cur.type == SQLTOK_EOF) return sql__err("empty SQL statement");
     if (p.cur.type == SQLTOK_ERROR) return sql__err("couldn't even tokenize this -- check for an unterminated string or a stray character");
 
+    /* schema changes aren't wrapped by kdb_tx_* (it only knows about
+     * add/update/delete) -- letting one through mid-transaction would mean
+     * ROLLBACK silently doesn't undo it, which is worse than just refusing
+     * up front. */
+    if (db->sql_tx && (sql__kw_is(&p.cur, "CREATE") || sql__kw_is(&p.cur, "ALTER") || sql__kw_is(&p.cur, "DROP")))
+        return sql__err("schema changes (CREATE/ALTER/DROP) aren't transactional here -- COMMIT or ROLLBACK "
+                         "the open transaction first, then run them outside it");
+
     KdbStatus st;
     if      (sql__kw_is(&p.cur, "CREATE")) st = sql__exec_create_table(&p, db);
     else if (sql__kw_is(&p.cur, "ALTER"))  st = sql__exec_alter_table(&p, db);
@@ -5620,7 +5700,18 @@ KdbStatus kdb_exec_sql(KumDB *db, const char *sql, KdbRows **rows_out, size_t *a
     else if (sql__kw_is(&p.cur, "UPDATE")) st = sql__exec_update(&p, db, affected_out, rows_out);
     else if (sql__kw_is(&p.cur, "DELETE")) st = sql__exec_delete(&p, db, affected_out, rows_out);
     else if (sql__kw_is(&p.cur, "WITH"))   { sql__advance(&p); st = sql__exec_with_stmt(&p, db, rows_out); }
-    else return sql__err("unrecognized statement -- expected CREATE, ALTER, DROP, INSERT, SELECT, UPDATE, DELETE, or WITH");
+    else if (sql__kw_is(&p.cur, "BEGIN"))  st = sql__exec_begin(&p, db);
+    else if (sql__kw_is(&p.cur, "START"))  st = sql__exec_start_transaction(&p, db);
+    else if (sql__kw_is(&p.cur, "COMMIT")) st = sql__exec_commit(&p, db);
+    else if (sql__kw_is(&p.cur, "ROLLBACK")) st = sql__exec_rollback(&p, db);
+    else if (sql__kw_is(&p.cur, "SAVEPOINT"))
+        return sql__err("SAVEPOINT isn't supported -- the underlying transaction API only backs up/restores "
+                         "a whole transaction, not partial rollback points; use ROLLBACK for the whole "
+                         "transaction instead");
+    else if (sql__kw_is(&p.cur, "RELEASE"))
+        return sql__err("RELEASE SAVEPOINT isn't supported -- see SAVEPOINT");
+    else return sql__err("unrecognized statement -- expected CREATE, ALTER, DROP, INSERT, SELECT, UPDATE, "
+                          "DELETE, WITH, BEGIN, START TRANSACTION, COMMIT, or ROLLBACK");
 
     if (st != KDB_OK) return st;
 

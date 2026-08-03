@@ -392,6 +392,77 @@ static void test_returning(void) {
     teardown(db);
 }
 
+static int64_t count_all(KumDB *db, const char *table) {
+    char q[128];
+    snprintf(q, sizeof(q), "SELECT * FROM %s", table);
+    KdbRows *rows = NULL;
+    ASSERT_OK(kdb_exec_sql(db, q, &rows, NULL));
+    int64_t n = rows ? (int64_t)rows->count : -1;
+    if (rows) kdb_rows_free(rows);
+    return n;
+}
+
+static void test_transactions(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (name TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('alice')"));
+
+    /* COMMIT keeps the writes */
+    ASSERT_OK(sql(db, "BEGIN"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('bob')"));
+    ASSERT_EQ(count_all(db, "t"), 2);
+    ASSERT_OK(sql(db, "COMMIT"));
+    ASSERT_EQ(count_all(db, "t"), 2);
+
+    /* ROLLBACK undoes every statement in the transaction, across
+     * INSERT/UPDATE/DELETE together */
+    ASSERT_OK(sql(db, "BEGIN TRANSACTION"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('carol')"));
+    ASSERT_OK(sql(db, "UPDATE t SET name = 'alice2' WHERE name = 'alice'"));
+    ASSERT_OK(sql(db, "DELETE FROM t WHERE name = 'bob'"));
+    ASSERT_EQ(count_all(db, "t"), 2); /* alice2, carol */
+    ASSERT_OK(sql(db, "ROLLBACK"));
+    ASSERT_EQ(count_all(db, "t"), 2); /* back to alice, bob */
+    {
+        KdbRows *rows = NULL;
+        ASSERT_OK(kdb_exec_sql(db, "SELECT name FROM t WHERE name = 'alice'", &rows, NULL));
+        ASSERT(rows && rows->count == 1u);
+        if (rows) kdb_rows_free(rows);
+    }
+
+    /* START TRANSACTION is accepted as an alias for BEGIN */
+    ASSERT_OK(sql(db, "START TRANSACTION"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('dave')"));
+    ASSERT_OK(sql(db, "COMMIT"));
+    ASSERT_EQ(count_all(db, "t"), 3);
+
+    /* error paths */
+    ASSERT_ERR(sql(db, "COMMIT"));                 /* nothing open */
+    ASSERT_ERR(sql(db, "ROLLBACK"));                /* nothing open */
+    ASSERT_OK(sql(db, "BEGIN"));
+    ASSERT_ERR(sql(db, "BEGIN"));                   /* no nested transactions */
+    ASSERT_ERR(sql(db, "CREATE TABLE u (x INT)"));  /* DDL isn't transactional here */
+    ASSERT_ERR(sql(db, "SAVEPOINT sp1"));           /* not supported, see docs */
+    ASSERT_ERR(sql(db, "ROLLBACK TO SAVEPOINT sp1"));
+    ASSERT_ERR(sql(db, "RELEASE SAVEPOINT sp1"));
+    ASSERT_OK(sql(db, "ROLLBACK")); /* clean up the still-open transaction */
+
+    /* a transaction left open when the handle closes is rolled back, same
+     * as a crash mid-transaction would be -- reopen the same directory
+     * (not teardown()/setup(), which would wipe it) to check */
+    ASSERT_OK(sql(db, "BEGIN"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('ghost')"));
+    ASSERT_EQ(count_all(db, "t"), 4);
+    kdb_close(db);
+
+    db = kdb_open(TEST_DIR);
+    ASSERT(db != NULL);
+    ASSERT_EQ(count_all(db, "t"), 3); /* ghost rolled back automatically */
+
+    teardown(db);
+}
+
 static void test_projection(void) {
     KumDB *db;
     setup(&db);
@@ -2856,6 +2927,7 @@ int main(void) {
     test_multi_row_insert_and_insert_select();
     test_upsert();
     test_returning();
+    test_transactions();
     test_projection();
     test_limit_offset();
     test_multi_column_order_by();

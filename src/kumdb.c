@@ -696,6 +696,13 @@ KumDB *kdb_open_readonly(const char *data_dir) {
 
 void kdb_close(KumDB *db) {
     if (!db) return;
+    /* a SQL BEGIN left un-COMMIT-ed/un-ROLLBACK-ed when the handle closes
+     * -- roll it back now rather than leaking the KdbTx and its backup
+     * files; leaving them for kdb__tx_recover() on the next kdb_open()
+     * would also be correct (that's exactly what a real crash mid-
+     * transaction looks like to this engine) but doing it here is
+     * immediate and frees tx right away. */
+    if (db->sql_tx) { kdb_tx_rollback((KdbTx *)db->sql_tx); db->sql_tx = NULL; }
     for (uint32_t i = 0; i < db->table_count; i++) {
         if (db->tables[i]) {
             kdb_table_close(db->tables[i]);
