@@ -801,6 +801,111 @@ static KdbStatus kdb__check_def_to_value(const KdbCheckDef *def, KdbValue *out) 
     }
 }
 
+/* Sets col_name's DEFAULT value -- an INT/FLOAT/BOOL/STRING literal, same
+ * restricted set as CHECK (never NULL: a nullable column already defaults
+ * to NULL when omitted, so there's nothing for "DEFAULT NULL" to add).
+ * Overwrites any DEFAULT col_name already had (no KDB_ERR_EXISTS, unlike
+ * FK/CHECK -- redeclaring a column's default is a normal thing to do, not
+ * an error). Enforced from here on by kdb_table_apply_defaults, called
+ * from kdb_table_insert/kdb_table_insert_batch before constraint
+ * checking -- existing rows aren't retroactively touched. */
+KdbStatus kdb_table_set_default(KdbTable *tbl, const char *col_name, const KdbValue *default_val) {
+    if (!tbl || !col_name || !default_val) {
+        kdb_err_null_arg("tbl/col_name/default_val", "kdb_table_set_default");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (default_val->type != KDB_TYPE_INT && default_val->type != KDB_TYPE_FLOAT &&
+        default_val->type != KDB_TYPE_BOOL && default_val->type != KDB_TYPE_STRING) {
+        kdb_set_error(KDB_ERR_BAD_ARG, "DEFAULT's literal must be an INT, FLOAT, BOOL, or STRING value.");
+        return KDB_ERR_BAD_ARG;
+    }
+    KdbColumn *col = NULL;
+    for (uint32_t i = 0; i < tbl->header.column_count; i++) {
+        if (strcmp(tbl->header.columns[i].name, col_name) == 0) { col = &tbl->header.columns[i]; break; }
+    }
+    if (!col) {
+        kdb_err_field_not_found(col_name, tbl->name);
+        return KDB_ERR_NOT_FOUND;
+    }
+
+    col->has_default = 1;
+    col->default_type = (uint8_t)default_val->type;
+    col->default_as_int = 0; col->default_as_float = 0; col->default_as_bool = 0;
+    memset(col->default_as_string, 0, sizeof(col->default_as_string));
+    switch (default_val->type) {
+        case KDB_TYPE_INT:    col->default_as_int   = default_val->v.as_int;   break;
+        case KDB_TYPE_FLOAT:  col->default_as_float = default_val->v.as_float; break;
+        case KDB_TYPE_BOOL:   col->default_as_bool  = default_val->v.as_bool;  break;
+        case KDB_TYPE_STRING: KDB_STRLCPY(col->default_as_string, default_val->v.as_string.data, sizeof(col->default_as_string)); break;
+        default: break;
+    }
+
+    tbl->dirty = 1;
+    return kdb_storage_flush_header(tbl);
+}
+
+/* Clears col_name's DEFAULT. KDB_ERR_NOT_FOUND if it doesn't have one. */
+KdbStatus kdb_table_drop_default(KdbTable *tbl, const char *col_name) {
+    if (!tbl || !col_name) {
+        kdb_err_null_arg("tbl/col_name", "kdb_table_drop_default");
+        return KDB_ERR_BAD_ARG;
+    }
+    KdbColumn *col = NULL;
+    for (uint32_t i = 0; i < tbl->header.column_count; i++) {
+        if (strcmp(tbl->header.columns[i].name, col_name) == 0) { col = &tbl->header.columns[i]; break; }
+    }
+    if (!col) {
+        kdb_err_field_not_found(col_name, tbl->name);
+        return KDB_ERR_NOT_FOUND;
+    }
+    if (!col->has_default) {
+        kdb_set_error(KDB_ERR_NOT_FOUND, "Column '%s' on table '%s' has no DEFAULT.", col_name, tbl->name);
+        return KDB_ERR_NOT_FOUND;
+    }
+    col->has_default = 0;
+    col->default_type = 0;
+    col->default_as_int = 0; col->default_as_float = 0; col->default_as_bool = 0;
+    memset(col->default_as_string, 0, sizeof(col->default_as_string));
+
+    tbl->dirty = 1;
+    return kdb_storage_flush_header(tbl);
+}
+
+/* Builds a real KdbValue out of a column's fixed-size DEFAULT literal,
+ * same idea as kdb__check_def_to_value. Caller must kdb_value_free() the
+ * result. */
+static KdbStatus kdb__column_default_to_value(const KdbColumn *col, KdbValue *out) {
+    switch ((KdbType)col->default_type) {
+        case KDB_TYPE_INT:    return kdb_value_from_int(col->default_as_int, out);
+        case KDB_TYPE_FLOAT:  return kdb_value_from_float(col->default_as_float, out);
+        case KDB_TYPE_BOOL:   return kdb_value_from_bool(col->default_as_bool, out);
+        case KDB_TYPE_STRING: return kdb_value_from_string(col->default_as_string, KDB_TYPE_STRING, out);
+        default:              return KDB_ERR_BAD_TYPE;
+    }
+}
+
+/* Fills in every column's DEFAULT for a field r doesn't have at all --
+ * not one it has set to NULL (an explicit NULL means the caller asked for
+ * NULL, same as real SQL: DEFAULT only ever fires when a column is
+ * omitted outright). Runs before constraint checking (kdb_table_check_
+ * insert_constraints) so a DEFAULT can satisfy NOT NULL/CHECK the same
+ * way an explicitly-supplied value would. */
+static KdbStatus kdb_table_apply_defaults(KdbTable *tbl, KdbRecord *r) {
+    for (uint32_t i = 0; i < tbl->header.column_count; i++) {
+        const KdbColumn *col = &tbl->header.columns[i];
+        if (!col->has_default) continue;
+        if (kdb_record_get_field(r, col->name)) continue; /* explicitly supplied (even if NULL) -- leave it alone */
+
+        KdbValue def;
+        KdbStatus st = kdb__column_default_to_value(col, &def);
+        if (st != KDB_OK) return st;
+        st = kdb_record_set_field(r, col->name, &def);
+        kdb_value_free(&def);
+        if (st != KDB_OK) return st;
+    }
+    return KDB_OK;
+}
+
 const char *kdb__drop_col_name = NULL;
 
 int kdb__drop_column_transform(KdbRecord *r, void *ud) {
@@ -1048,6 +1153,9 @@ KdbStatus kdb_table_insert(KdbTable *tbl, KdbRecord *r) {
         if (st != KDB_OK) { kdb_lock_release(&lock); return st; }
     }
 
+    st = kdb_table_apply_defaults(tbl, r);
+    if (st != KDB_OK) { kdb_lock_release(&lock); return st; }
+
     st = kdb_table_check_insert_constraints(tbl, r);
     if (st != KDB_OK) { kdb_lock_release(&lock); return st; }
 
@@ -1092,6 +1200,9 @@ KdbStatus kdb_table_insert_batch(KdbTable  *tbl,
     }
 
     for (size_t i = 0; i < count; i++) {
+        st = kdb_table_apply_defaults(tbl, &records[i]);
+        if (st != KDB_OK) { kdb_lock_release(&lock); return st; }
+
         st = kdb_table_check_insert_constraints(tbl, &records[i]);
         if (st != KDB_OK) { kdb_lock_release(&lock); return st; }
 

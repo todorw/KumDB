@@ -1105,6 +1105,18 @@ static KdbStatus sql__type_from_ident(const char *s, KdbFieldType *out) {
     return KDB_ERR_SQL_SYNTAX;
 }
 
+/* Forward declaration -- sql__case_value_from_token's full definition
+ * lives down with CASE's own parsing code, but sql__parse_column_
+ * modifiers (DEFAULT val, just below) and CREATE TABLE's CHECK (col op
+ * literal) items both need it well before that, since CREATE TABLE is
+ * parsed well before CASE is in this file. KDB_SQL_CASE_VAL_BUF (the
+ * string buffer size all three share) is defined here for the same
+ * reason -- see its own comment near CASE's other constants for why 512. */
+#define KDB_SQL_CASE_VAL_BUF 512
+static int sql__case_value_from_token(const SqlToken *t, KdbFieldType *type_out,
+                                      int64_t *int_out, double *float_out, int *bool_out,
+                                      char *str_out, size_t str_out_size);
+
 /* [ON DELETE {RESTRICT|CASCADE|SET NULL}] [ON UPDATE {RESTRICT|CASCADE|
  * SET NULL}], in either order, both optional -- follows a REFERENCES
  * ref_table(ref_col), whether written as a column modifier or as a
@@ -1146,12 +1158,21 @@ static int sql__parse_fk_actions(SqlParser *p, KdbFkAction *on_delete, KdbFkActi
  * [ON UPDATE ...] is collected here but not applied -- the caller adds
  * the actual foreign key (via kdb_add_foreign_key, which needs a KumDB*
  * to validate ref_table/ref_col exist) once the column itself exists.
- * The rest (DEFAULT) is accepted and ignored, best-effort SQL DDL
- * compatibility. */
+ * DEFAULT val is an optional leading '-' then an INT/FLOAT/BOOL/STRING
+ * literal (sql__case_value_from_token's grammar) -- an explicit "DEFAULT
+ * NULL" is parsed but has_default is left 0 for it, same as not writing
+ * DEFAULT at all (a nullable column already defaults to NULL when
+ * omitted, so there's nothing for kdb_table_set_default to store). Also
+ * collected here but not applied for the same reason as REFERENCES --
+ * the caller calls kdb_set_column_default once the column itself
+ * exists. */
 static KdbStatus sql__parse_column_modifiers(SqlParser *p, const char *col_name, int *nullable, int *indexed, int *unique,
                                              int *has_fk, char *fk_ref_table, size_t fk_ref_table_size,
                                              char *fk_ref_col, size_t fk_ref_col_size,
-                                             KdbFkAction *fk_on_delete, KdbFkAction *fk_on_update) {
+                                             KdbFkAction *fk_on_delete, KdbFkAction *fk_on_update,
+                                             int *has_default, KdbFieldType *default_type,
+                                             int64_t *default_int, double *default_float, int *default_bool,
+                                             char *default_str, size_t default_str_size) {
     for (;;) {
         if (sql__kw_is(&p->cur, "NOT")) {
             sql__advance(p);
@@ -1189,24 +1210,31 @@ static KdbStatus sql__parse_column_modifiers(SqlParser *p, const char *col_name,
         }
         if (sql__kw_is(&p->cur, "DEFAULT")) {
             sql__advance(p);
+            int negate = 0;
+            if (p->cur.type == SQLTOK_MINUS) { negate = 1; sql__advance(p); }
+            KdbFieldType lit_type = KDB_TYPE_NULL;
+            int64_t lit_int = 0; double lit_float = 0; int lit_bool = 0;
+            if (!sql__case_value_from_token(&p->cur, &lit_type, &lit_int, &lit_float, &lit_bool, default_str, default_str_size))
+                return sql__err("expected a literal after DEFAULT for column '%s'", col_name);
+            if (negate) {
+                if (lit_type == KDB_TYPE_INT) lit_int = -lit_int;
+                else if (lit_type == KDB_TYPE_FLOAT) lit_float = -lit_float;
+                else return sql__err("'-' before a non-numeric DEFAULT literal for column '%s'", col_name);
+            }
             sql__advance(p);
+            if (lit_type != KDB_TYPE_NULL) {
+                *has_default   = 1;
+                *default_type  = lit_type;
+                *default_int   = lit_int;
+                *default_float = lit_float;
+                *default_bool  = lit_bool;
+            }
             continue;
         }
         break;
     }
     return KDB_OK;
 }
-
-/* Forward declaration -- sql__case_value_from_token's full definition lives
- * down with CASE's own parsing code, but CREATE TABLE's CHECK (col op
- * literal) items (just below) need it too, and CREATE TABLE is parsed
- * well before CASE is in this file. KDB_SQL_CASE_VAL_BUF (the string
- * buffer size both share) is defined early for the same reason -- see
- * its own comment near CASE's other constants for why 512. */
-#define KDB_SQL_CASE_VAL_BUF 512
-static int sql__case_value_from_token(const SqlToken *t, KdbFieldType *type_out,
-                                      int64_t *int_out, double *float_out, int *bool_out,
-                                      char *str_out, size_t str_out_size);
 
 /* Maps a comparison-operator token to the matching KdbOperator -- used by
  * CREATE TABLE's CHECK (col op literal) items to hand the parsed operator
@@ -1727,6 +1755,15 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
     KdbFkAction col_fk_on_delete[KDB_SQL_MAX_COLUMNS];
     KdbFkAction col_fk_on_update[KDB_SQL_MAX_COLUMNS];
 
+    /* A column's own DEFAULT modifier -- applied (via kdb_set_column_
+     * default) the same way, only after the column itself exists. */
+    int          col_has_default[KDB_SQL_MAX_COLUMNS];
+    KdbFieldType col_default_type[KDB_SQL_MAX_COLUMNS];
+    int64_t      col_default_int[KDB_SQL_MAX_COLUMNS];
+    double       col_default_float[KDB_SQL_MAX_COLUMNS];
+    int          col_default_bool[KDB_SQL_MAX_COLUMNS];
+    char         col_default_string[KDB_SQL_MAX_COLUMNS][KDB_SQL_CASE_VAL_BUF];
+
     /* Table-level FOREIGN KEY (col) REFERENCES ref_table(ref_col) items --
      * same thing, spelled the other standard-SQL way, not tied to one
      * column definition's own line. */
@@ -1914,10 +1951,17 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
         int nullable = 1, indexed = 0, unique = 0, has_fk = 0;
         char fk_ref_table[KDB_SQL_IDENT_BUF], fk_ref_col[KDB_SQL_IDENT_BUF];
         KdbFkAction fk_on_delete = KDB_FK_RESTRICT, fk_on_update = KDB_FK_RESTRICT;
+        int has_default = 0;
+        KdbFieldType default_type = KDB_TYPE_NULL;
+        int64_t default_int = 0; double default_float = 0; int default_bool = 0;
+        char default_str[KDB_SQL_CASE_VAL_BUF];
         KdbStatus mst = sql__parse_column_modifiers(p, this_name, &nullable, &indexed, &unique,
                                                     &has_fk, fk_ref_table, sizeof(fk_ref_table),
                                                     fk_ref_col, sizeof(fk_ref_col),
-                                                    &fk_on_delete, &fk_on_update);
+                                                    &fk_on_delete, &fk_on_update,
+                                                    &has_default, &default_type,
+                                                    &default_int, &default_float, &default_bool,
+                                                    default_str, sizeof(default_str));
         if (mst != KDB_OK) return mst;
 
         if (!sql__is_reserved_column(this_name)) {
@@ -1934,6 +1978,14 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
                 snprintf(col_fk_ref_col[n], sizeof(col_fk_ref_col[0]), "%s", fk_ref_col);
                 col_fk_on_delete[n] = fk_on_delete;
                 col_fk_on_update[n] = fk_on_update;
+            }
+            col_has_default[n] = has_default;
+            if (has_default) {
+                col_default_type[n]  = default_type;
+                col_default_int[n]   = default_int;
+                col_default_float[n] = default_float;
+                col_default_bool[n]  = default_bool;
+                snprintf(col_default_string[n], sizeof(col_default_string[0]), "%s", default_str);
             }
             n++;
         }
@@ -1952,6 +2004,21 @@ static KdbStatus sql__exec_create_table(SqlParser *p, KumDB *db) {
         if (!col_has_fk[i]) continue;
         KdbStatus ast = kdb_add_foreign_key(db, table_name, cols[i].name, col_fk_ref_table[i], col_fk_ref_col[i],
                                             col_fk_on_delete[i], col_fk_on_update[i]);
+        if (ast != KDB_OK) { kdb_drop_table(db, table_name); return ast; }
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (!col_has_default[i]) continue;
+        KdbField def;
+        def.name = NULL;
+        def.type = col_default_type[i];
+        switch (col_default_type[i]) {
+            case KDB_TYPE_INT:    def.v.as_int    = col_default_int[i];    break;
+            case KDB_TYPE_FLOAT:  def.v.as_float  = col_default_float[i];  break;
+            case KDB_TYPE_BOOL:   def.v.as_bool   = col_default_bool[i];   break;
+            case KDB_TYPE_STRING: def.v.as_string = col_default_string[i]; break;
+            default: break;
+        }
+        KdbStatus ast = kdb_set_column_default(db, table_name, cols[i].name, &def);
         if (ast != KDB_OK) { kdb_drop_table(db, table_name); return ast; }
     }
     for (int i = 0; i < n_tfk; i++) {
@@ -2194,10 +2261,17 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
         int nullable = 1, indexed = 0, unique = 0, has_fk = 0;
         char fk_ref_table[KDB_SQL_IDENT_BUF], fk_ref_col[KDB_SQL_IDENT_BUF];
         KdbFkAction fk_on_delete = KDB_FK_RESTRICT, fk_on_update = KDB_FK_RESTRICT;
+        int has_default = 0;
+        KdbFieldType default_type = KDB_TYPE_NULL;
+        int64_t default_int = 0; double default_float = 0; int default_bool = 0;
+        char default_str[KDB_SQL_CASE_VAL_BUF];
         KdbStatus mst = sql__parse_column_modifiers(p, col_name, &nullable, &indexed, &unique,
                                                     &has_fk, fk_ref_table, sizeof(fk_ref_table),
                                                     fk_ref_col, sizeof(fk_ref_col),
-                                                    &fk_on_delete, &fk_on_update);
+                                                    &fk_on_delete, &fk_on_update,
+                                                    &has_default, &default_type,
+                                                    &default_int, &default_float, &default_bool,
+                                                    default_str, sizeof(default_str));
         if (mst != KDB_OK) return mst;
 
         if (sql__is_reserved_column(col_name))
@@ -2207,6 +2281,20 @@ static KdbStatus sql__exec_alter_table(SqlParser *p, KumDB *db) {
         if (ast != KDB_OK) return ast;
         if (has_fk) {
             ast = kdb_add_foreign_key(db, table_name, col_name, fk_ref_table, fk_ref_col, fk_on_delete, fk_on_update);
+            if (ast != KDB_OK) { kdb_drop_column(db, table_name, col_name); return ast; }
+        }
+        if (has_default) {
+            KdbField def;
+            def.name = NULL;
+            def.type = default_type;
+            switch (default_type) {
+                case KDB_TYPE_INT:    def.v.as_int    = default_int;   break;
+                case KDB_TYPE_FLOAT:  def.v.as_float  = default_float; break;
+                case KDB_TYPE_BOOL:   def.v.as_bool   = default_bool;  break;
+                case KDB_TYPE_STRING: def.v.as_string = default_str;   break;
+                default: break;
+            }
+            ast = kdb_set_column_default(db, table_name, col_name, &def);
             if (ast != KDB_OK) { kdb_drop_column(db, table_name, col_name); return ast; }
         }
         return KDB_OK;

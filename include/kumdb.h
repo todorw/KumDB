@@ -489,6 +489,19 @@ KdbStatus kdb_drop_composite_foreign_key(KumDB *db, const char *table_name, cons
 KdbStatus kdb_add_check_constraint(KumDB *db, const char *table_name, const char *col_name,
                                    KdbOperator op, const KdbField *literal);
 
+/* Sets col_name's DEFAULT value -- default_val.type must be INT/FLOAT/
+ * BOOL/STRING (default_val.name is ignored), same restricted set as
+ * kdb_add_check_constraint's literal. From here on, kdb_add/kdb_batch_
+ * import (and every SQL INSERT) fill this in for any row that has no
+ * field at all for col_name -- an INSERT that explicitly gives col_name
+ * NULL still gets NULL, same as real SQL: DEFAULT only fires when the
+ * column is omitted outright. Existing rows aren't retroactively
+ * touched. Overwrites any DEFAULT col_name already had. */
+KdbStatus kdb_set_column_default(KumDB *db, const char *table_name, const char *col_name, const KdbField *default_val);
+
+/* Removes col_name's DEFAULT. KDB_ERR_NOT_FOUND if it doesn't have one. */
+KdbStatus kdb_drop_column_default(KumDB *db, const char *table_name, const char *col_name);
+
 /* Renames the table itself (the file on disk, and the header's own
  * stored name). KDB_ERR_EXISTS if new_name already names a table. */
 KdbStatus kdb_rename_table(KumDB *db, const char *old_name, const char *new_name);

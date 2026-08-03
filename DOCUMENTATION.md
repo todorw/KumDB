@@ -314,16 +314,21 @@ rewritten.
 
 `kdb_add_foreign_key(db, table, col, ref_table, ref_col, on_delete,
 on_update)`, `kdb_add_composite_foreign_key(db, table, col_names, n_cols,
-ref_table, ref_cols, n_ref_cols, on_delete, on_update)`, and
-`kdb_add_check_constraint(db, table, col, op, literal)` add real,
+ref_table, ref_cols, n_ref_cols, on_delete, on_update)`,
+`kdb_add_check_constraint(db, table, col, op, literal)`, and
+`kdb_set_column_default(db, table, col, default_val)` add real,
 enforced constraints the same way from the C API directly
-(`kdb_drop_foreign_key`/`kdb_drop_composite_foreign_key` remove one) —
-see `ALTER TABLE`'s `REFERENCES`/`FOREIGN KEY`/`CHECK` forms below for
-the full semantics (`on_delete`/`on_update` are `KDB_FK_RESTRICT`/
+(`kdb_drop_foreign_key`/`kdb_drop_composite_foreign_key`/
+`kdb_drop_column_default` remove one) — see `ALTER TABLE`'s
+`REFERENCES`/`FOREIGN KEY`/`CHECK`/`DEFAULT` forms below for the full
+semantics (`on_delete`/`on_update` are `KDB_FK_RESTRICT`/
 `KDB_FK_CASCADE`/`KDB_FK_SET_NULL`; the six-comparison-operator CHECK;
 all enforced by `kdb_add`/`kdb_update`/`kdb_delete` regardless of whether
-they were declared from SQL or here). `kdb_batch_import` bypasses all of
-them, same as it bypasses NOT NULL/UNIQUE.
+they were declared from SQL or here). `kdb_batch_import` bypasses FK
+checks (both single-column and composite) but not NOT NULL/UNIQUE/CHECK/
+DEFAULT — it shares `kdb_table_insert`'s constraint- and default-filling
+path (`kdb_table_insert_batch`), just not `kdb_add_validated`'s separate
+FK-checking step.
 
 ### Errors, printing, misc
 
@@ -561,9 +566,9 @@ kdb_exec_sql_params(db, "SELECT * FROM employees WHERE age >= ? AND dept = ?",
 ```
 
 ```sql
-CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2) [ON DELETE|UPDATE action]], ...
+CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2) [ON DELETE|UPDATE action]] [DEFAULT literal], ...
                 [, FOREIGN KEY (col[, col...]) REFERENCES t2(col2[, col2...]) [ON DELETE|UPDATE action]]* [, CHECK (col op literal)]*)
-ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2) [ON DELETE|UPDATE action]]
+ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2) [ON DELETE|UPDATE action]] [DEFAULT literal]
 ALTER TABLE t ADD FOREIGN KEY (col[, col...]) REFERENCES t2(col2[, col2...]) [ON DELETE action] [ON UPDATE action]  -- action: RESTRICT | CASCADE | SET NULL; 2+ columns each side is composite
 ALTER TABLE t ADD CHECK (col op literal)
 ALTER TABLE t DROP [COLUMN] col
@@ -839,6 +844,32 @@ format 2.0's remaining reserved padding could hold, so it bumped the
 on-disk format to 3.0 — another real, intentional break from anything
 older, same reasoning and the same clear "versions are incompatible"
 rejection as the 1.x → 2.0 bump before it.
+
+**`DEFAULT literal`** — as a column modifier (`col TYPE ... DEFAULT
+literal`) in `CREATE TABLE` or `ALTER TABLE t ADD COLUMN` — gives `col` a
+value to fall back on when an `INSERT` omits it entirely:
+
+```sql
+CREATE TABLE tasks (title TEXT, status TEXT NOT NULL DEFAULT 'pending', priority INT DEFAULT 5)
+INSERT INTO tasks (title) VALUES ('write docs')  -- status='pending', priority=5
+```
+
+`literal` is an optional leading `-` then an `INT`/`FLOAT`/`BOOL`/`STRING`
+literal (an explicit `DEFAULT NULL` is accepted but stores nothing — a
+nullable column already defaults to `NULL` when omitted, so there's
+nothing for it to add). It only ever fires when the column is left out of
+the `INSERT` altogether — giving it an explicit `NULL` still stores
+`NULL`, same as real SQL. Defaults are filled in before `NOT NULL`/
+`CHECK`/`UNIQUE` validation runs, so `NOT NULL DEFAULT literal` is a
+normal, useful combination rather than a contradiction. Not available via
+`ALTER TABLE t ALTER COLUMN` (only at column-creation time); adding a
+`DEFAULT` later via `ALTER TABLE t ADD COLUMN` doesn't retroactively
+touch existing rows, same as every other constraint here. Needed a real
+literal payload on `KdbColumn` (an `INT`/`FLOAT`/`BOOL`/`STRING`, the
+`STRING` case alone needing a 128-byte buffer) past what file format
+3.0's remaining padding could hold, so it bumped the on-disk format to
+4.0 — same reasoning and the same clear "versions are incompatible"
+rejection as every major bump before it.
 
 **`CHECK (col op literal)`** — as its own table-level item in
 `CREATE TABLE`, or via `ALTER TABLE t ADD CHECK (col op literal)` —

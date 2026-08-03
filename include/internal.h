@@ -8,27 +8,30 @@
 
 
 #define KDB_MAGIC              0x4B554D44
-/* File format 3.0 -- same story as the 1.x -> 2.0 break (see below), one
- * more time: composite (multi-column) foreign keys need an array of
- * table-name-sized strings per definition (KdbCompositeFkDef), nowhere
- * close to fitting in 2.0's remaining ~63-byte padding budget the way
- * every earlier same-major-version extension (KdbColumn.on_delete/
- * on_update included) managed to. Every extension within one major
- * version has stayed padding-carved so far specifically so
+/* File format 4.0 -- same story one more time: DEFAULT value enforcement
+ * needs a real literal payload on KdbColumn (an INT/FLOAT/BOOL/STRING,
+ * the STRING case alone needing a 128-byte buffer), and KdbColumn's only
+ * remaining reserved slot was _pad[2] -- nowhere close. Every extension
+ * within one major version stays padding-carved specifically so
  * kdb_storage_validate_header's version_major-only check stays honest
  * (same struct layout across a whole major version); breaking that
  * invariant without bumping the major version would make the version
- * check silently lie. Caught the same way 1.x->2.0 already was: a clean,
- * intentional "versions are incompatible" rejection, not a migration.
+ * check silently lie. Caught the same way every major bump before it
+ * was: a clean, intentional "versions are incompatible" rejection, not a
+ * migration.
  *
- * 2.0 (previous): KdbColumn/KdbTableHeader both grew real fields (FK
- * definitions, CHECK constraints, then on_delete/on_update) instead of
- * carving them out of reserved padding the way every 1.x extension did;
- * a foreign key alone needs a whole table-name-sized string, far more
- * than 1.x's padding budget had left. Fine for this project (no deployed
- * 1.x/2.x data to migrate); a real migration tool would read each older
- * header layout explicitly and rewrite it forward. */
-#define KDB_VERSION_MAJOR      3
+ * 3.0 (previous): composite (multi-column) foreign keys needed an array
+ * of table-name-sized strings per definition (KdbCompositeFkDef), past
+ * what 2.0's remaining padding could hold.
+ *
+ * 2.0: KdbColumn/KdbTableHeader both grew real fields (FK definitions,
+ * CHECK constraints, then on_delete/on_update) instead of carving them
+ * out of reserved padding the way every 1.x extension did; a foreign key
+ * alone needs a whole table-name-sized string, far more than 1.x's
+ * padding budget had left. Fine for this project (no deployed data from
+ * any earlier version to migrate); a real migration tool would read each
+ * older header layout explicitly and rewrite it forward. */
+#define KDB_VERSION_MAJOR      4
 #define KDB_VERSION_MINOR      0
 #define KDB_VERSION_PATCH      0
 
@@ -133,8 +136,10 @@ typedef struct {
      * column a non-NULL value requires a matching row in
      * fk_ref_table.fk_ref_col to already exist (kdb__check_fk_insert in
      * kumdb.c -- needs KumDB* to open the referenced table, so it can't
-     * live in table.c like NOT NULL/UNIQUE do). One FK per column, no
-     * composite (multi-column) foreign keys. */
+     * live in table.c like NOT NULL/UNIQUE do). One single-column FK per
+     * column -- composite (multi-column) foreign keys are a separate,
+     * parallel mechanism (KdbCompositeFkDef, on KdbTableHeader instead of
+     * here) added in file format 3.0, not stored via these fields. */
     uint8_t  has_fk;
     char     fk_ref_table[KDB_MAX_NAME_LEN];
     char     fk_ref_col[KDB_MAX_NAME_LEN];
@@ -147,7 +152,25 @@ typedef struct {
      * bytes as 0 behaves exactly as it always did. */
     uint8_t  on_delete;
     uint8_t  on_update;
-    uint8_t  _pad[2]; /* reserved for a future 2.x minor extension, same discipline as _pad above used to follow */
+    uint8_t  _pad[2]; /* reserved for a future 3.x minor extension, same discipline as _pad above used to follow */
+    /* Added in file format 4.0 -- DEFAULT value enforcement. has_default
+     * ==0 means no DEFAULT was declared (an INSERT omitting this column
+     * just leaves it NULL/missing, the original behavior); when it's 1,
+     * default_type says which of the fields below is meaningful (same
+     * restricted literal set as CHECK's KdbCheckDef -- INT/FLOAT/BOOL/
+     * STRING, never NULL: "DEFAULT NULL" is redundant since a column is
+     * nullable by default anyway, so sql.c doesn't store one for it at
+     * all). kdb_table_insert/kdb_table_insert_batch fill this in for any
+     * row whose KdbRecord has no field at all for this column -- an
+     * INSERT that explicitly gives it NULL still gets NULL, same as real
+     * SQL: DEFAULT only ever fires when the column is omitted outright. */
+    uint8_t  has_default;
+    uint8_t  default_type;   /* KdbType: INT/FLOAT/BOOL/STRING */
+    uint8_t  _pad2[2];
+    int64_t  default_as_int;
+    double   default_as_float;
+    uint8_t  default_as_bool;
+    char     default_as_string[128];
 } KdbColumn;
 
 /* has_fk's on_delete/on_update action. RESTRICT (0, the original-and-

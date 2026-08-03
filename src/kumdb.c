@@ -2852,6 +2852,39 @@ KdbStatus kdb_add_check_constraint(KumDB *db, const char *table_name, const char
     return st;
 }
 
+KdbStatus kdb_set_column_default(KumDB *db, const char *table_name, const char *col_name, const KdbField *default_val) {
+    if (!db || !table_name || !col_name || !default_val) {
+        kdb_err_null_arg("db/table_name/col_name/default_val", "kdb_set_column_default");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+
+    KdbValue val;
+    if (kdb__field_to_value(default_val, &val) != KDB_OK) return kdb_last_status();
+    KdbStatus st = kdb_table_set_default(tbl, col_name, &val);
+    kdb_value_free(&val);
+    return st;
+}
+
+KdbStatus kdb_drop_column_default(KumDB *db, const char *table_name, const char *col_name) {
+    if (!db || !table_name || !col_name) {
+        kdb_err_null_arg("db/table_name/col_name", "kdb_drop_column_default");
+        return KDB_ERR_BAD_ARG;
+    }
+    if (db->read_only) {
+        kdb_err_table_read_only(table_name);
+        return KDB_ERR_READ_ONLY;
+    }
+    KdbTable *tbl = kdb__get_table(db, table_name);
+    if (!tbl) return kdb_last_status();
+    return kdb_table_drop_default(tbl, col_name);
+}
+
 /* Renames the table itself: evicts any cached handle (closing its fd --
  * an already-open fd would otherwise keep referencing the old inode,
  * same reasoning kdb__evict_table's own doc comment gives for every

@@ -121,6 +121,16 @@ KdbStatus kdb_table_drop_composite_foreign_key(KdbTable *tbl, const char **col_n
  * KDB_ERR_FULL past KDB_MAX_CHECK_CONSTRAINTS. */
 KdbStatus kdb_table_add_check(KdbTable *tbl, const char *col_name, KdbOperator op, const KdbValue *literal);
 
+/* Sets col_name's DEFAULT value -- an INT/FLOAT/BOOL/STRING literal, same
+ * restricted set as CHECK. Applied by kdb_table_insert/kdb_table_insert_
+ * batch to fill in any row whose record has no field at all for col_name
+ * (an explicit NULL is left alone -- DEFAULT only fires when the column
+ * is omitted outright). Overwrites any DEFAULT col_name already had. */
+KdbStatus kdb_table_set_default(KdbTable *tbl, const char *col_name, const KdbValue *default_val);
+
+/* Clears col_name's DEFAULT. KDB_ERR_NOT_FOUND if it doesn't have one. */
+KdbStatus kdb_table_drop_default(KdbTable *tbl, const char *col_name);
+
 const KdbColumn *kdb_table_get_column(const KdbTable *tbl,
                                       const char     *col_name);
 

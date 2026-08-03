@@ -16,9 +16,9 @@ extern "C" {
  * lines) are both stripped like whitespace anywhere a token could start.
  *
  * Supported:
- *   CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2) [ON DELETE|UPDATE action]], ...
+ *   CREATE TABLE t (col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2) [ON DELETE|UPDATE action]] [DEFAULT literal], ...
  *                   [, FOREIGN KEY (col[, col...]) REFERENCES t2(col2[, col2...]) [ON DELETE|UPDATE action]]* [, CHECK (col OP literal)]*)
- *   ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2) [ON DELETE|UPDATE action]]
+ *   ALTER TABLE t ADD [COLUMN] col TYPE [NOT NULL] [UNIQUE | PRIMARY KEY] [INDEX] [REFERENCES t2(col2) [ON DELETE|UPDATE action]] [DEFAULT literal]
  *   ALTER TABLE t ADD FOREIGN KEY (col[, col...]) REFERENCES t2(col2[, col2...]) [ON DELETE action] [ON UPDATE action]  -- action: RESTRICT | CASCADE | SET NULL; 2+ columns on each side is a composite FK
  *   ALTER TABLE t ADD CHECK (col OP literal)
  *   ALTER TABLE t DROP [COLUMN] col
@@ -486,6 +486,22 @@ extern "C" {
  * t2(c1, c2, ...) [ON DELETE ...] [ON UPDATE ...] adds one after the
  * fact; ALTER TABLE t DROP FOREIGN KEY (col1, col2, ...) removes it
  * (matching the column set, any order).
+ *
+ * DEFAULT literal, as a column modifier (col TYPE ... DEFAULT literal) in
+ * CREATE TABLE or ALTER TABLE t ADD COLUMN -- not a table-level item, and
+ * not available via ALTER TABLE t ALTER COLUMN -- gives col a value to
+ * fall back on. literal is an optional leading '-' then an INT/FLOAT/
+ * BOOL/STRING literal (an explicit DEFAULT NULL is parsed but stores
+ * nothing -- a nullable column already defaults to NULL when omitted, so
+ * there's nothing for it to add). From then on, kdb_add/kdb_batch_import
+ * (and every SQL INSERT) fill in literal for any row that has no field at
+ * all for col -- an INSERT that explicitly gives col NULL still gets
+ * NULL, same as real SQL: DEFAULT only ever fires when the column is
+ * omitted outright. This runs before NOT NULL/CHECK/UNIQUE validation, so
+ * a DEFAULT can satisfy NOT NULL the same way an explicitly-supplied
+ * value would (col TYPE NOT NULL DEFAULT literal is a normal, useful
+ * combination). Existing rows aren't retroactively touched when DEFAULT
+ * is added later via ALTER TABLE t ADD COLUMN.
  *
  * CHECK (col OP literal), as its own table-level item in CREATE TABLE or
  * via ALTER TABLE t ADD CHECK (col OP literal), restricts col's values --

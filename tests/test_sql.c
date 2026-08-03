@@ -2631,6 +2631,108 @@ static void test_composite_foreign_key(void) {
     teardown(db);
 }
 
+static void test_default_values(void) {
+    KumDB *db;
+    setup(&db);
+    KdbRows *rows = NULL;
+
+    /* DEFAULT fires when the column is omitted, for every literal type */
+    ASSERT_OK(sql(db, "CREATE TABLE t (name TEXT, status TEXT DEFAULT 'pending', priority INT DEFAULT 5, "
+                      "score FLOAT DEFAULT 1.5, active BOOL DEFAULT TRUE, temp INT DEFAULT -10)"));
+    ASSERT_OK(sql(db, "INSERT INTO t (name) VALUES ('alice')"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE name = 'alice'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    {
+        const char *status = NULL;
+        int64_t priority = 0;
+        double score = 0;
+        int active = 0;
+        int64_t temp = 0;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "status", &status));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "priority", &priority));
+        ASSERT_OK(kdb_row_get_float(&rows->rows[0], "score", &score));
+        ASSERT_OK(kdb_row_get_bool(&rows->rows[0], "active", &active));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "temp", &temp));
+        ASSERT(status && strcmp(status, "pending") == 0);
+        ASSERT_EQ(priority, 5);
+        ASSERT(score == 1.5);
+        ASSERT_EQ(active, 1);
+        ASSERT_EQ(temp, -10);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* an explicit value overrides the DEFAULT */
+    ASSERT_OK(sql(db, "INSERT INTO t (name, status) VALUES ('bob', 'active')"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE name = 'bob'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    {
+        const char *status = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "status", &status));
+        ASSERT(status && strcmp(status, "active") == 0);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* an explicit NULL is NOT replaced by DEFAULT -- only omission triggers it */
+    ASSERT_OK(sql(db, "INSERT INTO t (name, status) VALUES ('carol', NULL)"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t WHERE name = 'carol'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    {
+        const char *status = NULL;
+        ASSERT(kdb_row_get_string(&rows->rows[0], "status", &status) != KDB_OK); /* NULL, not 'pending' */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* DEFAULT satisfies NOT NULL when the column is omitted */
+    ASSERT_OK(sql(db, "CREATE TABLE t2 (name TEXT, status TEXT NOT NULL DEFAULT 'new')"));
+    ASSERT_OK(sql(db, "INSERT INTO t2 (name) VALUES ('x')"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t2 WHERE name = 'x'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    {
+        const char *status = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "status", &status));
+        ASSERT(status && strcmp(status, "new") == 0);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+    ASSERT_ERR(sql(db, "INSERT INTO t2 (name, status) VALUES ('y', NULL)")); /* explicit NULL still rejected */
+
+    /* ALTER TABLE ADD COLUMN with DEFAULT -- existing rows aren't retroactively touched */
+    ASSERT_OK(sql(db, "CREATE TABLE t3 (name TEXT)"));
+    ASSERT_OK(sql(db, "INSERT INTO t3 (name) VALUES ('pre')"));
+    ASSERT_OK(sql(db, "ALTER TABLE t3 ADD COLUMN kind TEXT DEFAULT 'basic'"));
+    ASSERT_OK(sql(db, "INSERT INTO t3 (name) VALUES ('post')"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t3 WHERE name = 'post'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    {
+        const char *kind = NULL;
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "kind", &kind));
+        ASSERT(kind && strcmp(kind, "basic") == 0);
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t3 WHERE name = 'pre'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    {
+        const char *kind = NULL;
+        ASSERT(kdb_row_get_string(&rows->rows[0], "kind", &kind) != KDB_OK); /* not retroactively defaulted */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* DEFAULT NULL is a no-op, same as not writing DEFAULT at all */
+    ASSERT_OK(sql(db, "CREATE TABLE t4 (name TEXT, note TEXT DEFAULT NULL)"));
+    ASSERT_OK(sql(db, "INSERT INTO t4 (name) VALUES ('z')"));
+    ASSERT_OK(kdb_exec_sql(db, "SELECT * FROM t4 WHERE name = 'z'", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    {
+        const char *note = NULL;
+        ASSERT(kdb_row_get_string(&rows->rows[0], "note", &note) != KDB_OK); /* DEFAULT NULL is a no-op */
+    }
+    if (rows) { kdb_rows_free(rows); rows = NULL; }
+
+    /* '-' before a non-numeric DEFAULT literal is rejected */
+    ASSERT_ERR(sql(db, "CREATE TABLE bad (a TEXT DEFAULT -'x')"));
+
+    teardown(db);
+}
+
 static void test_unique_not_null_constraints(void) {
     KumDB *db;
     setup(&db);
@@ -4211,6 +4313,7 @@ int main(void) {
     test_foreign_keys_and_checks();
     test_fk_cascade_actions();
     test_composite_foreign_key();
+    test_default_values();
     test_unique_not_null_constraints();
     test_create_drop_index();
     test_composite_indexes();
