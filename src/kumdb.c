@@ -3332,6 +3332,19 @@ void kdb_row_print(const KdbRow *row, FILE *fp) {
     fprintf(fp, "{ id=%llu", (unsigned long long)row->id);
     for (uint32_t i = 0; i < row->field_count; i++) {
         const KdbField *f = &row->fields[i];
+        /* A SQL result that explicitly SELECTs id (e.g. "SELECT id FROM
+         * t") now carries it as a real field too, same value already
+         * shown in the "id=" preamble above -- skip it here rather than
+         * printing it twice. created_at/updated_at aren't in the preamble
+         * at all, so an explicit SELECT of those still shows normally.
+         * Only skip when the value actually matches row->id -- a
+         * RETURNING row doesn't populate row->id itself (a separate,
+         * pre-existing quirk), so its "id" field can legitimately be the
+         * only place carrying the real value; only a genuine duplicate
+         * (same value, both places) should be hidden. */
+        if (f->name && strcmp(f->name, "id") == 0 &&
+            f->type == KDB_TYPE_INT && (uint64_t)f->v.as_int == row->id)
+            continue;
         fprintf(fp, ", %s=", f->name ? f->name : "?");
         kdb__print_field_value(fp, f);
     }

@@ -117,8 +117,20 @@ void QueryPanel::refreshTableList() {
 static QStringList collectColumns(const QVector<KRow> &rows) {
     QStringList cols;
     for (const auto &r : rows)
-        for (const auto &f : r.fields)
+        for (const auto &f : r.fields) {
+            // column 0 is always "id" (from KRow::id, see RowTableModel) --
+            // an explicit "SELECT id" now carries id as a real field too,
+            // same value, so skip it here rather than showing it twice.
+            // Only when the values actually agree, though -- a RETURNING
+            // row doesn't populate KRow::id itself (a separate,
+            // pre-existing quirk, see kdb_row_print's own version of this
+            // same check in kumdb.c), so its "id" field can legitimately
+            // be the only place carrying the real value.
+            if (f.first == QStringLiteral("id") && f.second.canConvert<qint64>() &&
+                (quint64)f.second.value<qint64>() == r.id)
+                continue;
             if (!cols.contains(f.first)) cols << f.first;
+        }
     return cols;
 }
 
