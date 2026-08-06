@@ -1,6 +1,6 @@
 # KumDB
 
-*The database that doesn't waste your timee.*
+*The database that doesn't waste your time.*
 
 ## What is it
 
