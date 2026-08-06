@@ -124,22 +124,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The macOS SDK on Xcode 15+ (macOS 14 Sonoma+) dropped the legacy
-      # AGL.framework. Qt's CMake config pulls in CMake's own FindOpenGL
-      # module, and older CMake versions unconditionally reference AGL on
-      # Apple platforms (fixed upstream around CMake 3.27) -- without this,
-      # the final link fails with "ld: framework 'AGL' not found" even
-      # though this app never touches OpenGL directly. Homebrew's cmake
-      # formula tracks current upstream releases, well past the fix.
-      - name: Upgrade CMake
-        run: |
-          brew update
-          brew upgrade cmake || brew install cmake
-
+      # macos-latest has moved to macOS 26 (Tahoe), whose SDK fully removed
+      # AGL.framework rather than just deprecating it. Qt's own mkspecs
+      # still referenced "-framework AGL" for OpenGL detection through
+      # Qt 6.7.x, so the final link of kumdb_studio fails with
+      # "ld: framework 'AGL' not found" even though this app never touches
+      # OpenGL directly -- upgrading CMake (tried first) didn't help since
+      # the AGL reference comes from Qt itself, not from CMake's own
+      # FindOpenGL module. Qt fixed this upstream in 6.8.4/6.9.2 (QTBUG-137687).
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
         with:
-          version: '6.7.*'
+          version: '6.9.2'
 
       - name: Configure
         run: cmake -S app -B build -DCMAKE_BUILD_TYPE=Release
