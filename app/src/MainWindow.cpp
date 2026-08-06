@@ -388,10 +388,29 @@ void MainWindow::refreshTables() {
     QStringList tables = m_db.listTables();
     m_tableList->addItems(tables);
     m_tableCountLabel->setText(QString::number(tables.size()));
+
+    // setCurrentItem() alone doesn't fire itemClicked, so restoring (or
+    // picking) a selection here used to leave the datasheet/schema tabs
+    // showing whatever they last had -- stale data after a rename/drop, or
+    // just an empty "id" placeholder on first opening a database that
+    // already has tables. Drive the same reload onTableSelected does
+    // whenever a selection actually gets (re)established.
+    QListWidgetItem *toSelect = nullptr;
     if (!current.isEmpty()) {
         auto items = m_tableList->findItems(current, Qt::MatchExactly);
-        if (!items.isEmpty()) m_tableList->setCurrentItem(items.first());
+        if (!items.isEmpty()) toSelect = items.first();
     }
+    if (!toSelect && m_tableList->count() > 0) toSelect = m_tableList->item(0);
+
+    if (toSelect) {
+        m_tableList->setCurrentItem(toSelect);
+        onTableSelected(toSelect);
+    } else {
+        m_datasheetSearch->clear();
+        m_datasheetModel->clear();
+        m_schemaView->setRowCount(0);
+    }
+
     m_queryPanel->refreshTableList();
 }
 
@@ -601,9 +620,7 @@ void MainWindow::dropTable() {
         QMessageBox::warning(this, "Drop Table", err);
         return;
     }
-    m_datasheetModel->clear();
-    m_schemaView->setRowCount(0);
-    refreshTables();
+    refreshTables(); // picks a remaining table (if any) instead of leaving the dropped one's view up
 }
 
 void MainWindow::compactTable() {
