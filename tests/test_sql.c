@@ -3094,6 +3094,63 @@ static void test_reserved_columns_skipped(void) {
     teardown(db);
 }
 
+/* Bare id/created_at/updated_at in a plain (non-RETURNING, non-WHERE)
+ * SELECT item list used to silently disappear from the output row --
+ * sql__project_rows only ever tried kdb_row_get on the stored field list,
+ * and the three pseudo-columns live on KdbRow itself (row->id/created_at/
+ * updated_at), never in that field list, for a non-JOIN row. RETURNING and
+ * WHERE already special-cased them; plain SELECT didn't. */
+static void test_select_bare_pseudo_columns(void) {
+    KumDB *db;
+    setup(&db);
+    ASSERT_OK(sql(db, "CREATE TABLE t (name TEXT)"));
+
+    KdbRows *rows = NULL;
+    ASSERT_OK(kdb_exec_sql(db, "INSERT INTO t (name) VALUES ('alice') RETURNING id, created_at, updated_at", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    int64_t inserted_id = 0, inserted_created = 0, inserted_updated = 0;
+    if (rows) {
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "id", &inserted_id));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "created_at", &inserted_created));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "updated_at", &inserted_updated));
+        kdb_rows_free(rows);
+        rows = NULL;
+    }
+    ASSERT(inserted_id > 0);
+
+    ASSERT_OK(kdb_exec_sql(db, "SELECT id, name, created_at, updated_at FROM t", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) {
+        ASSERT_EQ(rows->rows[0].field_count, 4u);
+        int64_t id = 0, created = 0, updated = 0;
+        const char *name = NULL;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "id", &id));
+        ASSERT_OK(kdb_row_get_string(&rows->rows[0], "name", &name));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "created_at", &created));
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "updated_at", &updated));
+        ASSERT_EQ(id, inserted_id);
+        ASSERT_STR(name, "alice");
+        ASSERT_EQ(created, inserted_created);
+        ASSERT_EQ(updated, inserted_updated);
+        kdb_rows_free(rows);
+        rows = NULL;
+    }
+
+    /* id alone (no other columns) -- the exact bug report shape */
+    ASSERT_OK(kdb_exec_sql(db, "SELECT id FROM t", &rows, NULL));
+    ASSERT(rows && rows->count == 1u);
+    if (rows) {
+        ASSERT_EQ(rows->rows[0].field_count, 1u);
+        int64_t id = 0;
+        ASSERT_OK(kdb_row_get_int(&rows->rows[0], "id", &id));
+        ASSERT_EQ(id, inserted_id);
+        kdb_rows_free(rows);
+        rows = NULL;
+    }
+
+    teardown(db);
+}
+
 static void test_drop_table(void) {
     KumDB *db;
     setup(&db);
@@ -4320,6 +4377,7 @@ int main(void) {
     test_alter_table_rename();
     test_nested_values_through_sql();
     test_reserved_columns_skipped();
+    test_select_bare_pseudo_columns();
     test_drop_table();
     test_views();
     test_view_cte_join_targets();

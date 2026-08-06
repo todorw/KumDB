@@ -845,9 +845,9 @@ capped at a fixed depth so a cycle fails cleanly instead of recursing
 forever. `col2` can be a real column or one of the `id`/`created_at`/
 `updated_at` pseudo-columns — referencing a table's own auto `id` (as
 above) is the most common case, even though `id` isn't a "real" schema
-column (`kdb_table_has_column` is false for it — a plain `SELECT id`
-doesn't project it back out either, a separate, pre-existing gap; use
-`RETURNING id` to get it after an `INSERT`). One foreign key per column.
+column (`kdb_table_has_column` is false for it — `id`/`created_at`/
+`updated_at` still work as plain `SELECT` items too, same as `RETURNING`
+and `WHERE` already did). One foreign key per column.
 `ALTER TABLE t ADD FOREIGN KEY (col) REFERENCES t2(col2) [ON DELETE
 action] [ON UPDATE action]` adds one after the fact, same validation and
 enforcement; `ALTER TABLE t DROP FOREIGN KEY (col)` removes it. Dropping

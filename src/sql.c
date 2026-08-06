@@ -5090,13 +5090,13 @@ static KdbStatus sql__project_rows(KdbRows *rows, SqlSelectItem *items, uint32_t
                 continue;
             }
 
-            const KdbField *src = kdb_row_get(row, items[i].arg_col);
-            if (!src) continue;
+            KdbField pseudo;
+            if (!sql__lookup_outer_field(row, items[i].arg_col, &pseudo)) continue;
 
             KdbField *dst = &new_fields[kept];
             dst->name = strdup(items[i].alias);
-            dst->type = src->type;
-            if (!dst->name || !sql__copy_field_value(dst, src)) {
+            dst->type = pseudo.type;
+            if (!dst->name || !sql__copy_field_value(dst, &pseudo)) {
                 for (uint32_t k = 0; k <= kept; k++) sql__free_field(&new_fields[k]);
                 free(new_fields);
                 return KDB_ERR_OOM;
