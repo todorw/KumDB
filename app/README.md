@@ -53,9 +53,12 @@ Run it:
 
 ### Windows / macOS notes
 
-- Windows: install Qt via the official Qt Online Installer (MSVC or MinGW
-  kit), then build with `cmake --build build --config Release` from a
-  "Developer Command Prompt". Package with `windeployqt build\Release\kumdb_studio.exe`.
+- Windows: MinGW-w64 only, not MSVC — the C engine leans on mingw's POSIX
+  compat shims (a real `unistd.h`, etc.), and MSVC's CRT doesn't provide
+  them. Easiest path is MSYS2's MINGW64 environment (`pacman -S
+  mingw-w64-x86_64-{toolchain,cmake,ninja,qt6-base}`), then the same
+  `cmake`/`cmake --build` commands from an MSYS2 MINGW64 shell. Package with
+  `windeployqt build\kumdb_studio.exe`.
 - macOS: `brew install qt cmake`, then the same `cmake`/`cmake --build`
   commands. Package with `macdeployqt build/kumdb_studio.app -dmg`.
 

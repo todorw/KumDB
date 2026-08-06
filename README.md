@@ -14,8 +14,11 @@ just an embedded engine with its own filter-string query language. SQL
 support (and the explicit NoSQL-style operators) got added later because it
 turned out useful to speak both, not because the project set out to clone
 either one. Both sit on the exact same storage and query engine underneath,
-so results are always consistent between them. Still no `JOIN` statements
-though — that part was never up for debate.
+so results are always consistent between them. "No `JOIN` statements, that's
+not up for debate" didn't survive contact with actually writing a SQL
+dialect — there are real `JOIN`s now (inner/outer/theta/`CROSS`), plus
+subqueries, CTEs, window functions, transactions, and real constraints. See
+[`DOCUMENTATION.md`](DOCUMENTATION.md) for the full list.
 
 ```c
 KdbField fields[] = {
@@ -33,8 +36,10 @@ KdbRow *user = kdb_find_one(db, "users", filters);
 kdb_exec_sql(db, "SELECT * FROM users WHERE name = 'John'", &rows, NULL);
 ```
 
-This is **not** for people who need `JOIN`s, multi-table transactions, an
-ORM, or a network protocol. It **is** for dead-simple embedded persistence —
+This is **not** for people who need multi-writer concurrency, a
+client/server protocol, an ORM, or user accounts/permissions — it's a
+single-process embedded library, not a database server. It **is** for
+dead-simple embedded persistence with real query power when you want it —
 projects where SQLite feels like overkill, or where you just want to get
 something working in C without any ceremony.
 
@@ -48,8 +53,10 @@ make
 
 Use it in your project:
 
-```bash
+```c
 #include "kumdb.h"
+```
+```bash
 gcc myapp.c build/libkumdb.a -lm -o myapp
 ```
 
